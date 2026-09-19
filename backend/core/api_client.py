@@ -57,7 +57,14 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
     2. 不再依赖 httpx.HTTPStatusError（stream 不会自动 raise），显式处理状态码。"""
     full_text = []
     usage = {"prompt_tokens": 0, "completion_tokens": 0}
-    
+    # #2 流式增量节流缓冲：累计 content 到阈值再一次性 emit，避免碎片事件放大 SSE 流量
+    _stream = {"buf": ""}
+
+    def _flush_stream_chunk():
+        if sse_emit_fn and _stream["buf"]:
+            sse_emit_fn("stream_chunk", {"text": _stream["buf"]}, run_id)
+            _stream["buf"] = ""
+
     # 流式模式默认请求 usage（OpenAI 规范字段）；服务端不支持时由下方 400 降级逻辑移除
     if payload.get("stream") and "stream_options" not in payload:
         payload = {**payload, "stream_options": {"include_usage": True}}
@@ -79,9 +86,14 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
                 raise FatalAPIError("api_error", resp.status_code,
                     (await resp.aread()).decode('utf-8', errors='replace')[:500])
             async for line in resp.aiter_lines():
-                _process_sse_line(line, full_text, usage)
+                chunk = _process_sse_line(line, full_text, usage)
+                if chunk:
+                    _stream["buf"] += chunk
+                    if len(_stream["buf"]) >= 80:
+                        _flush_stream_chunk()
     
     await _do(payload)
+    _flush_stream_chunk()  # 冲刷末尾不足阈值的残留
     text = "".join(full_text).strip()
     if not text:
         raise EmptyContentError("API 返回空内容")
@@ -89,10 +101,10 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
 
 def _process_sse_line(line, full_text, usage):
     if not line or not line.startswith("data: "):
-        return
+        return None
     data = line[6:]
     if data == "[DONE]":
-        return
+        return None
     try:
         obj = json.loads(data)
         delta = obj.get("choices", [{}])[0].get("delta", {})
@@ -107,5 +119,6 @@ def _process_sse_line(line, full_text, usage):
             ct = u.get("completion_tokens", u.get("output_tokens", 0)) or 0
             if pt: usage["prompt_tokens"] = pt
             if ct: usage["completion_tokens"] = ct
+        return content if content else None
     except (json.JSONDecodeError, KeyError, IndexError):
-        pass
+        return None

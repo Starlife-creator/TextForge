@@ -121,8 +121,7 @@ def init_progress(req, run_id):
         "stitch_anchors": [], "current_phase": "phase0", "sub_step": None,
         "blueprint_confirmed": False, "blueprint_user_edited": False,
         "current_processing_batch": 0, "processed_batches": [], "completed_files": [],
-        "consecutive_failures": {}, "error_logs": [], "pause_requested": False,
-        "stop_requested": False, "degrade_count": 0, "resumed": False,
+        "error_logs": [], "resumed": False,
         # v8.8 缝合幂等游标：已完成 merge 的虚拟章父章 id、已完成批次间缝合的边界 key
         "stitch_virtual_done": [], "stitch_batch_done": [],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "estimated": False},

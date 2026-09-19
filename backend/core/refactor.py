@@ -35,6 +35,7 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     from core.api_client import make_httpx_client
     async with make_httpx_client(req) as client:
         # 阶段 3-1：无重叠重构
+        pending_batches = len([b for b in completed_batches if b['status'] != 'phase3_done'])
         for batch in completed_batches:
             # v8.8 修正：恢复时跳过已 phase3_done 的批次
             if batch['status'] == 'phase3_done':
@@ -51,6 +52,10 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                 atomic_write_json(progress_path, progress)
             logger.info(f"[phase3] batch {batch['batch_id']} 完成 文件={output_files}")
             sse_emit("batch_done", {"batch_id": batch['batch_id'], "output_files": output_files}, run_id)
+            # 铁律8：批次间保持 2s 串行间隔，避免连续请求触发云端限流
+            pending_batches -= 1
+            if pending_batches > 0:
+                await asyncio.sleep(2)
         
         # 阶段 3-2：缝合（同一个 client）
         await stitch_pipeline(output_path, progress, client, payload_base, sse_emit, run_id, chars)

@@ -3,7 +3,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { open } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { waitForPort } from './api/backend';
-import { connectSSE } from './api/sse';
+import { connectSSE, disconnectSSE } from './api/sse';
 
 // ---------- 后端连接 ----------
 const port = ref<number | null>(null);
@@ -40,6 +40,11 @@ const eventLog = ref<string[]>([]);
 const totalChapters = ref(0);
 const blueprintText = ref('');
 const showBlueprint = ref(false);
+// A: 操作防重复标志
+const confirmingBlueprint = ref(false);
+const controlling = ref(false);
+// #2 流式增量预览（最近 500 字）
+const streamingText = ref('');
 
 // 统计与提示
 const usageTokens = ref({ prompt: 0, completion: 0 });
@@ -143,10 +148,15 @@ function handleSSEEvent(event: string, payload: any) {
       addLog(`阶段完成：${phaseLabel[payload.phase] || payload.phase}${payload.resumed_skip ? '（恢复跳过）' : ''}`);
       break;
     case 'batch_start':
+      streamingText.value = ''; // 新批次清空流式预览
       addLog(`批次 ${payload.batch_id} 开始：章节 ${payload.chapter_ids?.join(',')}`);
       break;
     case 'batch_done':
       addLog(`批次 ${payload.batch_id} 完成`);
+      break;
+    case 'stream_chunk':
+      // #2 节流后的流式增量，保留最近 500 字
+      streamingText.value = (streamingText.value + (payload.text || '')).slice(-500);
       break;
     case 'blueprint_ready':
       blueprintText.value = payload.blueprint || '';
@@ -171,11 +181,15 @@ function handleSSEEvent(event: string, payload: any) {
     case 'done':
       pipelineRunning.value = false;
       currentPhase.value = '完成';
+      stopStatusPolling(); // C: 结束后停掉轮询，避免空转
+      disconnectSSE();     // #4 结束后断开 SSE，避免 keep-alive 空挂
       topTip.value = `全部完成！成品在：${payload.output_dir}\\03_final`;
       addLog(`全部完成！输出目录：${payload.output_dir}`);
       break;
     case 'stopped':
       pipelineRunning.value = false;
+      stopStatusPolling();
+      disconnectSSE();
       topTip.value = '流水线已停止，进度已保留；再次点击“开始重构”可从断点继续';
       addLog('流水线已停止');
       break;
@@ -183,6 +197,8 @@ function handleSSEEvent(event: string, payload: any) {
       addLog(`错误：${payload.message || payload.code}`);
       if (payload.kind !== 'warning') {
         pipelineRunning.value = false;
+        stopStatusPolling();
+        disconnectSSE();
         topError.value = payload.message || payload.code || '未知错误';
       }
       break;
@@ -268,10 +284,12 @@ async function startPipeline() {
 }
 
 async function confirmBlueprint() {
+  if (confirmingBlueprint.value) return; // 防重复点击
   if (blueprintText.value.length < 100) {
     alert('蓝图内容过短（需 >= 100 字）');
     return;
   }
+  confirmingBlueprint.value = true;
   try {
     const res = await fetch(`${apiBase()}/api/blueprint/confirm`, {
       method: 'POST',
@@ -291,10 +309,14 @@ async function confirmBlueprint() {
     }
   } catch (e: any) {
     alert(`请求失败：${e.message}`);
+  } finally {
+    confirmingBlueprint.value = false;
   }
 }
 
 async function control(action: 'pause' | 'resume' | 'stop') {
+  if (controlling.value) return; // 防重复点击
+  controlling.value = true;
   try {
     await fetch(`${apiBase()}/api/${action}`, {
       method: 'POST',
@@ -303,6 +325,8 @@ async function control(action: 'pause' | 'resume' | 'stop') {
     });
   } catch (e) {
     console.error(e);
+  } finally {
+    controlling.value = false;
   }
 }
 
@@ -423,9 +447,9 @@ const canStart = computed(() =>
         </div>
 
         <div class="controls" v-if="pipelineRunning">
-          <button @click="control('pause')" :disabled="isPaused">暂停</button>
-          <button @click="control('resume')" :disabled="!isPaused">恢复</button>
-          <button class="danger" @click="control('stop')">停止</button>
+          <button @click="control('pause')" :disabled="isPaused || controlling">暂停</button>
+          <button @click="control('resume')" :disabled="!isPaused || controlling">恢复</button>
+          <button class="danger" @click="control('stop')" :disabled="controlling">停止</button>
         </div>
 
         <div class="stats">
@@ -434,6 +458,8 @@ const canStart = computed(() =>
           <span class="stat">重构：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b></span>
           <span class="stat">Tokens：<b>{{ usageTokens.prompt + usageTokens.completion }}</b></span>
         </div>
+
+        <div v-if="streamingText" class="stream-box"><b class="stream-title">流式输出</b>{{ streamingText }}</div>
 
         <div class="log-box">
           <div v-for="(line, i) in eventLog" :key="i" class="log-line">{{ line }}</div>
@@ -450,7 +476,9 @@ const canStart = computed(() =>
         <textarea v-model="blueprintText" rows="18" class="blueprint-area"></textarea>
         <div class="modal-actions">
           <span class="count">{{ blueprintText.length }} 字</span>
-          <button @click="confirmBlueprint">确认并继续</button>
+          <button @click="confirmBlueprint" :disabled="confirmingBlueprint">
+            {{ confirmingBlueprint ? '确认中...' : '确认并继续' }}
+          </button>
         </div>
       </div>
     </div>
@@ -606,6 +634,22 @@ const canStart = computed(() =>
 }
 .controls button.danger { color: #c53030; border-color: #feb2b2; }
 .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.stream-box {
+  max-height: 72px;
+  overflow-y: auto;
+  background: #edf2f7;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: #2d3748;
+}
+.stream-title { color: #3182ce; margin-right: 6px; }
 
 .log-box {
   flex: 1;
