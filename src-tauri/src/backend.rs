@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 use serde::Serialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 

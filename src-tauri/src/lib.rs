@@ -34,8 +34,11 @@ pub fn run() {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
                     {
+                        // 先用独立语句取出 owned 子进程，避免 MutexGuard 临时值在 if-let
+                        // 块内延长借用导致 E0597（state 在块尾 drop 而 guard 仍在借用）
                         let state = app.state::<BackendProcess>();
-                        if let Some(child) = state.0.lock().unwrap().take() {
+                        let child = state.0.lock().unwrap().take();
+                        if let Some(child) = child {
                             if let Err(e) = child.kill() { eprintln!("[backend] kill 失败: {:?}", e); }
                         }
                     }
