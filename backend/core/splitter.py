@@ -25,8 +25,13 @@ def _read_docx(path: Path) -> str:
     doc = Document(str(path))
     return "\n\n".join(p.text if p.text.strip() else "" for p in doc.paragraphs)
 
+def _normalize_newlines(text: str) -> str:
+    """统一换行为 LF：Windows 源文件常为 CRLF，若保留 \r 会导致后续
+    split('\n\n') 段落切分失效（尤其是超长章的虚拟化分段）。"""
+    return text.replace('\r\n', '\n').replace('\r', '\n')
+
 def _read_file(path: Path, fmt: str) -> str:
-    return _read_docx(path) if fmt == "docx" else _read_txt_auto_encoding(path)
+    return _normalize_newlines(_read_docx(path) if fmt == "docx" else _read_txt_auto_encoding(path))
 
 def _sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode('utf-8')).hexdigest()
@@ -56,7 +61,8 @@ def _split_virtual_chapters(chapters, split_dir: Path, chars: float) -> tuple[li
         if len(text) >= trigger:
             segments = _split_by_paragraph(text, max_virtual)
             for i, seg in enumerate(segments):
-                vid = f"{ch['id']}{chr(ord('a') + i)}"
+                # 数字后缀而非字母：同一章切出>26段时 chr(ord('a')+i) 会生成非法 id
+                vid = f"{ch['id']}_{i}"
                 atomic_write_text(split_dir / f"{vid}.txt", seg)
                 new_chapters.append({
                     "id": vid, "filename": f"{ch['filename']}#{i+1}",

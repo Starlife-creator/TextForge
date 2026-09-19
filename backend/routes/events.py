@@ -13,13 +13,12 @@ def sse_emit(event: str, payload: dict, run_id: str | None = None):
         try:
             q.put_nowait({"event": event, "data": payload})
         except asyncio.QueueFull:
-            # done/error 时丢旧事件
-            if event in ("done", "error"):
-                try:
-                    q.get_nowait()
-                    q.put_nowait({"event": event, "data": payload})
-                except (asyncio.QueueEmpty, asyncio.QueueFull):
-                    pass
+            # 队列满：丢弃最旧、保留最新，保证进度/终态事件最终可达
+            try:
+                q.get_nowait()
+                q.put_nowait({"event": event, "data": payload})
+            except (asyncio.QueueEmpty, asyncio.QueueFull):
+                pass
 
 @router.get("/api/events")
 async def events(run_id: str | None = None):
