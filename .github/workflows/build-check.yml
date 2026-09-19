@@ -1,0 +1,74 @@
+name: build-check
+
+# 质量门：代码改动即验证能否编译（sidecar + 前端 + Rust），不发布安装包。
+# 触发：推送 main、创建/更新 PR。避免等到打 tag 发版才发现编译错误。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.13'
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node（前端）
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 安装 Python（sidecar 后端）
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 依赖缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 前端类型检查
+      - name: 前端类型检查
+        run: npm ci && npx vue-tsc --noEmit
+
+      # 先构建 sidecar（--onefile）——Tauri build-script 要求 exe 存在才能过校验，
+      # 参数与 release workflow / build_sidecar.bat 保持一致。
+      - name: 构建 sidecar（供 Rust 编译校验）
+        shell: bash
+        run: |
+          cd backend
+          python -m venv venv
+          source venv/Scripts/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+          python -m PyInstaller --noconsole --onefile \
+            --collect-all fastapi --collect-all starlette --collect-all pydantic \
+            --collect-all pydantic_core --collect-all uvicorn --collect-all anyio \
+            --collect-all httpx --collect-all h11 --collect-all sniffio \
+            --collect-all chardet --collect-all charset_normalizer \
+            --collect-all socksio --collect-all lxml --collect-all docx \
+            --collect-all cn2an --collect-all certifi --collect-all httpcore --collect-all idna \
+            --name backend main.py
+          mkdir -p ../src-tauri/binaries
+          cp dist/backend.exe ../src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
+
+      # Rust 编译检查（不打包发布，快速反馈编译是否通过）
+      - name: Rust 编译检查
+        run: cargo check --manifest-path src-tauri/Cargo.toml
