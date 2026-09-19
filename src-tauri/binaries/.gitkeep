@@ -1,0 +1,3 @@
+# 此目录用于存放 Tauri sidecar 后端二进制：
+#   backend-x86_64-pc-windows-msvc.exe
+# 该文件由 backend/build_sidecar.bat 构建生成，不入库（见 .gitignore）。

@@ -1,0 +1,144 @@
+import asyncio, json, time, logging
+from pathlib import Path
+from routes import state
+from routes.events import sse_emit
+from core.api_client import FatalAPIError, EmptyContentError, RetryableBusinessError
+from core.splitter import phase0_split, phase1_diagnose
+from core.pipeline import phase2_blueprint
+from core.refactor import phase3_refactor_stitch
+from core.finalize import phase4_finalize
+from utils.atomic import atomic_write_json
+
+logger = logging.getLogger("textforge")
+
+# 说明：phase0..phase4 均为幂等/可恢复。每个 phase 开头判断 current_phase 跳过已完成部分，
+# 批次级恢复见各 phase 内对 batch status 的判断。
+
+async def run_pipeline(req, run_id: str):
+    progress_path = Path(req.output_path) / "progress.json"
+    progress = None  # v8.8：finally 防护，极端情况下 _load_or_init_progress 之前异常也不引发 NameError
+    logger.info(f"[run_pipeline] 开始 run_id={run_id} input={req.input_path}")
+    try:
+        # v8.8 修正：断点恢复。若存在未完成的 progress.json，恢复而非覆盖。
+        progress = _load_or_init_progress(req, run_id, progress_path)
+        # v8.8：run_start 不携带 total_chapters（phase0 前尚不知道），由 phase0_done 携带
+        sse_emit("run_start", {"run_id": run_id, "input_mode": req.input_mode, "resumed": progress["resumed"]}, run_id)
+        logger.info(f"[run_pipeline] progress phase={progress['current_phase']} resumed={progress['resumed']}")
+
+        await phase0_split(req, progress, progress_path, run_id)
+        if state.stop_requested: raise asyncio.CancelledError()
+        await check_pause(run_id)
+
+        await phase1_diagnose(req, progress, progress_path, run_id)
+        if state.stop_requested: raise asyncio.CancelledError()
+        await check_pause(run_id)
+
+        await phase2_blueprint(req, progress, progress_path, run_id)
+        await check_pause(run_id)
+
+        await phase3_refactor_stitch(req, progress, progress_path, run_id)
+        if state.stop_requested: raise asyncio.CancelledError()
+
+        # phase4 含 docx 渲染与大量文件写盘，放入线程池避免阻塞事件循环（SSE/控制接口保持响应）
+        await asyncio.to_thread(phase4_finalize, Path(req.output_path), progress, req)
+        sse_emit("done", {"output_dir": req.output_path, "novel_name": progress["novel_name"]}, run_id)
+        logger.info(f"[run_pipeline] 完成 run_id={run_id}")
+        await asyncio.sleep(3)
+    
+    except FatalAPIError as e:
+        logger.error(f"[run_pipeline] FatalAPIError kind={e.kind} code={e.code} msg={e.message[:200]}")
+        sse_emit("error", {"kind": e.kind, "code": str(e.code), "message": e.message}, run_id)
+        log_error(progress_path, e)
+    except EmptyContentError as e:
+        logger.error(f"[run_pipeline] EmptyContentError msg={str(e)[:200]}")
+        sse_emit("error", {"kind": "empty_content", "code": "empty", "message": str(e)}, run_id)
+        log_error(progress_path, e)
+    except RetryableBusinessError as e:
+        # v8.8 修正：重试后用尽的业务格式错误，保留进度以便下次恢复
+        logger.error(f"[run_pipeline] RetryableBusinessError 重试用尽 msg={str(e)[:300]}")
+        sse_emit("error", {"kind": "business", "code": "retry_exhausted", "message": str(e)[:500]}, run_id)
+        log_error(progress_path, e)
+    except asyncio.CancelledError:
+        logger.info(f"[run_pipeline] 已停止 run_id={run_id}")
+        sse_emit("stopped", {"incomplete": True}, run_id)
+    except Exception as e:
+        logger.exception(f"[run_pipeline] 未捕获异常 run_id={run_id}")
+        sse_emit("error", {"kind": "unknown", "code": "exception", "message": str(e)[:500]}, run_id)
+        log_error(progress_path, e)
+    finally:
+        state.pipeline_running = False
+        # v8.8 修正：progress.json 里 pipeline_running 复位为 False，便于前端判定
+        if progress is not None:
+            try:
+                progress["pipeline_running"] = False
+                async with state.progress_lock:
+                    atomic_write_json(progress_path, progress)
+            except Exception:
+                logger.exception("[run_pipeline] finally 写 progress.json 失败")
+        # 不清 current_run_id，等待下次 /api/start 覆盖
+        state.current_output_path = None
+        state.pipeline_task = None
+
+def _load_or_init_progress(req, run_id, progress_path):
+    """v8.8 新增：存在未完成 progress 则恢复，否则新建。"""
+    if progress_path.exists():
+        try:
+            existing = json.loads(progress_path.read_text(encoding='utf-8'))
+            if existing.get('current_phase') and existing.get('current_phase') != 'phase4':
+                # 恢复：更新 run_id（匹配本次 SSE），保持工作产物
+                existing['run_id'] = run_id
+                existing['pipeline_running'] = True
+                existing['resumed'] = True
+                logger.info(f"[run_pipeline] 恢复进度 phase={existing['current_phase']}")
+                return existing
+        except Exception:
+            pass
+    progress = init_progress(req, run_id)
+    progress["resumed"] = False
+    return progress
+
+async def check_pause(run_id):
+    """v8.8 修正：暂停状态仅用内存事件，不写 progress.json；进入/退出推事件。"""
+    was_paused = not state.pause_event.is_set()
+    if was_paused:
+        sse_emit("paused", {}, run_id)
+    while not state.pause_event.is_set():
+        if state.stop_requested: raise asyncio.CancelledError()
+        await asyncio.sleep(1.0)
+    if was_paused:
+        sse_emit("resumed", {}, run_id)
+
+def init_progress(req, run_id):
+    novel_name = req.novel_name or (
+        Path(req.input_path).parent.name if req.input_mode == "single_file" else Path(req.input_path).name
+    ) or "重构终稿"
+    return {
+        "schema_version": "8.8", "run_id": run_id, "input_mode": req.input_mode,
+        "input_format": req.input_format, "input_path": req.input_path, "output_path": req.output_path,
+        "api_config": {"api_url": req.api_url, "model": req.model, "context_window": req.context_window},
+        "novel_name": novel_name, "rich_text": req.rich_text,
+        "chapters": [], "batches": [], "virtual_chapter_map": [], "cross_batch_virtual": [],
+        "stitch_anchors": [], "current_phase": "phase0", "sub_step": None,
+        "blueprint_confirmed": False, "blueprint_user_edited": False,
+        "current_processing_batch": 0, "processed_batches": [], "completed_files": [],
+        "consecutive_failures": {}, "error_logs": [], "pause_requested": False,
+        "stop_requested": False, "degrade_count": 0, "resumed": False,
+        # v8.8 缝合幂等游标：已完成 merge 的虚拟章父章 id、已完成批次间缝合的边界 key
+        "stitch_virtual_done": [], "stitch_batch_done": [],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "estimated": False},
+        "pipeline_running": True, "last_heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+def log_error(progress_path, error):
+    try:
+        progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        progress.setdefault("error_logs", []).append({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "kind": getattr(error, "kind", "unknown"),
+            "code": str(getattr(error, "code", "unknown")),
+            "message": str(error)[:500],
+        })
+        progress["error_logs"] = progress["error_logs"][-100:]
+        atomic_write_json(progress_path, progress)
+    except Exception:
+        pass
