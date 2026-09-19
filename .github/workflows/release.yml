@@ -8,6 +8,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# 需要写权限：tauri-action 要用 GITHUB_TOKEN 创建 Release 并上传安装包
+permissions:
+  contents: write
+
 env:
   NODE_VERSION: '20'
   PYTHON_VERSION: '3.13'
@@ -67,7 +71,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: .
-          rust: stable
           tagName: ${{ github.ref_name }}
           releaseName: TextForge ${{ github.ref_name }}
           releaseBody: |
