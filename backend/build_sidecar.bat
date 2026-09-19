@@ -21,7 +21,7 @@ venv\Scripts\python.exe -m PyInstaller --noconsole --onefile ^
   --collect-all fastapi --collect-all starlette --collect-all pydantic ^
   --collect-all pydantic_core --collect-all uvicorn --collect-all anyio ^
   --collect-all httpx --collect-all h11 --collect-all sniffio ^
-  --collect-all natsort --collect-all chardet --collect-all charset_normalizer ^
+  --collect-all chardet --collect-all charset_normalizer ^
   --collect-all socksio --collect-all lxml --collect-all docx ^
   --collect-all cn2an --collect-all certifi --collect-all httpcore --collect-all idna ^
   --distpath build\dist --workpath build\work --specpath build ^

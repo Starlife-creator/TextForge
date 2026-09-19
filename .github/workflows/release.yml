@@ -1,0 +1,80 @@
+name: release
+
+# 触发：推送 v 开头 tag（如 v0.1.0）自动构建并发布 GitHub Release；
+# 也可在 Actions 页面手动运行（workflow_dispatch）。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.13'
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node（前端）
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 安装 Python（sidecar 后端）
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 前端依赖安装
+        run: npm ci
+
+      # 先构建 sidecar 后端（PyInstaller --onefile 单 exe），再交予 Tauri 打包。
+      # 参数与 backend/build_sidecar.bat 保持一致（均已移除已精简的 natsort/PyYAML）。
+      - name: 构建 sidecar 后端（PyInstaller onefile）
+        shell: bash
+        run: |
+          cd backend
+          python -m venv venv
+          source venv/Scripts/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+          python -m PyInstaller --noconsole --onefile \
+            --collect-all fastapi --collect-all starlette --collect-all pydantic \
+            --collect-all pydantic_core --collect-all uvicorn --collect-all anyio \
+            --collect-all httpx --collect-all h11 --collect-all sniffio \
+            --collect-all chardet --collect-all charset_normalizer \
+            --collect-all socksio --collect-all lxml --collect-all docx \
+            --collect-all cn2an --collect-all certifi --collect-all httpcore --collect-all idna \
+            --name backend main.py
+          mkdir -p ../src-tauri/binaries
+          cp dist/backend.exe ../src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
+
+      # 前端构建在 tauri build 前自动执行（beforeBuildCommand: npm run build），
+      # 完成后将 -setup.exe 上传到 GitHub Release，tag 即版本号。
+      # 注意：无代码签名证书，产物为未签名安装包，首次运行会触发 SmartScreen 提示。
+      - name: Tauri 打包并发布
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: .
+          rust: stable
+          tagName: ${{ github.ref_name }}
+          releaseName: TextForge ${{ github.ref_name }}
+          releaseBody: |
+            文炼工坊 TextForge 自动发布
+            - tag: ${{ github.ref_name }}
+            - 触发：${{ github.event_name }}
+            - 说明：未签名安装包，首次运行若见 SmartScreen 提示请点“更多信息→仍要运行”。
+          releaseDraft: false
+          prerelease: false
+          args: --target x86_64-pc-windows-msvc
