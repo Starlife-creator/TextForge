@@ -65,6 +65,11 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         stats = _write_comparison_outputs(output_path, progress)
         logger.info(f"[comparison] 生成完成 written={stats['written']} skipped={stats['skipped']}")
         sse_emit("comparison_done", {"written": stats["written"], "skipped": stats["skipped"]}, run_id)
+
+    # P1.7 章快照：缝合完成后快照每个逻辑章的最终稿到 snapshots/final（默认关）
+    if getattr(req, "chapter_snapshots", False):
+        n = _write_snapshot_finals(output_path, progress)
+        logger.info(f"[snapshot] 缝合终稿快照完成 final={n}")
     
     progress['current_phase'] = 'phase4'
     async with state.progress_lock:
@@ -104,6 +109,11 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
     for cid, ctext in chapter_texts.items():
         rel = f"02_workspace/reconstructed/chapter_{cid}.txt"
         atomic_write_text(recon_dir / f"chapter_{cid}.txt", ctext)
+        # P1.7 章快照：重构初稿镜像到 snapshots/drafts（默认关）
+        if getattr(req, "chapter_snapshots", False):
+            draft_dir = output_path / "02_workspace/snapshots/drafts"
+            draft_dir.mkdir(parents=True, exist_ok=True)
+            atomic_write_text(draft_dir / f"chapter_{cid}.txt", ctext)
         if rel not in progress['completed_files']:
             progress['completed_files'].append(rel)
         output_files.append(rel)
@@ -267,6 +277,39 @@ def _render_name_map(name_map):
     lines += [f"   - {old} → {new}" for old, new in mapping.items()]
     lines.append("映射表之外的名字原样保留。")
     return "\n".join(lines) + "\n"
+
+def _iter_output_chapter_ids(progress):
+    """返回最终成书的逻辑章 id：空章剔除；虚拟章组折叠到父章（original_id）；去重保序。"""
+    ids = []
+    seen = set()
+    for ch in progress.get('chapters', []):
+        if ch.get('is_empty'):
+            continue
+        if ch.get('is_virtual') or ch.get('is_virtual_parent'):
+            out_id = ch.get('original_id') or ch.get('id')
+        else:
+            out_id = ch.get('id')
+        if out_id and out_id not in seen:
+            seen.add(out_id)
+            ids.append(out_id)
+    return ids
+
+
+def _write_snapshot_finals(output_path, progress):
+    """P1.7 缝合终稿快照：缝合完成后，把每个逻辑章的最终稿复制到
+    snapshots/final/。由既有文件派生，覆盖写天然幂等。"""
+    output_path = Path(output_path)
+    snap_dir = output_path / "02_workspace/snapshots/final"
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for out_id in _iter_output_chapter_ids(progress):
+        src = output_path / "02_workspace/reconstructed" / f"chapter_{out_id}.txt"
+        if not src.exists():
+            logger.warning(f"[snapshot] 缺失最终稿，跳过章 {out_id}: {src.name}")
+            continue
+        atomic_write_text(snap_dir / f"chapter_{out_id}.txt", src.read_text(encoding='utf-8', newline=''))
+        written += 1
+    return written
 
 def _write_comparison_outputs(output_path, progress):
     """P1.6 左右对照：按「逻辑章」生成原文 | 重构后 两列表格 Markdown。

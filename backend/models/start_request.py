@@ -42,6 +42,9 @@ class StartRequest(BaseModel):
     diagnose_json: Optional[str] = None
     # P1.6 左右对照：phase3 后按章生成「原文 | 重构后」Markdown 对照（默认关）
     compare_output: bool = False
+    # P1.7 章快照：重构初稿(drafts)与缝合终稿(final)按逻辑章快照到
+    # 02_workspace/snapshots/（原文在 split 目录，不再重复存）（默认关）
+    chapter_snapshots: bool = False
     # P0.3 可选拆书预览门：默认 False（phase0 后直接进 phase1，保持旧行为）
     review_split: bool = False
     # P4.1 分阶段模型，缺省 = 单一 model
