@@ -46,6 +46,9 @@ const summaries = ref<any[]>([]);
 const showSummaries = ref(false);
 // P0.3：拆书预览确认门
 const reviewSplit = ref(false);
+const compareOutput = ref(false);
+const chapterSnapshots = ref(false);
+const diagnoseJson = ref('');
 const showSplit = ref(false);
 const splitChapters = ref<any[]>([]);
 // A: 操作防重复标志
@@ -272,6 +275,9 @@ async function startPipeline() {
     novel_name: novelName.value || null,
     refactor_mode: refactorMode.value,
     review_split: reviewSplit.value,
+    compare_output: compareOutput.value,
+    chapter_snapshots: chapterSnapshots.value,
+    diagnose_json: diagnoseJson.value || null,
     proxy: proxy.value || null,
     rich_text: richText.value,
     temperatures: {
@@ -459,6 +465,20 @@ const canStart = computed(() =>
           <label>拆书确认</label>
           <label class="rich"><input type="checkbox" v-model="reviewSplit" /> 拆书后先预览章节再继续</label>
         </div>
+
+        <details class="adv">
+          <summary>优化项：左右对照 / 章快照 / 诊断 JSON</summary>
+          <div class="row">
+            <label class="rich"><input type="checkbox" v-model="compareOutput" /> 左右对照（重构后按章生成原文|重构后表格）</label>
+          </div>
+          <div class="row">
+            <label class="rich"><input type="checkbox" v-model="chapterSnapshots" /> 章快照（保留重构初稿与缝合终稿）</label>
+          </div>
+          <div class="row">
+            <label>诊断JSON路径</label>
+            <input v-model="diagnoseJson" placeholder="可选，留空关闭；设置后按批次输出结构化断层 JSON" />
+          </div>
+        </details>
 
         <div class="row">
           <label>代理</label>
