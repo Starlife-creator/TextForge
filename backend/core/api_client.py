@@ -8,16 +8,38 @@ STREAM_THROTTLE = int(os.environ.get("TEXTFORGE_STREAM_THROTTLE", "80"))
 def pick_model(req, phase: str) -> str:
     """P4.1 分阶段模型：models[phase] 优先，缺省回退到单一 req.model。
     phase ∈ {diagnose, blueprint, refactor, stitch}，未配置则用全局 model，旧行为不变。"""
-    models = getattr(req, "models", {}) or {}
-    return models.get(phase) or req.model
+    return pick_endpoint(req, phase)["model"]
 
-def make_httpx_client(req):
+
+def pick_endpoint(req, phase: str) -> dict:
+    """A2 分阶段端点：返回该阶段 {model, api_url, api_key}。
+    models[phase] 可为字符串（旧：同名模型但同一端点）或 dict {model, api_url?, api_key?}。
+    缺省回退到全局 req.model / req.api_url / req.api_key，旧行为不变。"""
+    models = getattr(req, "models", {}) or {}
+    model = req.model
+    url = req.api_url
+    key = getattr(req, "api_key", "") or ""
+    entry = models.get(phase)
+    if isinstance(entry, str) and entry:
+        model = entry
+    elif isinstance(entry, dict):
+        if entry.get("model"):
+            model = entry["model"]
+        if entry.get("api_url"):
+            url = entry["api_url"]
+        if "api_key" in entry:
+            key = entry.get("api_key") or ""
+    return {"model": model, "api_url": url, "api_key": key}
+
+
+def make_httpx_client(req, api_url: str | None = None, api_key: str | None = None):
     """统一构造 httpx.AsyncClient：注入鉴权头（Key 仅存内存）、超时、代理、SSL 校验。
-    Authorization 作为 client 默认头随每个请求发送，不落盘、不进日志。"""
+    Authorization 作为 client 默认头随每个请求发送，不落盘、不进日志。
+    A2：可传入 api_url/api_key 覆盖（分阶段独立服务商），缺省用 req 全局端点。"""
     headers = {"Content-Type": "application/json"}
-    api_key = getattr(req, "api_key", "") or ""
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    key = api_key if api_key is not None else (getattr(req, "api_key", "") or "")
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
     return httpx.AsyncClient(
         timeout=httpx.Timeout(connect=30.0, read=300.0, write=30.0, pool=30.0),
         verify=req.ssl_verify, proxy=req.proxy, follow_redirects=True,

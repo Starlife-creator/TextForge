@@ -4,7 +4,7 @@ from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
 from routes.events import sse_emit
 from core.stitch import stitch_pipeline
-from core.api_client import call_with_retry, RetryableBusinessError, pick_model
+from core.api_client import call_with_retry, RetryableBusinessError, pick_model, pick_endpoint
 
 logger = logging.getLogger("textforge")
 
@@ -22,20 +22,22 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     blueprint_for_stitch = blueprint_text[:int(chars * 0.10)]
 
     gates = getattr(req, "refactor_gates", {}) or {}
+    from core.api_client import make_httpx_client, pick_endpoint
+    ep_ref = pick_endpoint(req, "refactor")
+    ep_stitch = pick_endpoint(req, "stitch")
     payload_base = {
         "output_path": req.output_path,
-        "api_url": req.api_url,
+        "api_url": ep_stitch["api_url"],
         "blueprint": blueprint_for_stitch,
         "author_style": req.author_style,
-        "payload": {"model": pick_model(req, "stitch"), "temperature": req.temperatures.stitch, "stream": True},
+        "payload": {"model": ep_stitch["model"], "temperature": req.temperatures.stitch, "stream": True},
         "progress": progress,      # v8.8：供 apply_batch_stitch 映射虚拟章父章
         "skip_smooth": bool(gates.get("skip_stitch_if_smooth")),
     }
     
     completed_batches = [b for b in progress['batches'] if b['status'] == 'phase1_done']
     
-    from core.api_client import make_httpx_client
-    async with make_httpx_client(req) as client:
+    async with make_httpx_client(req, api_url=ep_ref["api_url"], api_key=ep_ref["api_key"]) as client:
         # 阶段 3-1：无重叠重构
         pending_batches = len([b for b in completed_batches if b['status'] != 'phase3_done'])
         for batch in completed_batches:
@@ -48,7 +50,7 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
             chapter_ids = batch['chapter_ids']
             output_files = await _refactor_and_split(
                 client, req, output_path, recon_dir, blueprint_text, chars,
-                progress, batch, run_id)
+                progress, batch, run_id, ep_ref)
             
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
@@ -61,9 +63,10 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
             pending_batches -= 1
             if pending_batches > 0:
                 await asyncio.sleep(getattr(req, "batch_interval_sec", 2.0))
-        
-        # 阶段 3-2：缝合（同一个 client）
-        await stitch_pipeline(output_path, progress, client, payload_base, sse_emit, run_id, chars)
+    
+    # 阶段 3-2：缝合（用缝合阶段的独立端点 client）
+        async with make_httpx_client(req, api_url=ep_stitch["api_url"], api_key=ep_stitch["api_key"]) as stitch_client:
+            await stitch_pipeline(output_path, progress, stitch_client, payload_base, sse_emit, run_id, chars)
     
     # P1.6 左右对照：仅开启时按章生成「原文 | 重构后」对照文档（默认关；由既有文件派生，幂等）
     if getattr(req, "compare_output", False):
@@ -99,6 +102,7 @@ async def regen_single_chapter(req, output_path, chapter_id):
     """A1：单章重生成。复用运行中 req（含鉴权，仅内存），对单章重新走一次重构，
     覆盖 reconstructed/chapter_{chapter_id}.txt，返回新正文。用于逐章验收「驳回→重写」。"""
     from core.api_client import make_httpx_client, call_with_retry
+    ep = pick_endpoint(req, "refactor")
     output_path = Path(output_path)
     split_file = output_path / "02_workspace/split" / f"{chapter_id}.txt"
     if not split_file.exists():
@@ -118,15 +122,15 @@ async def regen_single_chapter(req, output_path, chapter_id):
         gates=gates,
     )
     payload = {
-        "model": pick_model(req, "refactor"),
+        "model": ep["model"],
         "messages": [{"role": "user", "content": prompt}],
         "temperature": req.temperatures.refactor,
         "max_tokens": int(len(batch_content) / 1.5),
         "stream": True,
     }
     logger.info(f"[regen] 单章重生成 chapter_{chapter_id} 开始")
-    async with make_httpx_client(req) as client:
-        result, usage, _ = await call_with_retry(client, req.api_url, payload, sse_emit, "regen", max_retries=2)
+    async with make_httpx_client(req, api_url=ep["api_url"], api_key=ep["api_key"]) as client:
+        result, usage, _ = await call_with_retry(client, ep["api_url"], payload, sse_emit, "regen", max_retries=2)
     chapter_texts = _split_refactored_by_chapters(result, [chapter_id])
     new_text = chapter_texts[chapter_id]
     recon_dir = output_path / "02_workspace/reconstructed"
@@ -137,9 +141,11 @@ async def regen_single_chapter(req, output_path, chapter_id):
 
 
 async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_text, chars,
-                              progress, batch, run_id):
+                              progress, batch, run_id, ep=None):
     """v8.8 新增：将 '调用 + 按章拆分' 包成一个可重试单元。
-    这样 ChapterBreakMissingError 由 call_with_retry 捕获并重试（而非在返回后丢失）。"""
+    这样 ChapterBreakMissingError 由 call_with_retry 捕获并重试（而非在返回后丢失）。
+    A2：ep = pick_endpoint(req,'refactor')，未传则回退全局（单厂商兼容）。"""
+    ep = ep or pick_endpoint(req, "refactor")
     chapter_ids = batch['chapter_ids']
     batch_content = "\n\n".join(
         (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file']).read_text(encoding='utf-8', newline='')
@@ -154,7 +160,7 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
         gates=getattr(req, "refactor_gates", {}) or {},
     )
     payload = {
-        "model": pick_model(req, "refactor"), "messages": [{"role": "user", "content": prompt}],
+        "model": ep["model"], "messages": [{"role": "user", "content": prompt}],
         "temperature": req.temperatures.refactor,
         "max_tokens": int(len(batch_content) / 1.5),
         "stream": True,
@@ -163,7 +169,7 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
     sse_emit("batch_start", {"batch_id": batch['batch_id'], "chapter_ids": chapter_ids}, run_id)
     
     # call_with_retry 收到 ChapterBreakMissingError 会按 RetryableBusinessError 重试 1 次
-    result, usage, _ = await call_with_retry(client, req.api_url, payload, sse_emit, run_id)
+    result, usage, _ = await call_with_retry(client, ep["api_url"], payload, sse_emit, run_id)
     chapter_texts = _split_refactored_by_chapters(result, chapter_ids)
     
     output_files = []

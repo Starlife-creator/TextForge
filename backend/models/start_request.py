@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Literal, Optional, List, Dict
+from typing import Literal, Optional, List, Dict, Union
 
 class Temperatures(BaseModel):
     diagnose: float = 0.3
@@ -49,5 +49,5 @@ class StartRequest(BaseModel):
     chapter_snapshots: bool = False
     # P0.3 可选拆书预览门：默认 False（phase0 后直接进 phase1，保持旧行为）
     review_split: bool = False
-    # P4.1 分阶段模型，缺省 = 单一 model
-    models: Dict[str, str] = Field(default_factory=dict)
+    # P4.1 分阶段模型：值可为模型名 str，或 dict{model, api_url?, api_key?}（A2 多服务商）
+    models: Dict[str, Union[str, Dict[str, str]]] = Field(default_factory=dict)

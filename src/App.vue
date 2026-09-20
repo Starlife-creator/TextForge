@@ -55,6 +55,11 @@ const mDiagnose = ref('');
 const mBlueprint = ref('');
 const mRefactor = ref('');
 const mStitch = ref('');
+// A2：各阶段可选独立 API 地址（留空则用全局端点）
+const uDiagnose = ref('');
+const uBlueprint = ref('');
+const uRefactor = ref('');
+const uStitch = ref('');
 // 禁改清单（inject_forbidden 门用，每行一条）+ reskin 人名映射（每行 旧名=新名）
 const forbiddenCanon = ref('');
 const nameMapText = ref('');
@@ -72,6 +77,18 @@ function applyPreset() {
   [tDiagnose.value, tBlueprint.value, tRefactor.value, tStitch.value] = p.temps;
   contextWindow.value = p.ctx;
   batchInterval.value = p.interval;
+}
+// A2：构建 models 字典——仅模型则为字符串；配了独立端点则为 {model, api_url}
+function buildModels(): Record<string, string | { model: string; api_url: string }> {
+  const out: Record<string, string | { model: string; api_url: string }> = {};
+  const put = (ph: string, m: string, u: string) => {
+    if (m && m.trim()) out[ph] = (u && u.trim()) ? { model: m.trim(), api_url: u.trim() } : m.trim();
+  };
+  put('diagnose', mDiagnose.value, uDiagnose.value);
+  put('blueprint', mBlueprint.value, uBlueprint.value);
+  put('refactor', mRefactor.value, uRefactor.value);
+  put('stitch', mStitch.value, uStitch.value);
+  return out;
 }
 // C4 成品文档直开
 const finalFiles = ref<{ name: string; path: string }[]>([]);
@@ -507,10 +524,7 @@ async function startPipeline() {
       stitch: tStitch.value,
     },
     batch_interval_sec: batchInterval.value,
-    models: Object.fromEntries(
-      Object.entries({ diagnose: mDiagnose.value, blueprint: mBlueprint.value, refactor: mRefactor.value, stitch: mStitch.value })
-        .filter(([, v]) => v && v.trim()),
-    ),
+    models: buildModels(),
   };
   try {
     const res = await fetch(`${apiBase()}/api/start`, {
@@ -939,13 +953,19 @@ const canStart = computed(() =>
           <summary>分阶段模型（可选，留空用全局模型）</summary>
           <div class="row">
             <label>诊断</label> <input v-model="mDiagnose" placeholder="诊断用模型" />
+            <label class="t">地址</label> <input v-model="uDiagnose" placeholder="(留空=全局)" />
           </div>
           <div class="row">
             <label>蓝图</label> <input v-model="mBlueprint" placeholder="蓝图用模型" />
-            <label class="t">重构</label> <input v-model="mRefactor" placeholder="重构用模型" />
+            <label class="t">地址</label> <input v-model="uBlueprint" placeholder="(留空=全局)" />
+          </div>
+          <div class="row">
+            <label>重构</label> <input v-model="mRefactor" placeholder="重构用模型" />
+            <label class="t">地址</label> <input v-model="uRefactor" placeholder="(留空=全局)" />
           </div>
           <div class="row">
             <label>缝合</label> <input v-model="mStitch" placeholder="缝合用模型" />
+            <label class="t">地址</label> <input v-model="uStitch" placeholder="(留空=全局)" />
           </div>
         </details>
 
