@@ -139,18 +139,41 @@ async def apply_virtual_stitch(prev_v, next_v, client, payload_base, sse_emit_fn
     return patches
 
 async def apply_batch_stitch(prev_batch, next_batch, client, payload_base, sse_emit_fn, run_id, chars):
-    """v8.8 修正：prev 末章 / next 首章，虚拟章映射到父章文件。"""
+    """v8.8 修正：prev 末章 / next 首章，虚拟章映射到父章文件。
+    skip_stitch_if_smooth 门：若后一文件开头是硬分章断点（章节标题/分隔线），
+    视为已自然衔接，跳过该处缝合调用。"""
     progress = payload_base.get('progress') or {}
     prev_last = prev_batch['chapter_ids'][-1]
     next_first = next_batch['chapter_ids'][0]
     prev_file_rel = _chapter_file_for_stitch(prev_last, progress)
     next_file_rel = _chapter_file_for_stitch(next_first, progress)
+    if payload_base.get('skip_smooth'):
+        next_file = Path(payload_base['output_path']) / next_file_rel
+        if next_file.exists():
+            head = unicodedata.normalize('NFC', next_file.read_text(encoding='utf-8', newline=''))[:400]
+            if _is_hard_break(head):
+                logger.info(f"[stitch] skip_smooth：边界 {prev_batch['batch_id']}->{next_batch['batch_id']} 为硬分章断点，跳过缝合")
+                return []
     patches = await _stitch_common(prev_file_rel, next_file_rel,
         Path(payload_base['output_path']), payload_base, client, sse_emit_fn, run_id, chars)
     for p in patches:
         p["source"] = "batch_stitch"
         p["batch_id"] = prev_batch['batch_id']
     return patches
+
+def _is_hard_break(text: str) -> bool:
+    """判断是否硬分章断点：首个非空行为 Markdown 标题 / 中文章节标题 / 分隔线。"""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line in ("---", "***", "___"):
+            return True
+        return bool(
+            re.match(r'^#{1,6}\s+', line)
+            or re.match(r'^第[0-9零一二三四五六七八九十百千万两]+[章节回卷部]', line)
+        )
+    return False
 
 def merge_virtual_chapters(virtuals_sorted, output_path, progress):
     """v8.8 修正：用 \n\n 拼接避免粘连；合并后更新父章 hash。"""

@@ -30,6 +30,7 @@ async def stop(run_id: str | None = Body(None, embed=True)):
     state.blueprint_confirmed.set()  # 解除蓝图等待
     state.split_confirm.set()  # P0.3：解除拆书预览等待
     state.fix_review_confirm.set()  # 解除断层勾选等待
+    state.accept_confirm.set()  # 解除逐章验收等待
     return {"status": "stopping"}
 
 @router.post("/api/split/confirm")
@@ -78,6 +79,31 @@ async def fix_confirm(payload: dict = Body(...)):
         atomic_write_json(progress_path, progress)
     state.fix_review_confirm.set()
     return {"status": "confirmed", "fix_list": fix_list}
+
+@router.post("/api/accept")
+async def accept(payload: dict = Body(...)):
+    """逐章验收确认：仅 phase3_accept 阶段允许。记录该批次已验收章节后放行进下一批。"""
+    _check_run_id(payload.get("run_id"))
+    output_path = state.current_output_path
+    if not output_path: raise HTTPException(409, "no_active_run")
+    progress_path = Path(output_path) / "progress.json"
+    async with state.progress_lock:
+        if not progress_path.exists():
+            raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
+        try:
+            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(409, f"progress.json 无法读取: {e}")
+        if progress.get('current_phase') != 'phase3_accept':
+            raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许验收")
+        progress.setdefault('accepted_batches', [])
+        pend = progress.get('accept_pending_batch')
+        if pend is not None and pend not in progress['accepted_batches']:
+            progress['accepted_batches'].append(pend)
+        progress['current_phase'] = 'phase2'
+        atomic_write_json(progress_path, progress)
+    state.accept_confirm.set()
+    return {"status": "accepted"}
 
 @router.post("/api/blueprint/confirm")
 async def blueprint_confirm(payload: dict = Body(...)):

@@ -5,7 +5,7 @@ from routes.events import sse_emit
 from core.api_client import FatalAPIError, EmptyContentError, RetryableBusinessError, RateLimitError
 from core.splitter import phase0_split, phase1_diagnose
 from core.pipeline import phase2_blueprint
-from core.refactor import phase3_refactor_stitch
+from core.refactor import phase3_refactor_stitch, QCFailedError
 from core.finalize import phase4_finalize
 from utils.atomic import atomic_write_json
 
@@ -68,6 +68,10 @@ async def run_pipeline(req, run_id: str):
         # v8.8 修正：重试后用尽的业务格式错误，保留进度以便下次恢复
         logger.error(f"[run_pipeline] RetryableBusinessError 重试用尽 msg={str(e)[:300]}")
         sse_emit("error", {"kind": "business", "code": "retry_exhausted", "message": str(e)[:500]}, run_id)
+        log_error(progress_path, e)
+    except QCFailedError as e:
+        logger.error(f"[run_pipeline] 质检未通过，阻止导出：{e}")
+        sse_emit("error", {"kind": "qc", "code": "qc_blocked", "message": str(e)[:500]}, run_id)
         log_error(progress_path, e)
     except asyncio.CancelledError:
         logger.info(f"[run_pipeline] 已停止 run_id={run_id}")

@@ -11,6 +11,8 @@ split_confirm = asyncio.Event()            # P0.3 拆书预览确认（仅内存
 split_confirm.set()
 fix_review_confirm = asyncio.Event()       # fix_gaps 断层勾选确认（仅内存，不落盘）
 fix_review_confirm.set()
+accept_confirm = asyncio.Event()           # 逐章验收确认（仅内存，不落盘）
+accept_confirm.set()
 stop_requested = False
 current_run_id: Optional[str] = None
 current_output_path: Optional[str] = None
@@ -22,7 +24,7 @@ logger = logging.getLogger("textforge")
 # 流水线阶段顺序（用于断点恢复时判断阶段是否已完成）
 PHASE_ORDER = {
     "phase0": 0, "phase1": 1, "phase1_fixreview": 2, "phase2": 2,
-    "phase2_waiting": 3, "phase3-1": 4, "phase4": 5,
+    "phase2_waiting": 3, "phase3_accept": 3, "phase3-1": 4, "phase4": 5,
 }
 
 def phase_index(name: str | None) -> int:

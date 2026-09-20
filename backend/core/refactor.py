@@ -1,4 +1,4 @@
-import asyncio, json, time, logging, html
+import asyncio, json, time, logging, html, hashlib
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
@@ -12,6 +12,12 @@ class ChapterBreakMissingError(RetryableBusinessError):
     """v8.8 修正：继承 RetryableBusinessError，才能进入 call_with_retry 的重试路径。"""
     pass
 
+class QCFailedError(Exception):
+    """质检拦截导出门未通过：阻止 phase4 导出，携带质检问题清单。"""
+    def __init__(self, message, issues):
+        self.issues = issues
+        super().__init__(message)
+
 async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     output_path = Path(req.output_path)
     recon_dir = output_path / "02_workspace/reconstructed"
@@ -20,7 +26,8 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     blueprint_text = (output_path / "Story_Bible.md").read_text(encoding='utf-8')
     chars = req.context_window * 1.5
     blueprint_for_stitch = blueprint_text[:int(chars * 0.10)]
-    
+
+    gates = getattr(req, "refactor_gates", {}) or {}
     payload_base = {
         "output_path": req.output_path,
         "api_url": req.api_url,
@@ -28,6 +35,7 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         "author_style": req.author_style,
         "payload": {"model": pick_model(req, "stitch"), "temperature": req.temperatures.stitch, "stream": True},
         "progress": progress,      # v8.8：供 apply_batch_stitch 映射虚拟章父章
+        "skip_smooth": bool(gates.get("skip_stitch_if_smooth")),
     }
     
     completed_batches = [b for b in progress['batches'] if b['status'] == 'phase1_done']
@@ -52,6 +60,9 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                 atomic_write_json(progress_path, progress)
             logger.info(f"[phase3] batch {batch['batch_id']} 完成 文件={output_files}")
             sse_emit("batch_done", {"batch_id": batch['batch_id'], "output_files": output_files}, run_id)
+            # 逐章验收门：开启时每个批次重构稿产出后暂停，等待用户验收再继续
+            if gates.get("require_chapter_accept"):
+                await _wait_batch_accept(progress, progress_path, batch, output_path, run_id)
             # 铁律8：批次间保持 2s 串行间隔，避免连续请求触发云端限流
             pending_batches -= 1
             if pending_batches > 0:
@@ -70,7 +81,17 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     if getattr(req, "chapter_snapshots", False):
         n = _write_snapshot_finals(output_path, progress)
         logger.info(f"[snapshot] 缝合终稿快照完成 final={n}")
-    
+
+    # 质检拦截导出门：未通过则阻止 phase4（不设 current_phase=phase4）
+    if gates.get("qc_block_export"):
+        issues = _run_qc(output_path, progress)
+        if issues:
+            progress['qc_issues'] = issues
+            async with state.progress_lock:
+                atomic_write_json(progress_path, progress)
+            sse_emit("qc_failed", {"issues": issues}, run_id)
+            raise QCFailedError("质检未通过，已阻止导出", issues)
+
     progress['current_phase'] = 'phase4'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
@@ -151,15 +172,37 @@ def _split_refactored_by_chapters(text: str, chapter_ids: list) -> dict:
 def _build_refactor_prompt(mode, blueprint, author_style, batch_content, *,
                            forbidden_canon=(), name_map=None, fix_list=(), gates=None):
     """按重构档位选择提示词。缺省/未知 mode 一律回退 full_rewrite（原行为）。
-    full_rewrite 不注入任何锁定/禁改/映射清单——这是默认极端档本身。"""
+    档位提示词构建后，若启用了任何「保护门」(lock_names/lock_plot/inject_forbidden)，
+    追加一段强制规则；全关时完全不加，旧行为不变。"""
     mode = mode or "full_rewrite"
     if mode == "fidelity":
-        return _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates)
-    if mode == "fix_gaps":
-        return _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates)
-    if mode == "reskin":
-        return _prompt_reskin(blueprint, author_style, batch_content, name_map)
-    return _prompt_full_rewrite(blueprint, author_style, batch_content)
+        prompt = _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates)
+    elif mode == "fix_gaps":
+        prompt = _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates)
+    elif mode == "reskin":
+        prompt = _prompt_reskin(blueprint, author_style, batch_content, name_map)
+    else:
+        prompt = _prompt_full_rewrite(blueprint, author_style, batch_content)
+    gate_block = _render_gate_rules(gates, forbidden_canon)
+    if gate_block:
+        prompt += "\n\n【本次已启用的保护门（强制遵守）】\n" + gate_block
+    return prompt
+
+
+def _render_gate_rules(gates, forbidden_canon):
+    """把已开启的提示词级保护门渲染为追加规则段。全关返回空字符串（不改旧行为）。"""
+    gates = gates or {}
+    rules = []
+    if gates.get("lock_names"):
+        rules.append("- 锁定人名、地名与专有名词：一律原样保留，不得改动、替换或省略（确需调整请另用 *改动说明* 标注）。")
+    if gates.get("lock_plot"):
+        rules.append("- 锁定剧情骨架与关键事件顺序：不得增删、重排关键情节，仅优化表述与过渡。")
+    if gates.get("inject_forbidden"):
+        items = [x for x in (forbidden_canon or []) if str(x).strip()]
+        if items:
+            rules.append("- 禁止修改以下内容（原样保留，不得替换/删除/改写）：")
+            rules += [f"  * {x}" for x in items]
+    return "\n".join(rules)
 
 
 # 统一的格式契约：Markdown 保留、标题行保留、===CHAPTER_BREAK=== 分隔、直接输出正文。
@@ -359,6 +402,66 @@ def _write_chapter_comparison(comp_dir: Path, out_id, original: str, reconstruct
     )
     atomic_write_text(comp_dir / rel, md)
     return rel
+
+async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id):
+    """逐章验收门：批次重构稿产出后暂停，推送该批章节预览等待用户验收，确认后继续下一批。
+    未验收前 current_phase='phase3_accept'，恢复时该批仍 pending 会重新推送，幂等。"""
+    output_path = Path(output_path)
+    chapters = []
+    for cid in batch['chapter_ids']:
+        recon_file = output_path / "02_workspace/reconstructed" / f"chapter_{cid}.txt"
+        preview = ""
+        try:
+            preview = recon_file.read_text(encoding='utf-8', newline='')[:80]
+        except OSError:
+            preview = ""
+        chapters.append({"id": cid, "preview": preview})
+    progress['current_phase'] = 'phase3_accept'
+    progress['accept_pending_batch'] = batch['batch_id']
+    async with state.progress_lock:
+        atomic_write_json(progress_path, progress)
+    sse_emit("accept_ready", {"batch_id": batch['batch_id'], "chapters": chapters,
+        "accepted": progress.get('accepted_batches', [])}, run_id)
+    logger.info(f"[accept] 批次 {batch['batch_id']} 待验收（{len(chapters)} 章）")
+    state.accept_confirm.clear()
+    while not state.accept_confirm.is_set():
+        if state.stop_requested: raise asyncio.CancelledError()
+        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        async with state.progress_lock:
+            atomic_write_json(progress_path, progress)
+        await asyncio.sleep(1.0)
+    progress['current_phase'] = 'phase2'
+    async with state.progress_lock:
+        atomic_write_json(progress_path, progress)
+
+def _run_qc(output_path, progress):
+    """质检拦截导出门：对最终逻辑章做轻量规则质检，返回问题清单（空表 = 通过）。
+    规则：空章 / 疑似重复（哈希相同）/ 残留机器分隔标记 / 疑似占位未完稿。"""
+    output_path = Path(output_path)
+    issues = []
+    hashes = {}
+    for out_id in _iter_output_chapter_ids(progress):
+        recon_file = output_path / "02_workspace/reconstructed" / f"chapter_{out_id}.txt"
+        if not recon_file.exists():
+            issues.append(f"章 {out_id}: 缺少重构稿（reconstructed/chapter_{out_id}.txt）")
+            continue
+        text = recon_file.read_text(encoding='utf-8', newline='').strip()
+        if not text:
+            issues.append(f"章 {out_id}: 为空章")
+            continue
+        if "===CHAPTER_BREAK===" in text:
+            issues.append(f"章 {out_id}: 残留机器分隔标记 ===CHAPTER_BREAK===")
+        low = text.lower()
+        for kw in ("todo", "占位符", "待补", "此处省略"):
+            if kw in low:
+                issues.append(f"章 {out_id}: 疑似占位/未完稿（出现「{kw}」）")
+                break
+        h = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        if h in hashes:
+            issues.append(f"章 {out_id}: 与第 {hashes[h]} 章内容重复（可能未重构）")
+        hashes[h] = out_id
+    return issues
+
 
 async def _wait_pause(progress, progress_path):
     while not state.pause_event.is_set():

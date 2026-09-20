@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
 import { open } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { waitForPort } from './api/backend';
@@ -24,6 +24,16 @@ const contextWindow = ref(8000);
 const authorStyle = ref('出版级文学重构，文笔凝练，注重画面感');
 const novelName = ref('');
 const refactorMode = ref<'full_rewrite' | 'fidelity' | 'fix_gaps' | 'reskin'>('full_rewrite');
+// 重构保护门（后端 refactor_gates，默认全关）
+const gates = reactive({
+  lock_names: false, lock_plot: false, inject_forbidden: false,
+  require_chapter_accept: false, skip_stitch_if_smooth: false, qc_block_export: false,
+});
+// 逐章验收弹窗
+const showAccept = ref(false);
+const acceptBatch = ref<number | null>(null);
+const acceptChapters = ref<any[]>([]);
+const confirmingAccept = ref(false);
 const proxy = ref('');
 const richText = ref(false);
 // 各阶段温度（高级项，对应后端 Temperatures）
@@ -193,6 +203,18 @@ function handleSSEEvent(event: string, payload: any) {
       showFixReview.value = true;
       addLog(`断层诊断完成，共 ${fixGaps.value.length} 项，请勾选需要修复的断层`);
       break;
+    case 'accept_ready':
+      // 逐章验收门：本批重构稿已产出，等待验收
+      acceptBatch.value = payload.batch_id;
+      acceptChapters.value = payload.chapters || [];
+      showAccept.value = true;
+      addLog(`批次 ${payload.batch_id} 重构稿已产出，请验收后继续`);
+      break;
+    case 'qc_failed':
+      // 质检拦截导出：展示质检问题
+      addLog(`质检未通过（${(payload.issues || []).length} 项问题），已阻止导出`);
+      alert(`质检未通过，已阻止导出：\n\n${(payload.issues || []).join('\n')}`);
+      break;
     case 'blueprint_ready':
       blueprintText.value = payload.blueprint || '';
       showBlueprint.value = true;
@@ -292,6 +314,7 @@ async function startPipeline() {
     novel_name: novelName.value || null,
     refactor_mode: refactorMode.value,
     review_split: reviewSplit.value,
+    refactor_gates: { ...gates },
     compare_output: compareOutput.value,
     chapter_snapshots: chapterSnapshots.value,
     diagnose_json: diagnoseJson.value || null,
@@ -372,6 +395,29 @@ async function confirmFix() {
     alert(`请求失败：${e.message}`);
   } finally {
     confirmingFix.value = false;
+  }
+}
+
+async function confirmAccept() {
+  if (confirmingAccept.value) return; // 防重复点击
+  confirmingAccept.value = true;
+  try {
+    const res = await fetch(`${apiBase()}/api/accept`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId.value }),
+    });
+    if (res.ok) {
+      showAccept.value = false;
+      addLog(`批次 ${acceptBatch.value} 已验收，继续重构`);
+    } else {
+      const d = await res.json();
+      alert(`验收失败：${d.detail || res.status}`);
+    }
+  } catch (e: any) {
+    alert(`请求失败：${e.message}`);
+  } finally {
+    confirmingAccept.value = false;
   }
 }
 
@@ -504,6 +550,19 @@ const canStart = computed(() =>
             <option value="fix_gaps">修断层</option>
             <option value="reskin">换皮</option>
           </select>
+        </div>
+
+        <div class="row">
+          <label>保护门</label>
+          <details class="adv gates">
+            <summary>重构保护门（默认全关）</summary>
+            <label class="rich"><input type="checkbox" v-model="gates.lock_names" /> 锁人名/设定名</label>
+            <label class="rich"><input type="checkbox" v-model="gates.lock_plot" /> 锁剧情骨架</label>
+            <label class="rich"><input type="checkbox" v-model="gates.inject_forbidden" /> 注入禁改清单</label>
+            <label class="rich"><input type="checkbox" v-model="gates.require_chapter_accept" /> 逐章验收</label>
+            <label class="rich"><input type="checkbox" v-model="gates.skip_stitch_if_smooth" /> 平滑衔接跳过缝合</label>
+            <label class="rich"><input type="checkbox" v-model="gates.qc_block_export" /> 质检拦截导出</label>
+          </details>
         </div>
 
         <div class="row">
@@ -645,6 +704,24 @@ const canStart = computed(() =>
       </div>
     </div>
 
+    <!-- 逐章验收确认弹窗 -->
+    <div v-if="showAccept" class="modal-mask">
+      <div class="modal">
+        <h3>验收重构稿：批次 {{ acceptBatch }}</h3>
+        <p class="hint">以下为本批已产出的章节（预览为开头 80 字）。验收通过后继续下一批；不通过请停止后调整或重跑。</p>
+        <div class="sum-list">
+          <div v-for="c in acceptChapters" :key="c.id" class="split-row">
+            <span class="split-id">{{ c.id }}</span>
+            <span class="fix-desc">{{ c.preview }}</span>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <span></span>
+          <button :disabled="confirmingAccept" @click="confirmAccept">验收通过，继续</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 蓝图确认弹窗 -->
     <div v-if="showBlueprint" class="modal-mask">
       <div class="modal">
@@ -771,6 +848,8 @@ const canStart = computed(() =>
 .row label.t + input, .row label.rich + input { flex: 1; }
 .adv { border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; }
 .adv summary { font-size: 13px; color: #4a5568; cursor: pointer; }
+.adv.gates { display: flex; flex-direction: column; flex: 1; }
+.adv.gates .rich { margin: 3px 0; }
 .row textarea {
   width: 100%;
   padding: 6px 10px;
