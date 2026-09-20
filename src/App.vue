@@ -472,6 +472,23 @@ async function confirmAccept() {
   }
 }
 
+async function openOutput() {
+  if (!outputPath.value) return;
+  try {
+    const res = await fetch(`${apiBase()}/api/open_output`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ output_path: outputPath.value }),
+    });
+    if (!res.ok) {
+      const d = await res.json();
+      alert(`打开失败：${d.detail || res.status}`);
+    }
+  } catch (e: any) {
+    alert(`请求失败：${e.message}`);
+  }
+}
+
 async function confirmBlueprint() {
   if (confirmingBlueprint.value) return; // 防重复点击
   if (blueprintText.value.length < 100) {
@@ -694,6 +711,7 @@ const canStart = computed(() =>
           <span v-if="currentPhase" class="phase">{{ currentPhase }}</span>
           <span v-if="isPaused" class="badge paused">已暂停</span>
           <span v-if="pipelineRunning" class="badge running">运行中</span>
+          <button v-if="outputPath" class="open-btn" @click="openOutput">打开输出目录</button>
         </div>
 
         <div class="controls" v-if="pipelineRunning">
@@ -902,6 +920,8 @@ const canStart = computed(() =>
 .bar-fill { height: 100%; width: 0; background: #3182ce; border-radius: 5px; transition: width 0.3s ease; }
 .bar-fill.recon { background: #38a169; }
 .bar-num { flex: 0 0 60px; text-align: right; }
+.open-btn { margin-left: auto; padding: 4px 12px; border: 1px solid #3182ce; color: #3182ce; background: #fff; border-radius: 5px; font-size: 12px; cursor: pointer; }
+.open-btn:hover { background: #ebf8ff; }
 
 .row {
   display: flex;

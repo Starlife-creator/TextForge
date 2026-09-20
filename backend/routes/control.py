@@ -1,3 +1,4 @@
+import os, subprocess, sys
 from fastapi import APIRouter, HTTPException, Body
 from routes import state
 from pathlib import Path
@@ -80,10 +81,27 @@ async def fix_confirm(payload: dict = Body(...)):
     state.fix_review_confirm.set()
     return {"status": "confirmed", "fix_list": fix_list}
 
+@router.post("/api/open_output")
+async def open_output(payload: dict = Body(...)):
+    """在系统文件管理器打开输出目录（本地调用，无需额外插件）。"""
+    path = payload.get("output_path") or ""
+    p = Path(path)
+    if not p.is_dir():
+        raise HTTPException(404, f"输出目录不存在: {path}")
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(p))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+    except Exception as e:
+        raise HTTPException(500, f"打开目录失败: {e}")
+    return {"status": "opened"}
+
 @router.post("/api/accept")
 async def accept(payload: dict = Body(...)):
     """逐章验收确认：仅 phase3_accept 阶段允许。记录该批次已验收章节后放行进下一批。"""
-    _check_run_id(payload.get("run_id"))
     output_path = state.current_output_path
     if not output_path: raise HTTPException(409, "no_active_run")
     progress_path = Path(output_path) / "progress.json"
