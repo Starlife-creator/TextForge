@@ -8,7 +8,11 @@ import { connectSSE, disconnectSSE } from './api/sse';
 // ---------- 后端连接 ----------
 const port = ref<number | null>(null);
 const backendReady = ref(false);
-const errorMsg = ref<string | null>(null);
+const errorMsg = ref('');
+// 运行计时
+const startedAt = ref<number | null>(null);
+const elapsed = ref('00:00');
+let elapsedTimer: number | null = null;
 const inTauri = isTauri();
 let statusTimer: number | null = null;
 
@@ -134,7 +138,7 @@ onMounted(async () => {
   }
 });
 
-onUnmounted(() => stopStatusPolling());
+onUnmounted(() => { stopStatusPolling(); stopElapsed(); });
 
 function startStatusPolling() {
   stopStatusPolling();
@@ -142,6 +146,22 @@ function startStatusPolling() {
 }
 function stopStatusPolling() {
   if (statusTimer !== null) { clearInterval(statusTimer); statusTimer = null; }
+}
+
+function startElapsed() {
+  startedAt.value = Date.now();
+  elapsed.value = '00:00';
+  if (elapsedTimer !== null) clearInterval(elapsedTimer);
+  elapsedTimer = window.setInterval(() => {
+    if (startedAt.value == null) return;
+    const s = Math.max(0, Math.floor((Date.now() - startedAt.value) / 1000));
+    const m = Math.floor(s / 60);
+    const ss = s % 60;
+    elapsed.value = `${String(m).padStart(2, '0')}:${String(ss).padStart(2, '0')}`;
+  }, 1000);
+}
+function stopElapsed() {
+  if (elapsedTimer !== null) { clearInterval(elapsedTimer); elapsedTimer = null; }
 }
 
 async function fetchStatus() {
@@ -193,6 +213,7 @@ function handleSSEEvent(event: string, payload: any) {
         ? '检测到未完成的进度，将从断点继续（已完成的阶段/批次自动跳过）'
         : null;
       addLog(`流水线启动${payload.resumed ? '（断点恢复）' : ''}`);
+      startElapsed();
       break;
     case 'phase_done':
       if (payload.phase === 'phase0') totalChapters.value = payload.total_chapters;
@@ -262,6 +283,7 @@ function handleSSEEvent(event: string, payload: any) {
       disconnectSSE();     // #4 结束后断开 SSE，避免 keep-alive 空挂
       topTip.value = `全部完成！成品在：${payload.output_dir}\\03_final`;
       addLog(`全部完成！输出目录：${payload.output_dir}`, 'ok');
+      stopElapsed();
       break;
     case 'stopped':
       pipelineRunning.value = false;
@@ -269,6 +291,7 @@ function handleSSEEvent(event: string, payload: any) {
       disconnectSSE();
       topTip.value = '流水线已停止，进度已保留；再次点击“开始重构”可从断点继续';
       addLog('流水线已停止', 'warn');
+      stopElapsed();
       break;
     case 'error':
       addLog(`错误：${payload.message || payload.code}`, 'err');
@@ -278,6 +301,7 @@ function handleSSEEvent(event: string, payload: any) {
         disconnectSSE();
         topError.value = payload.message || payload.code || '未知错误';
       }
+      stopElapsed();
       break;
   }
 }
@@ -371,6 +395,7 @@ async function startPipeline() {
     runId.value = data.run_id;
     eventLog.value = [];
     addLog(`已提交流水线 run_id=${data.run_id.slice(0, 8)}...`);
+    startElapsed();
   } catch (e: any) {
     alert(`请求失败：${e.message}`);
   }
@@ -681,6 +706,7 @@ const canStart = computed(() =>
           <span class="stat">总章节：<b>{{ totalChapters || '-' }}</b></span>
           <span class="stat">批次：<b>{{ batchStats.phase1 }}/{{ batchStats.total }}</b>（诊断）</span>
           <span class="stat">重构：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b></span>
+          <span class="stat" v-if="pipelineRunning || elapsed !== '00:00'">已运行：<b>{{ elapsed }}</b></span>
           <span class="stat">Tokens：<b>{{ usageTokens.prompt }}</b>输入 / <b>{{ usageTokens.completion }}</b>输出</span>
         </div>
 
