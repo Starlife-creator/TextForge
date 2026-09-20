@@ -162,7 +162,7 @@ async def apply_batch_stitch(prev_batch, next_batch, client, payload_base, sse_e
     return patches
 
 def _is_hard_break(text: str) -> bool:
-    """判断是否硬分章断点：首个非空行为 Markdown 标题 / 中文章节标题 / 分隔线。"""
+    """判断是否硬分章断点：首个非空行为 Markdown 标题 / 中英章节标题 / 分隔线 / 编号标题。"""
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -171,7 +171,10 @@ def _is_hard_break(text: str) -> bool:
             return True
         return bool(
             re.match(r'^#{1,6}\s+', line)
-            or re.match(r'^第[0-9零一二三四五六七八九十百千万两]+[章节回卷部]', line)
+            or re.match(r'^第[0-9零一二三四五六七八九十百千万两]+[章节回卷部篇]', line)
+            or re.match(r'^(chapter|CHAPTER)\s*\d+', line)
+            or re.match(r'^(chapter|CHAPTER)[\s#:.]+', line)
+            or re.match(r'^\d{1,3}[.、．]\s*\S', line)
         )
     return False
 

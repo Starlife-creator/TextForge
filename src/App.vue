@@ -93,8 +93,14 @@ const streamingText = ref('');
 // 统计与提示
 const usageTokens = ref({ prompt: 0, completion: 0 });
 const batchStats = ref({ total: 0, phase1: 0, phase3: 0 });
+const chapterProgress = ref({ total: 0, done: 0 });
 const topError = ref<string | null>(null);
 const topTip = ref<string | null>(null);
+const darkMode = ref(false);
+function toggleTheme() {
+  darkMode.value = !darkMode.value;
+  document.documentElement.classList.toggle('dark', darkMode.value);
+}
 
 const phaseLabel: Record<string, string> = {
   phase0: '阶段0：拆书',
@@ -118,6 +124,10 @@ const diagPercent = computed(() => {
 const reconPercent = computed(() => {
   const t = batchStats.value.total;
   return t ? `${Math.round((batchStats.value.phase3 / t) * 100)}%` : '0%';
+});
+const chapterPercent = computed(() => {
+  const t = chapterProgress.value.total;
+  return t ? `${Math.round((chapterProgress.value.done / t) * 100)}%` : '0%';
 });
 
 // 新日志自动滚到底部
@@ -186,6 +196,10 @@ async function fetchStatus() {
       total: s.batches.total || 0,
       phase1: s.batches.phase1_done || 0,
       phase3: s.batches.phase3_done || 0,
+    };
+    if (s.total_logic_chapters || s.reconstructed_chapters) chapterProgress.value = {
+      total: s.total_logic_chapters || 0,
+      done: s.reconstructed_chapters || 0,
     };
     if (s.pipeline_running) {
       pipelineRunning.value = true;
@@ -482,19 +496,32 @@ async function confirmAccept() {
 }
 
 async function openOutput() {
+  await callOpenOutput(outputPath.value);
+}
+
+async function openFinal() {
   if (!outputPath.value) return;
+  const root = outputPath.value.replace(/[\\/]+$/, '');
+  const ok = await callOpenOutput(`${root}/03_final`);
+  if (!ok) await callOpenOutput(root); // 成品目录尚未生成则打开输出根目录
+}
+
+async function callOpenOutput(path: string): Promise<boolean> {
   try {
     const res = await fetch(`${apiBase()}/api/open_output`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ output_path: outputPath.value }),
+      body: JSON.stringify({ output_path: path }),
     });
     if (!res.ok) {
       const d = await res.json();
       alert(`打开失败：${d.detail || res.status}`);
+      return false;
     }
+    return true;
   } catch (e: any) {
     alert(`请求失败：${e.message}`);
+    return false;
   }
 }
 
@@ -599,6 +626,7 @@ const canStart = computed(() =>
       <div class="status">
         <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
         {{ backendReady ? '后端已连接' : (errorMsg || '连接中...') }}
+        <button class="theme-toggle" @click="toggleTheme">{{ darkMode ? '☀︎' : '☾' }}</button>
       </div>
     </header>
 
@@ -683,7 +711,7 @@ const canStart = computed(() =>
           </details>
         </div>
 
-        <div class="row col">
+        <div v-if="gates.inject_forbidden || refactorMode === 'reskin'" class="row col">
           <label>禁改清单 / 人名映射（配合“保护门·注入禁改清单”与“换皮”模式）</label>
           <textarea v-model="forbiddenCanon" rows="2" placeholder="禁改清单：每行一条，如&#10;主角不能再死亡&#10;不许改设定名" class="lone-area"></textarea>
           <textarea v-model="nameMapText" rows="2" placeholder="换皮映射：每行 旧名=新名，如&#10;林晚=苏晴" class="lone-area"></textarea>
@@ -762,6 +790,7 @@ const canStart = computed(() =>
           <span v-if="isPaused" class="badge paused">已暂停</span>
           <span v-if="pipelineRunning" class="badge running">运行中</span>
           <button v-if="outputPath" class="open-btn" @click="openOutput">打开输出目录</button>
+          <button v-if="outputPath" class="open-btn ghost" @click="openFinal">打开成品</button>
         </div>
 
         <div class="controls" v-if="pipelineRunning">
@@ -788,6 +817,11 @@ const canStart = computed(() =>
             <span class="bar-label">重构批次</span>
             <div class="bar-track"><div class="bar-fill recon" :style="{ width: reconPercent }"></div></div>
             <span class="bar-num">{{ batchStats.phase3 }}/{{ batchStats.total }} · {{ reconPercent }}</span>
+          </div>
+          <div v-if="chapterProgress.total" class="bar">
+            <span class="bar-label">已重构章</span>
+            <div class="bar-track"><div class="bar-fill chapter" :style="{ width: chapterPercent }"></div></div>
+            <span class="bar-num">{{ chapterProgress.done }}/{{ chapterProgress.total }} · {{ chapterPercent }}</span>
           </div>
         </div>
 
@@ -985,9 +1019,12 @@ const canStart = computed(() =>
 .bar-track { flex: 1; height: 8px; background: #edf2f7; border-radius: 5px; overflow: hidden; }
 .bar-fill { height: 100%; width: 0; background: #3182ce; border-radius: 5px; transition: width 0.3s ease; }
 .bar-fill.recon { background: #38a169; }
+.bar-fill.chapter { background: #805ad5; }
 .bar-num { flex: 0 0 60px; text-align: right; }
 .open-btn { margin-left: auto; padding: 4px 12px; border: 1px solid #3182ce; color: #3182ce; background: #fff; border-radius: 5px; font-size: 12px; cursor: pointer; }
 .open-btn:hover { background: #ebf8ff; }
+.open-btn.ghost { margin-left: 6px; border-color: #38a169; color: #38a169; }
+.open-btn.ghost:hover { background: #f0fff4; }
 
 .row {
   display: flex;
@@ -1181,4 +1218,39 @@ const canStart = computed(() =>
   border-radius: 5px;
   cursor: pointer;
 }
+
+.theme-toggle {
+  margin-left: 8px;
+  padding: 2px 10px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  color: #fff;
+  border-radius: 5px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.theme-toggle:hover { background: rgba(255, 255, 255, 0.12); }
+
+/* 深色主题（html.dark）最小覆盖 */
+html.dark .app { background: #171923; color: #e2e8f0; }
+html.dark .panel { background: #1f2733; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+html.dark .panel h2 { color: #e2e8f0; }
+html.dark .row label,
+html.dark .phase, html.dark .phase-bar .open-btn { color: #e2e8f0; }
+html.dark input, html.dark select, html.dark textarea {
+  background: #1a202c; color: #e2e8f0; border-color: #4a5568;
+}
+html.dark .stats { background: #232b39; color: #a0aec0; }
+html.dark .stat b { color: #e2e8f0; }
+html.dark .bar-track { background: #2d3748; }
+html.dark .bar, html.dark .bar-num, html.dark .bar-label { color: #a0aec0; }
+html.dark .adv { border-color: #4a5568; }
+html.dark .adv summary, html.dark .log-count, html.dark .sum-empty { color: #a0aec0; }
+html.dark .stream-box { background: #1a202c; border-color: #4a5568; color: #e2e8f0; }
+html.dark .sum-list { background: #232b39; border-color: #4a5568; }
+html.dark .split-id, html.dark .sum-item summary { color: #e2e8f0; }
+html.dark .fix-desc, html.dark .sum-preview { color: #a0aec0; }
+html.dark .modal { background: #1f2733; }
+html.dark .controls button, html.dark .row button { background: #2d3748; color: #e2e8f0; border-color: #4a5568; }
+html.dark .start-btn:disabled { background: #4a5568; }
 </style>

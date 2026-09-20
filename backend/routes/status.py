@@ -27,6 +27,12 @@ async def status(output_path: str | None = None):
                 "has_progress": True, "progress_error": f"progress.json 无法读取: {e}"}
 
     batches = progress.get("batches", [])
+    # #2 章级进度：按逻辑章（虚拟章组折叠到父章）统计总数与已重构数
+    logic_ids = _logic_chapter_ids(progress.get("chapters", []))
+    reconstructed = sum(
+        1 for oid in logic_ids
+        if (Path(target) / "02_workspace/reconstructed" / f"chapter_{oid}.txt").exists()
+    )
     data = {
         "pipeline_running": state.pipeline_running,
         "paused": paused,
@@ -35,6 +41,8 @@ async def status(output_path: str | None = None):
         "current_phase": progress.get("current_phase"),
         "novel_name": progress.get("novel_name"),
         "total_chapters": len(progress.get("chapters", [])),
+        "total_logic_chapters": len(logic_ids),
+        "reconstructed_chapters": reconstructed,
         "resumed": progress.get("resumed", False),
         "blueprint_confirmed": progress.get("blueprint_confirmed", False),
         "usage": progress.get("usage", {}),
@@ -63,3 +71,20 @@ async def status(output_path: str | None = None):
         if prev:
             data["summaries"] = prev
     return data
+
+
+def _logic_chapter_ids(chapters) -> list:
+    """返回最终成书的逻辑章 id：空章剔除；虚拟章组折叠到父章（original_id）；去重保序。"""
+    ids = []
+    seen = set()
+    for ch in chapters:
+        if ch.get('is_empty'):
+            continue
+        if ch.get('is_virtual') or ch.get('is_virtual_parent'):
+            out_id = ch.get('original_id') or ch.get('id')
+        else:
+            out_id = ch.get('id')
+        if out_id and out_id not in seen:
+            seen.add(out_id)
+            ids.append(out_id)
+    return ids
