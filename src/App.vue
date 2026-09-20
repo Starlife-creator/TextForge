@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue';
 import { open } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { waitForPort } from './api/backend';
@@ -52,7 +52,9 @@ const runId = ref<string | null>(null);
 const pipelineRunning = ref(false);
 const isPaused = ref(false);
 const currentPhase = ref('');
-const eventLog = ref<string[]>([]);
+type LogEntry = { ts: string; text: string; level: 'info' | 'ok' | 'warn' | 'err' | 'accent' };
+const eventLog = ref<LogEntry[]>([]);
+const logBoxRef = ref<HTMLElement | null>(null);
 const totalChapters = ref(0);
 const blueprintText = ref('');
 const showBlueprint = ref(false);
@@ -92,11 +94,26 @@ const phaseLabel: Record<string, string> = {
   phase4: '阶段4：收尾',
 };
 
-function addLog(msg: string) {
+function addLog(msg: string, level: LogEntry['level'] = 'info') {
   const ts = new Date().toLocaleTimeString();
-  eventLog.value.push(`[${ts}] ${msg}`);
-  if (eventLog.value.length > 200) eventLog.value.shift();
+  eventLog.value.push({ ts, text: msg, level });
+  if (eventLog.value.length > 300) eventLog.value.shift();
 }
+
+const diagPercent = computed(() => {
+  const t = batchStats.value.total;
+  return t ? `${Math.round((batchStats.value.phase1 / t) * 100)}%` : '0%';
+});
+const reconPercent = computed(() => {
+  const t = batchStats.value.total;
+  return t ? `${Math.round((batchStats.value.phase3 / t) * 100)}%` : '0%';
+});
+
+// 新日志自动滚到底部
+watch(eventLog, () => {
+  const el = logBoxRef.value;
+  if (el) el.scrollTop = el.scrollHeight;
+});
 
 onMounted(async () => {
   try {
@@ -177,14 +194,14 @@ function handleSSEEvent(event: string, payload: any) {
     case 'phase_done':
       if (payload.phase === 'phase0') totalChapters.value = payload.total_chapters;
       currentPhase.value = phaseLabel[payload.phase] || payload.phase;
-      addLog(`阶段完成：${phaseLabel[payload.phase] || payload.phase}${payload.resumed_skip ? '（恢复跳过）' : ''}`);
+      addLog(`阶段完成：${phaseLabel[payload.phase] || payload.phase}${payload.resumed_skip ? '（恢复跳过）' : ''}`, 'ok');
       break;
     case 'batch_start':
       streamingText.value = ''; // 新批次清空流式预览
-      addLog(`批次 ${payload.batch_id} 开始：章节 ${payload.chapter_ids?.join(',')}`);
+      addLog(`批次 ${payload.batch_id} 开始：章节 ${payload.chapter_ids?.join(',')}`, 'accent');
       break;
     case 'batch_done':
-      addLog(`批次 ${payload.batch_id} 完成`);
+      addLog(`批次 ${payload.batch_id} 完成`, 'accent');
       break;
     case 'stream_chunk':
       // #2 节流后的流式增量，保留最近 500 字
@@ -194,25 +211,25 @@ function handleSSEEvent(event: string, payload: any) {
       // P0.3：拆书完成，等待用户确认拆分后进入诊断
       splitChapters.value = payload.chapters || [];
       showSplit.value = true;
-      addLog(`拆书完成，共 ${splitChapters.value.length} 章，请确认`);
+      addLog(`拆书完成，共 ${splitChapters.value.length} 章，请确认`, 'warn');
       break;
     case 'fix_ready':
       // fix_gaps 闭环：诊断断层清单已就绪，等待勾选确认
       fixGaps.value = payload.gaps || [];
       fixSelected.value = fixGaps.value.map((g: any) => g.id).filter(Boolean);
       showFixReview.value = true;
-      addLog(`断层诊断完成，共 ${fixGaps.value.length} 项，请勾选需要修复的断层`);
+      addLog(`断层诊断完成，共 ${fixGaps.value.length} 项，请勾选需要修复的断层`, 'warn');
       break;
     case 'accept_ready':
       // 逐章验收门：本批重构稿已产出，等待验收
       acceptBatch.value = payload.batch_id;
       acceptChapters.value = payload.chapters || [];
       showAccept.value = true;
-      addLog(`批次 ${payload.batch_id} 重构稿已产出，请验收后继续`);
+      addLog(`批次 ${payload.batch_id} 重构稿已产出，请验收后继续`, 'warn');
       break;
     case 'qc_failed':
       // 质检拦截导出：展示质检问题
-      addLog(`质检未通过（${(payload.issues || []).length} 项问题），已阻止导出`);
+      addLog(`质检未通过（${(payload.issues || []).length} 项问题），已阻止导出`, 'err');
       alert(`质检未通过，已阻止导出：\n\n${(payload.issues || []).join('\n')}`);
       break;
     case 'blueprint_ready':
@@ -222,18 +239,18 @@ function handleSSEEvent(event: string, payload: any) {
       addLog(payload.resumed ? '待确认蓝图（恢复）' : '蓝图已生成，请确认后继续');
       break;
     case 'stitch_start':
-      addLog(`缝合阶段${payload.stage}开始（${payload.count} 处）`);
+      addLog(`缝合阶段${payload.stage}开始（${payload.count} 处）`, 'accent');
       break;
     case 'stitch_done':
-      addLog(`缝合阶段${payload.stage}完成`);
+      addLog(`缝合阶段${payload.stage}完成`, 'accent');
       break;
     case 'paused':
       isPaused.value = true;
-      addLog('已暂停');
+      addLog('已暂停', 'warn');
       break;
     case 'resumed':
       isPaused.value = false;
-      addLog('已恢复');
+      addLog('已恢复', 'warn');
       break;
     case 'done':
       pipelineRunning.value = false;
@@ -241,17 +258,17 @@ function handleSSEEvent(event: string, payload: any) {
       stopStatusPolling(); // C: 结束后停掉轮询，避免空转
       disconnectSSE();     // #4 结束后断开 SSE，避免 keep-alive 空挂
       topTip.value = `全部完成！成品在：${payload.output_dir}\\03_final`;
-      addLog(`全部完成！输出目录：${payload.output_dir}`);
+      addLog(`全部完成！输出目录：${payload.output_dir}`, 'ok');
       break;
     case 'stopped':
       pipelineRunning.value = false;
       stopStatusPolling();
       disconnectSSE();
       topTip.value = '流水线已停止，进度已保留；再次点击“开始重构”可从断点继续';
-      addLog('流水线已停止');
+      addLog('流水线已停止', 'warn');
       break;
     case 'error':
-      addLog(`错误：${payload.message || payload.code}`);
+      addLog(`错误：${payload.message || payload.code}`, 'err');
       if (payload.kind !== 'warning') {
         pipelineRunning.value = false;
         stopStatusPolling();
@@ -652,10 +669,28 @@ const canStart = computed(() =>
           <span class="stat">Tokens：<b>{{ usageTokens.prompt }}</b>输入 / <b>{{ usageTokens.completion }}</b>输出</span>
         </div>
 
+        <div class="bars">
+          <div class="bar">
+            <span class="bar-label">诊断批次</span>
+            <div class="bar-track"><div class="bar-fill" :style="{ width: diagPercent }"></div></div>
+            <span class="bar-num">{{ batchStats.phase1 }}/{{ batchStats.total }} · {{ diagPercent }}</span>
+          </div>
+          <div class="bar">
+            <span class="bar-label">重构批次</span>
+            <div class="bar-track"><div class="bar-fill recon" :style="{ width: reconPercent }"></div></div>
+            <span class="bar-num">{{ batchStats.phase3 }}/{{ batchStats.total }} · {{ reconPercent }}</span>
+          </div>
+        </div>
+
         <div v-if="streamingText" class="stream-box"><b class="stream-title">流式输出</b>{{ streamingText }}</div>
 
-        <div class="log-box">
-          <div v-for="(line, i) in eventLog" :key="i" class="log-line">{{ line }}</div>
+        <div class="log-head">
+          <b>事件日志</b>
+          <span class="log-count">{{ eventLog.length }} 条</span>
+          <button class="min-btn" @click="eventLog = []">清空</button>
+        </div>
+        <div ref="logBoxRef" class="log-box">
+          <div v-for="(line, i) in eventLog" :key="i" class="log-line" :class="`log-${line.level}`"><span class="log-ts">{{ line.ts }}</span>{{ line.text }}</div>
           <div v-if="!eventLog.length" class="log-empty">暂无事件</div>
         </div>
       </section>
@@ -819,6 +854,14 @@ const canStart = computed(() =>
 }
 .stat b { color: #2d3748; }
 
+.bars { display: flex; flex-direction: column; gap: 7px; margin-bottom: 10px; }
+.bar { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #4a5568; }
+.bar-label { flex: 0 0 46px; }
+.bar-track { flex: 1; height: 8px; background: #edf2f7; border-radius: 5px; overflow: hidden; }
+.bar-fill { height: 100%; width: 0; background: #3182ce; border-radius: 5px; transition: width 0.3s ease; }
+.bar-fill.recon { background: #38a169; }
+.bar-num { flex: 0 0 60px; text-align: right; }
+
 .row {
   display: flex;
   align-items: center;
@@ -933,7 +976,16 @@ const canStart = computed(() =>
   line-height: 1.6;
 }
 .log-line { white-space: pre-wrap; word-break: break-all; }
+.log-line .log-ts { color: #718096; margin-right: 8px; }
+.log-ok { color: #9ae6b4; }
+.log-warn { color: #fefcbf; }
+.log-err { color: #fc8181; }
+.log-accent { color: #90cdf4; }
 .log-empty { color: #718096; }
+.log-head { display: flex; align-items: center; gap: 8px; color: #4a5568; font-size: 12px; margin-bottom: 6px; }
+.log-count { color: #718096; }
+.min-btn { margin-left: auto; padding: 2px 10px; background: transparent; border: 1px solid #cbd5e0; border-radius: 4px; color: #4a5568; font-size: 12px; cursor: pointer; }
+.min-btn:hover { background: #edf2f7; }
 
 .modal-mask {
   position: fixed;
