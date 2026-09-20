@@ -88,3 +88,31 @@ def _logic_chapter_ids(chapters) -> list:
             seen.add(out_id)
             ids.append(out_id)
     return ids
+
+
+@router.get("/api/final_files")
+async def final_files(output_path: str):
+    """C4：列出 03_final 成品目录内的文件（供前端一键打开成品文档）。"""
+    fin = Path(output_path) / "03_final"
+    if not fin.is_dir():
+        return {"files": []}
+    files = []
+    for f in sorted(fin.iterdir()):
+        if f.is_file():
+            files.append({"name": f.name, "path": str(f)})
+    return {"files": files}
+
+
+@router.get("/api/comparisons")
+async def comparisons(output_path: str):
+    """C1：列出 00_comparison 左右对照 md 文件及其原文（前端转义渲染）。"""
+    comp_dir = Path(output_path) / "00_comparison"
+    if not comp_dir.is_dir():
+        return {"items": []}
+    items = []
+    for f in sorted(comp_dir.glob("chapter_*.comparison.md")):
+        items.append({
+            "name": f.name,
+            "text": f.read_text(encoding='utf-8', errors='replace'),
+        })
+    return {"items": items}

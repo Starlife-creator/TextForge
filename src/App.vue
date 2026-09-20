@@ -59,6 +59,25 @@ const forbiddenCanon = ref('');
 const nameMapText = ref('');
 // B1 批次间隔（秒）
 const batchInterval = ref(2.0);
+// B2 服务商预设（温度/上下文/批次间隔一键套用，纯前端）
+const preset = ref('通用');
+const PRESETS: Record<string, { temps: number[]; ctx: number; interval: number }> = {
+  通用: { temps: [0.3, 0.5, 0.8, 0.6], ctx: 8000, interval: 2.0 },
+  快速低保真: { temps: [0.2, 0.3, 0.7, 0.5], ctx: 8000, interval: 1.0 },
+  '创作·宽松': { temps: [0.5, 0.7, 1.0, 0.8], ctx: 8000, interval: 2.5 },
+};
+function applyPreset() {
+  const p = PRESETS[preset.value] || PRESETS['通用'];
+  [tDiagnose.value, tBlueprint.value, tRefactor.value, tStitch.value] = p.temps;
+  contextWindow.value = p.ctx;
+  batchInterval.value = p.interval;
+}
+// C4 成品文档直开
+const finalFiles = ref<{ name: string; path: string }[]>([]);
+// C1 左右对照预览
+const showComparisons = ref(false);
+const comparisonItems = ref<{ name: string; text: string }[]>([]);
+const comparisonSel = ref('');
 
 // ---------- 运行状态 ----------
 const runId = ref<string | null>(null);
@@ -572,8 +591,23 @@ async function openOutput() {
 async function openFinal() {
   if (!outputPath.value) return;
   const root = outputPath.value.replace(/[\\/]+$/, '');
-  const ok = await callOpenOutput(`${root}/03_final`);
-  if (!ok) await callOpenOutput(root); // 成品目录尚未生成则打开输出根目录
+  // C4：先列出成品文件，优先直开文档；无可开文件则打开根目录
+  try {
+    const res = await fetch(`${apiBase()}/api/final_files?output_path=${encodeURIComponent(root)}`);
+    if (res.ok) {
+      const d = await res.json();
+      const files = d.files || [];
+      if (files.length) {
+        finalFiles.value = files;
+        // 若只有一个成品文件，直接打开它
+        if (files.length === 1) { await callOpenOutput(files[0].path); return; }
+        // 多个则打开成品目录（保持简单）
+        await callOpenOutput(`${root}/03_final`);
+        return;
+      }
+    }
+  } catch { /* 忽略 */ }
+  await callOpenOutput(root);
 }
 
 async function callOpenOutput(path: string): Promise<boolean> {
@@ -634,6 +668,21 @@ async function exportLog() {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
   addLog(`已导出日志（${eventLog.value.length} 条）`);
+}
+
+async function openComparisons() {
+  if (!outputPath.value) return;
+  try {
+    const res = await fetch(`${apiBase()}/api/comparisons?output_path=${encodeURIComponent(outputPath.value)}`);
+    if (!res.ok) { alert('获取对照失败'); return; }
+    const d = await res.json();
+    comparisonItems.value = d.items || [];
+    comparisonSel.value = comparisonItems.value[0]?.name ?? '';
+    showComparisons.value = true;
+    if (!comparisonItems.value.length) alert('当前输出目录还没有左右对照文件（需开启「左右对照」并跑完 phase3）');
+  } catch (e: any) {
+    alert(`请求失败：${e.message}`);
+  }
 }
 
 async function confirmBlueprint() {
@@ -763,6 +812,14 @@ const canStart = computed(() =>
         </div>
 
         <div class="row">
+          <label>预设</label>
+          <select v-model="preset" @change="applyPreset">
+            <option v-for="name in Object.keys(PRESETS)" :key="name" :value="name">{{ name }}</option>
+          </select>
+          <label class="rich">选后自动套用温度/上下文/批次间隔</label>
+        </div>
+
+        <div class="row">
           <label>重构模式</label>
           <select v-model="refactorMode">
             <option value="full_rewrite">全部重构（默认）</option>
@@ -868,6 +925,7 @@ const canStart = computed(() =>
           <span v-if="pipelineRunning" class="badge running">运行中</span>
           <button v-if="outputPath" class="open-btn" @click="openOutput">打开输出目录</button>
           <button v-if="outputPath" class="open-btn ghost" @click="openFinal">打开成品</button>
+          <button v-if="outputPath" class="open-btn ghost" @click="openComparisons">对照预览</button>
         </div>
 
         <div class="controls" v-if="pipelineRunning">
@@ -989,6 +1047,24 @@ const canStart = computed(() =>
         <div class="modal-actions">
           <button class="danger" @click="control('stop')">停止</button>
           <button class="primary" :disabled="forcingExport" @click="forceExport">强制导出</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 左右对照预览弹窗 -->
+    <div v-if="showComparisons" class="modal-mask">
+      <div class="modal modal-wide">
+        <h3>左右对照预览</h3>
+        <div class="row" v-if="comparisonItems.length">
+          <label>章节</label>
+          <select v-model="comparisonSel">
+            <option v-for="it in comparisonItems" :key="it.name" :value="it.name">{{ it.name }}</option>
+          </select>
+        </div>
+        <pre class="comp-preview">{{ (comparisonItems.find(i => i.name === comparisonSel) || {}).text }}</pre>
+        <div class="modal-actions">
+          <span></span>
+          <button @click="showComparisons = false">关闭</button>
         </div>
       </div>
     </div>
@@ -1295,6 +1371,13 @@ const canStart = computed(() =>
   border: none;
   border-radius: 5px;
   cursor: pointer;
+}
+.modal-wide { width: 780px; max-width: 92vw; }
+.comp-preview {
+  margin-top: 10px; max-height: 60vh; overflow: auto;
+  background: #1a202c; color: #e2e8f0; border-radius: 6px;
+  padding: 10px 12px; font-family: "Consolas", monospace; font-size: 12px;
+  white-space: pre-wrap; word-break: break-all;
 }
 
 .theme-toggle {
