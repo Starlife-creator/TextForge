@@ -51,6 +51,11 @@ const chapterSnapshots = ref(false);
 const diagnoseJson = ref('');
 const showSplit = ref(false);
 const splitChapters = ref<any[]>([]);
+// fix_gaps 闭环：断层勾选弹窗
+const showFixReview = ref(false);
+const fixGaps = ref<any[]>([]);
+const fixSelected = ref<string[]>([]);
+const confirmingFix = ref(false);
 // A: 操作防重复标志
 const confirmingBlueprint = ref(false);
 const controlling = ref(false);
@@ -175,6 +180,13 @@ function handleSSEEvent(event: string, payload: any) {
       splitChapters.value = payload.chapters || [];
       showSplit.value = true;
       addLog(`拆书完成，共 ${splitChapters.value.length} 章，请确认`);
+      break;
+    case 'fix_ready':
+      // fix_gaps 闭环：诊断断层清单已就绪，等待勾选确认
+      fixGaps.value = payload.gaps || [];
+      fixSelected.value = fixGaps.value.map((g: any) => g.id).filter(Boolean);
+      showFixReview.value = true;
+      addLog(`断层诊断完成，共 ${fixGaps.value.length} 项，请勾选需要修复的断层`);
       break;
     case 'blueprint_ready':
       blueprintText.value = payload.blueprint || '';
@@ -322,6 +334,35 @@ async function confirmSplit() {
     }
   } catch (e: any) {
     alert(`请求失败：${e.message}`);
+  }
+}
+
+function toggleFix(gapId: string) {
+  const i = fixSelected.value.indexOf(gapId);
+  if (i >= 0) fixSelected.value.splice(i, 1);
+  else fixSelected.value.push(gapId);
+}
+
+async function confirmFix() {
+  if (confirmingFix.value) return; // 防重复点击
+  confirmingFix.value = true;
+  try {
+    const res = await fetch(`${apiBase()}/api/fix/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId.value, fix_list: fixSelected.value }),
+    });
+    if (res.ok) {
+      showFixReview.value = false;
+      addLog(`已勾选 ${fixSelected.value.length} 处断层，开始修复`);
+    } else {
+      const d = await res.json();
+      alert(`确认失败：${d.detail || res.status}`);
+    }
+  } catch (e: any) {
+    alert(`请求失败：${e.message}`);
+  } finally {
+    confirmingFix.value = false;
   }
 }
 
@@ -554,6 +595,30 @@ const canStart = computed(() =>
         <div class="modal-actions">
           <span></span>
           <button @click="confirmSplit">确认拆分，继续</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 断层勾选确认弹窗 -->
+    <div v-if="showFixReview" class="modal-mask">
+      <div class="modal">
+        <h3>修复断层：请勾选需修复项</h3>
+        <p class="hint">共诊断出 {{ fixGaps.length }} 处断层，默认全选。确认后将按勾选项执行修复（其余内容保持原样）。</p>
+        <label class="sum-toggle"><input type="checkbox"
+          :checked="fixGaps.length > 0 && fixSelected.length === fixGaps.length"
+          @change="fixGaps.length === fixSelected.length ? fixSelected = [] : fixSelected = fixGaps.map((g:any)=>g.id)" />
+          全选 / 全不选</label>
+        <div class="sum-list">
+          <label v-for="g in fixGaps" :key="g.id" class="fix-row">
+            <input type="checkbox" :checked="fixSelected.includes(g.id)" @change="toggleFix(g.id)" />
+            <span class="split-id">{{ g.location || g.batch_id }}</span>
+            <span class="badge" :class="g.severity === 'high' ? 'badge-err' : (g.severity === 'medium' ? 'badge-warn' : '')">{{ g.severity }}</span>
+            <span class="fix-desc">{{ g.description }}</span>
+          </label>
+        </div>
+        <div class="modal-actions">
+          <span></span>
+          <button :disabled="confirmingFix" @click="confirmFix">确认修复（{{ fixSelected.length }} 处）</button>
         </div>
       </div>
     </div>
@@ -819,6 +884,11 @@ const canStart = computed(() =>
 .split-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
 .split-id { flex: 1; color: #2d3748; word-break: break-all; }
 .badge.err2 { background: #fed7d7; color: #822727; }
+.badge-err { background: #fed7d7; color: #822727; }
+.badge-warn { background: #fefcbf; color: #975a16; }
+.fix-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; cursor: pointer; }
+.fix-row input { width: auto; margin: 0; }
+.fix-desc { color: #4a5568; word-break: break-all; }
 .sum-item summary { cursor: pointer; color: #2d3748; margin-bottom: 2px; }
 .sum-preview { color: #4a5568; white-space: pre-wrap; word-break: break-all; }
 .count { font-size: 12px; color: #718096; }

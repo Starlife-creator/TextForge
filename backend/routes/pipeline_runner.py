@@ -36,6 +36,9 @@ async def run_pipeline(req, run_id: str):
         if state.stop_requested: raise asyncio.CancelledError()
         await check_pause(run_id)
 
+        # fix_gaps 闭环：仅 diagnose_json 已配且重构模式为 fix_gaps 时，phase1 后等待勾选断层
+        await wait_fix_review(req, progress, progress_path, run_id)
+
         await phase2_blueprint(req, progress, progress_path, run_id)
         await check_pause(run_id)
 
@@ -129,6 +132,52 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
     progress['current_phase'] = 'phase1'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
+
+async def wait_fix_review(req, progress, progress_path, run_id):
+    """fix_gaps 闭环：仅 diagnose_json 已配置且重构模式为 fix_gaps 时，
+    phase1 后暂停，推送诊断断层清单并等待用户勾选确认后再进 phase2。
+    默认（未配 diagnose_json 或非 fix_gaps）直接放行，保持旧行为。"""
+    if not getattr(req, "diagnose_json", None):
+        return
+    if progress.get('refactor_mode') != 'fix_gaps':
+        return
+    gaps = _collect_diagnosed_gaps(req.diagnose_json)
+    progress['current_phase'] = 'phase1_fixreview'
+    async with state.progress_lock:
+        atomic_write_json(progress_path, progress)
+    sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
+    logger.info(f"[fix_review] 断层勾选等待确认（{len(gaps)} 项）run_id={run_id}")
+    state.fix_review_confirm.clear()
+    while not state.fix_review_confirm.is_set():
+        if state.stop_requested: raise asyncio.CancelledError()
+        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        async with state.progress_lock:
+            atomic_write_json(progress_path, progress)
+        await asyncio.sleep(1.0)
+    progress['current_phase'] = 'phase2'
+    async with state.progress_lock:
+        atomic_write_json(progress_path, progress)
+
+def _collect_diagnosed_gaps(diag_path: str) -> list:
+    """读取 diagnose_json 目录下诊断批次文件的 gaps，汇总为前端可选清单。"""
+    diag_dir = Path(diag_path)
+    gaps = []
+    if not diag_dir.is_dir():
+        return gaps
+    for f in sorted(diag_dir.glob("diagnose_*.json")):
+        try:
+            obj = json.loads(f.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for g in (obj.get("gaps") if isinstance(obj, dict) else None) or []:
+            if isinstance(g, dict):
+                gaps.append({
+                    "id": g.get("id"), "batch_id": obj.get("batch_id"),
+                    "type": g.get("type"), "severity": g.get("severity"),
+                    "location": g.get("location"),
+                    "description": g.get("description"), "suggestion": g.get("suggestion"),
+                })
+    return gaps
 
 async def check_pause(run_id):
     """v8.8 修正：暂停状态仅用内存事件，不写 progress.json；进入/退出推事件。"""

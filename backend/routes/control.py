@@ -29,6 +29,7 @@ async def stop(run_id: str | None = Body(None, embed=True)):
     state.pause_event.set()  # 解除暂停
     state.blueprint_confirmed.set()  # 解除蓝图等待
     state.split_confirm.set()  # P0.3：解除拆书预览等待
+    state.fix_review_confirm.set()  # 解除断层勾选等待
     return {"status": "stopping"}
 
 @router.post("/api/split/confirm")
@@ -51,6 +52,32 @@ async def split_confirm(payload: dict = Body(...)):
         atomic_write_json(progress_path, progress)
     state.split_confirm.set()
     return {"status": "confirmed"}
+
+@router.post("/api/fix/confirm")
+async def fix_confirm(payload: dict = Body(...)):
+    """fix_gaps 断层勾选确认：仅 phase1_fixreview 阶段允许；
+    持久化勾选断层 fix_list 到 progress.json，确认后进入 phase2。"""
+    _check_run_id(payload.get("run_id"))
+    fix_list = payload.get("fix_list", []) or []
+    if not isinstance(fix_list, list):
+        raise HTTPException(422, "fix_list 必须为数组")
+    output_path = state.current_output_path
+    if not output_path: raise HTTPException(409, "no_active_run")
+    progress_path = Path(output_path) / "progress.json"
+    async with state.progress_lock:
+        if not progress_path.exists():
+            raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
+        try:
+            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(409, f"progress.json 无法读取: {e}")
+        if progress.get('current_phase') != 'phase1_fixreview':
+            raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认断层")
+        progress['fix_list'] = fix_list
+        progress['current_phase'] = 'phase2'
+        atomic_write_json(progress_path, progress)
+    state.fix_review_confirm.set()
+    return {"status": "confirmed", "fix_list": fix_list}
 
 @router.post("/api/blueprint/confirm")
 async def blueprint_confirm(payload: dict = Body(...)):

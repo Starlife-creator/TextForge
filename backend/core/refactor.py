@@ -89,7 +89,7 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
         blueprint_text, req.author_style, batch_content,
         forbidden_canon=getattr(req, "forbidden_canon", []) or [],
         name_map=getattr(req, "name_map", {}) or {},
-        fix_list=getattr(req, "fix_list", []) or [],
+        fix_list=progress.get('fix_list') or getattr(req, "fix_list", []) or [],
         gates=getattr(req, "refactor_gates", {}) or {},
     )
     payload = {
