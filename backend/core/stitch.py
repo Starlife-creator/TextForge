@@ -172,8 +172,8 @@ def _is_hard_break(text: str) -> bool:
         return bool(
             re.match(r'^#{1,6}\s+', line)
             or re.match(r'^第[0-9零一二三四五六七八九十百千万两]+[章节回卷部篇]', line)
-            or re.match(r'^(chapter|CHAPTER)\s*\d+', line)
-            or re.match(r'^(chapter|CHAPTER)[\s#:.]+', line)
+            or re.match(r'^chapter\s*\d+', line, re.IGNORECASE)
+            or re.match(r'^chapter[\s#:.]+', line, re.IGNORECASE)
             or re.match(r'^\d{1,3}[.、．]\s*\S', line)
         )
     return False
