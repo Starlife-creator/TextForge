@@ -72,3 +72,12 @@ jobs:
       # Rust 编译检查（不打包发布，快速反馈编译是否通过）
       - name: Rust 编译检查
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      # D1：后端单测（复用上面 sidecar 已装好全部依赖的 backend/venv）
+      - name: 后端单测
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          pip install pytest
+          python -m pytest tests -q

@@ -205,6 +205,7 @@ def init_progress(req, run_id):
         "forbidden_canon": getattr(req, "forbidden_canon", []),
         "name_map": getattr(req, "name_map", {}),
         "fix_list": getattr(req, "fix_list", []),
+        "diagnose_json": getattr(req, "diagnose_json", None),
         "models": getattr(req, "models", {}),
         "chapters": [], "batches": [], "virtual_chapter_map": [], "cross_batch_virtual": [],
         "stitch_anchors": [], "current_phase": "phase0", "sub_step": None,

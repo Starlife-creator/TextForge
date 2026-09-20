@@ -300,6 +300,25 @@ async function fetchStatus() {
     }
     const lastErr = s.error_logs?.[s.error_logs.length - 1];
     if (lastErr && !pipelineRunning.value) topError.value = lastErr.message;
+    // B3：刷新后恢复等待态弹窗
+    if (s.resume) {
+      const r = s.resume;
+      if (r.key === 'accept' && !showAccept.value) {
+        acceptBatch.value = r.batch_id;
+        acceptChapters.value = r.chapters || [];
+        showAccept.value = true;
+        addLog('已恢复逐章验收（刷新后重开）', 'warn');
+      } else if (r.key === 'fix' && !showFixReview.value) {
+        fixGaps.value = r.gaps || [];
+        fixSelected.value = fixGaps.value.map((g: any) => g.id).filter(Boolean);
+        showFixReview.value = true;
+        addLog('已恢复断层勾选（刷新后重开）', 'warn');
+      } else if (r.key === 'qc' && !showQcBlock.value) {
+        qcIssues.value = r.issues || [];
+        showQcBlock.value = true;
+        addLog('已恢复质检决策（刷新后重开）', 'err');
+      }
+    }
   } catch {
     // 轮询失败静默，等待下一次
   }

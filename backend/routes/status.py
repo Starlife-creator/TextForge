@@ -70,7 +70,53 @@ async def status(output_path: str | None = None):
             prev.append({"name": f.name, "preview": txt[:200]})
         if prev:
             data["summaries"] = prev
+
+    # B3：刷新后恢复等待态
+    data["resume"] = _build_resume(progress, target)
     return data
+
+
+def _read_diag_gaps(diag_path):
+    """读取诊断 JSON 目录的 gaps，供断层勾选恢复。"""
+    diag_dir = Path(diag_path)
+    gaps = []
+    if not diag_dir.is_dir():
+        return gaps
+    for f in sorted(diag_dir.glob("diagnose_*.json")):
+        try:
+            obj = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for g in (obj.get("gaps") if isinstance(obj, dict) else None) or []:
+            if isinstance(g, dict):
+                gaps.append({"id": g.get("id"), "batch_id": obj.get("batch_id"),
+                             "type": g.get("type"), "severity": g.get("severity"),
+                             "location": g.get("location"),
+                             "description": g.get("description"), "suggestion": g.get("suggestion")})
+    return gaps
+
+
+def _build_resume(progress, target):
+    """按当前等待阶段返回可重开弹窗所需的前端数据，否则 None。"""
+    phase = progress.get("current_phase")
+    if phase == "phase1_fixreview":
+        djson = progress.get("diagnose_json")
+        return {"key": "fix", "gaps": _read_diag_gaps(djson) if djson else []}
+    if phase == "phase3_accept":
+        pend = progress.get("accept_pending_batch")
+        chapters = []
+        if pend is not None:
+            for b in progress.get("batches", []):
+                if b.get("batch_id") == pend:
+                    for cid in b.get("chapter_ids", []):
+                        pf = Path(target) / "02_workspace/reconstructed" / f"chapter_{cid}.txt"
+                        preview = pf.read_text(encoding="utf-8", errors="replace")[:80] if pf.exists() else ""
+                        chapters.append({"id": cid, "preview": preview})
+                    break
+        return {"key": "accept", "batch_id": pend, "chapters": chapters}
+    if phase == "phase3_qc":
+        return {"key": "qc", "issues": progress.get("qc_issues", [])}
+    return None
 
 
 def _logic_chapter_ids(chapters) -> list:
