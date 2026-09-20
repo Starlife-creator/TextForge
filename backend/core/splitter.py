@@ -1,4 +1,4 @@
-import asyncio, re, hashlib, unicodedata, time, logging
+import asyncio, re, hashlib, unicodedata, time, logging, json
 from pathlib import Path
 from docx import Document
 from utils.atomic import atomic_write_text, atomic_write_json
@@ -182,7 +182,9 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
                 (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file']).read_text(encoding='utf-8', newline='')
                 for cid in chapter_ids
             )
-            prompt = _build_diagnose_prompt(prev_context, batch_content)
+            # P1.4：仅当设置了 diagnose_json 路径时才追加结构化 JSON 契约（缺省关）
+            with_json = bool(getattr(req, "diagnose_json", None))
+            prompt = _build_diagnose_prompt(prev_context, batch_content, with_json=with_json)
             payload = {"model": req.model, "messages": [{"role": "user", "content": prompt}],
                 "temperature": req.temperatures.diagnose, "max_tokens": 2000, "stream": True}
             logger.info(f"[phase1] batch {batch['batch_id']} 开始 章节={chapter_ids}")
@@ -190,6 +192,16 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
             result, usage, _ = await call_with_retry(client, req.api_url, payload, sse_emit, run_id)
             summary_file = f"01_summaries/batch_{batch['batch_id']:02d}.txt"
             atomic_write_text(summaries_dir / f"batch_{batch['batch_id']:02d}.txt", result)
+            # P1.4：可选结构化诊断落盘（与 batch_XX.txt 并存），解析失败不阻断流水线
+            if with_json:
+                diag = _parse_diag_json(result, batch['batch_id'])
+                if diag is not None:
+                    diag_dir = Path(req.diagnose_json)
+                    diag_dir.mkdir(parents=True, exist_ok=True)
+                    atomic_write_json(diag_dir / f"diagnose_{batch['batch_id']:02d}.json", diag)
+                    logger.info(f"[phase1] batch {batch['batch_id']} 诊断JSON -> {diag_dir / f'diagnose_{batch['batch_id']:02d}.json'}")
+                else:
+                    logger.warning(f"[phase1] batch {batch['batch_id']} 未解析出诊断 JSON，跳过落盘")
             
             prev_context = _build_overlap(progress['chapters'], chapter_ids, output_path, overlap_limit)
             
@@ -314,8 +326,8 @@ def _build_overlap(chapters, prev_chapter_ids, output_path, overlap_limit):
             break
     return "\n\n".join(result_parts)
 
-def _build_diagnose_prompt(prev_context, batch_content):
-    return f"""你是一位拥有二十年经验的资深小说主编。你的任务是对输入的章节进行精准的"局部诊断"。
+def _build_diagnose_prompt(prev_context, batch_content, with_json=False):
+    text = f"""你是一位拥有二十年经验的资深小说主编。你的任务是对输入的章节进行精准的"局部诊断"。
 请阅读用户提供的【当前章节正文】，结合【前情提要】，输出以下三个维度的结构化诊断报告。
 1. 章节摘要（逐章列出，每章150字以内）
 2. 人物状态（主角及关键配角在本批次中的状态变化）
@@ -327,6 +339,59 @@ def _build_diagnose_prompt(prev_context, batch_content):
 【当前章节正文】
 {batch_content}
 """
+    if not with_json:
+        return text
+    # P1.4：追加结构化 JSON 契约，供 fix_gaps 消费；流式返回纯文本，故要求独立 ```json 代码块
+    text += """
+
+【结构化诊断（本批次必须输出）】
+请在报告末尾另起一段，输出一个可直接解析的 JSON 代码块（用 ```json 包裹，只保留一个），字段契约：
+{
+  "summary": "本批次章节整体摘要（150字内）",
+  "gaps": [
+    {
+      "type": "plot_jump 或 logic_inconsistency 或 motivation_abrupt",
+      "severity": "high 或 medium 或 low",
+      "location": "断层所在位置（第几章 / 开头 / 结尾）",
+      "description": "一句话描述断层",
+      "suggestion": "一句话修改建议"
+    }
+  ]
+}
+若本批次无断层，gaps 为空数组 []。
+"""
+    return text
+
+
+def _parse_diag_json(result: str, batch_id: int) -> dict | None:
+    """P1.4：从流式纯文本中抽取 ```json 代码块并解析；失败回退查找顶层 {...}。
+    返回结构化诊断对象；解析失败返回 None（可选能力，不阻断流水线）。
+    同时为每个断层补稳定的 id（B{batch_id}G{i}），供 fix_gaps 的 fix_list 引用。"""
+    candidate = result
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", result, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+    try:
+        start = candidate.index("{")
+        end = candidate.rindex("}")
+        obj = json.loads(candidate[start:end + 1])
+    except (ValueError, json.JSONDecodeError):
+        logger.warning(f"[phase1] batch {batch_id} 诊断 JSON 解析失败")
+        return None
+    if not isinstance(obj, dict):
+        return None
+    gaps = obj.get("gaps")
+    if not isinstance(gaps, list):
+        gaps = []
+    normalized = []
+    for i, g in enumerate(gaps):
+        if not isinstance(g, dict):
+            continue
+        g["id"] = f"B{batch_id}G{i + 1}"
+        normalized.append(g)
+    obj["batch_id"] = batch_id
+    obj["gaps"] = normalized
+    return obj
 
 async def _wait_pause(progress, progress_path):
     while not state.pause_event.is_set():
