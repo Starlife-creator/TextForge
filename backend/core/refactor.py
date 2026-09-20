@@ -4,7 +4,7 @@ from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
 from routes.events import sse_emit
 from core.stitch import stitch_pipeline
-from core.api_client import call_with_retry, RetryableBusinessError
+from core.api_client import call_with_retry, RetryableBusinessError, pick_model
 
 logger = logging.getLogger("textforge")
 
@@ -26,7 +26,7 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         "api_url": req.api_url,
         "blueprint": blueprint_for_stitch,
         "author_style": req.author_style,
-        "payload": {"model": req.model, "temperature": req.temperatures.stitch, "stream": True},
+        "payload": {"model": pick_model(req, "stitch"), "temperature": req.temperatures.stitch, "stream": True},
         "progress": progress,      # v8.8：供 apply_batch_stitch 映射虚拟章父章
     }
     
@@ -93,7 +93,7 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
         gates=getattr(req, "refactor_gates", {}) or {},
     )
     payload = {
-        "model": req.model, "messages": [{"role": "user", "content": prompt}],
+        "model": pick_model(req, "refactor"), "messages": [{"role": "user", "content": prompt}],
         "temperature": req.temperatures.refactor,
         "max_tokens": int(len(batch_content) / 1.5),
         "stream": True,

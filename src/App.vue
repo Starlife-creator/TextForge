@@ -31,6 +31,11 @@ const tDiagnose = ref(0.3);
 const tBlueprint = ref(0.5);
 const tRefactor = ref(0.8);
 const tStitch = ref(0.6);
+// P4.1 分阶段模型（可选，留空则用全局模型名）
+const mDiagnose = ref('');
+const mBlueprint = ref('');
+const mRefactor = ref('');
+const mStitch = ref('');
 
 // ---------- 运行状态 ----------
 const runId = ref<string | null>(null);
@@ -298,6 +303,10 @@ async function startPipeline() {
       refactor: tRefactor.value,
       stitch: tStitch.value,
     },
+    models: Object.fromEntries(
+      Object.entries({ diagnose: mDiagnose.value, blueprint: mBlueprint.value, refactor: mRefactor.value, stitch: mStitch.value })
+        .filter(([, v]) => v && v.trim()),
+    ),
   };
   try {
     const res = await fetch(`${apiBase()}/api/start`, {
@@ -536,6 +545,19 @@ const canStart = computed(() =>
           <div class="row">
             <label>重构</label> <input v-model.number="tRefactor" type="number" min="0" max="2" step="0.1" />
             <label class="t">缝合</label> <input v-model.number="tStitch" type="number" min="0" max="2" step="0.1" />
+          </div>
+        </details>
+        <details class="adv">
+          <summary>分阶段模型（可选，留空用全局模型）</summary>
+          <div class="row">
+            <label>诊断</label> <input v-model="mDiagnose" placeholder="诊断用模型" />
+          </div>
+          <div class="row">
+            <label>蓝图</label> <input v-model="mBlueprint" placeholder="蓝图用模型" />
+            <label class="t">重构</label> <input v-model="mRefactor" placeholder="重构用模型" />
+          </div>
+          <div class="row">
+            <label>缝合</label> <input v-model="mStitch" placeholder="缝合用模型" />
           </div>
         </details>
 

@@ -2,6 +2,12 @@ import asyncio, json, time, logging, httpx
 
 logger = logging.getLogger("textforge")
 
+def pick_model(req, phase: str) -> str:
+    """P4.1 分阶段模型：models[phase] 优先，缺省回退到单一 req.model。
+    phase ∈ {diagnose, blueprint, refactor, stitch}，未配置则用全局 model，旧行为不变。"""
+    models = getattr(req, "models", {}) or {}
+    return models.get(phase) or req.model
+
 def make_httpx_client(req):
     """统一构造 httpx.AsyncClient：注入鉴权头（Key 仅存内存）、超时、代理、SSL 校验。
     Authorization 作为 client 默认头随每个请求发送，不落盘、不进日志。"""

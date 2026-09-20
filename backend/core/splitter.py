@@ -166,7 +166,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
     
-    from core.api_client import call_with_retry, make_httpx_client
+    from core.api_client import call_with_retry, make_httpx_client, pick_model
     async with make_httpx_client(req) as client:
         prev_context = ""
         for idx, batch in enumerate(progress['batches']):
@@ -185,7 +185,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
             # P1.4：仅当设置了 diagnose_json 路径时才追加结构化 JSON 契约（缺省关）
             with_json = bool(getattr(req, "diagnose_json", None))
             prompt = _build_diagnose_prompt(prev_context, batch_content, with_json=with_json)
-            payload = {"model": req.model, "messages": [{"role": "user", "content": prompt}],
+            payload = {"model": pick_model(req, "diagnose"), "messages": [{"role": "user", "content": prompt}],
                 "temperature": req.temperatures.diagnose, "max_tokens": 2000, "stream": True}
             logger.info(f"[phase1] batch {batch['batch_id']} 开始 章节={chapter_ids}")
             sse_emit("batch_start", {"batch_id": batch['batch_id'], "chapter_ids": chapter_ids}, run_id)

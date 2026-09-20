@@ -64,9 +64,9 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
 {all_summaries}
 """
     
-    from core.api_client import call_with_retry, make_httpx_client
+    from core.api_client import call_with_retry, make_httpx_client, pick_model
     async with make_httpx_client(req) as client:
-        payload = {"model": req.model, "messages": [{"role": "user", "content": prompt}],
+        payload = {"model": pick_model(req, "blueprint"), "messages": [{"role": "user", "content": prompt}],
             "temperature": req.temperatures.blueprint, "max_tokens": blueprint_max * 2, "stream": True}
         result, usage, _ = await call_with_retry(client, req.api_url, payload, sse_emit, run_id)
     
