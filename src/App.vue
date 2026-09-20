@@ -46,6 +46,9 @@ const mDiagnose = ref('');
 const mBlueprint = ref('');
 const mRefactor = ref('');
 const mStitch = ref('');
+// 禁改清单（inject_forbidden 门用，每行一条）+ reskin 人名映射（每行 旧名=新名）
+const forbiddenCanon = ref('');
+const nameMapText = ref('');
 
 // ---------- 运行状态 ----------
 const runId = ref<string | null>(null);
@@ -332,6 +335,12 @@ async function startPipeline() {
     refactor_mode: refactorMode.value,
     review_split: reviewSplit.value,
     refactor_gates: { ...gates },
+    forbidden_canon: forbiddenCanon.value.split('\n').map(s => s.trim()).filter(Boolean),
+    name_map: Object.fromEntries(
+      nameMapText.value.split('\n').map(s => s.trim()).filter(Boolean)
+        .map(s => s.split(/[=→：]/).map(p => p.trim()))
+        .filter(p => p.length === 2 && p[0]),
+    ),
     compare_output: compareOutput.value,
     chapter_snapshots: chapterSnapshots.value,
     diagnose_json: diagnoseJson.value || null,
@@ -580,6 +589,12 @@ const canStart = computed(() =>
             <label class="rich"><input type="checkbox" v-model="gates.skip_stitch_if_smooth" /> 平滑衔接跳过缝合</label>
             <label class="rich"><input type="checkbox" v-model="gates.qc_block_export" /> 质检拦截导出</label>
           </details>
+        </div>
+
+        <div class="row col">
+          <label>禁改清单 / 人名映射（配合“保护门·注入禁改清单”与“换皮”模式）</label>
+          <textarea v-model="forbiddenCanon" rows="2" placeholder="禁改清单：每行一条，如&#10;主角不能再死亡&#10;不许改设定名" class="lone-area"></textarea>
+          <textarea v-model="nameMapText" rows="2" placeholder="换皮映射：每行 旧名=新名，如&#10;林晚=苏晴" class="lone-area"></textarea>
         </div>
 
         <div class="row">
@@ -901,6 +916,7 @@ const canStart = computed(() =>
   font-size: 13px;
   resize: vertical;
 }
+.lone-area + .lone-area { margin-top: 6px; }
 .row button {
   padding: 6px 14px;
   border: 1px solid #d1d5db;
