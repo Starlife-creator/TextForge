@@ -517,6 +517,24 @@ async function forceExport() {
   }
 }
 
+async function exportLog() {
+  if (!eventLog.value.length) {
+    alert('暂无日志可导出');
+    return;
+  }
+  const text = eventLog.value.map(l => `[${l.ts}] ${l.text}`).join('\n');
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `textforge-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  addLog(`已导出日志（${eventLog.value.length} 条）`);
+}
+
 async function confirmBlueprint() {
   if (confirmingBlueprint.value) return; // 防重复点击
   if (blueprintText.value.length < 100) {
@@ -774,6 +792,7 @@ const canStart = computed(() =>
         <div class="log-head">
           <b>事件日志</b>
           <span class="log-count">{{ eventLog.length }} 条</span>
+          <button class="min-btn" @click="exportLog">导出</button>
           <button class="min-btn" @click="eventLog = []">清空</button>
         </div>
         <div ref="logBoxRef" class="log-box">
