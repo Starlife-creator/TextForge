@@ -1,4 +1,4 @@
-import asyncio, json, time, logging
+import asyncio, json, time, logging, html
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
@@ -59,6 +59,12 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         
         # 阶段 3-2：缝合（同一个 client）
         await stitch_pipeline(output_path, progress, client, payload_base, sse_emit, run_id, chars)
+    
+    # P1.6 左右对照：仅开启时按章生成「原文 | 重构后」对照文档（默认关；由既有文件派生，幂等）
+    if getattr(req, "compare_output", False):
+        stats = _write_comparison_outputs(output_path, progress)
+        logger.info(f"[comparison] 生成完成 written={stats['written']} skipped={stats['skipped']}")
+        sse_emit("comparison_done", {"written": stats["written"], "skipped": stats["skipped"]}, run_id)
     
     progress['current_phase'] = 'phase4'
     async with state.progress_lock:
@@ -261,6 +267,55 @@ def _render_name_map(name_map):
     lines += [f"   - {old} → {new}" for old, new in mapping.items()]
     lines.append("映射表之外的名字原样保留。")
     return "\n".join(lines) + "\n"
+
+def _write_comparison_outputs(output_path, progress):
+    """P1.6 左右对照：按「逻辑章」生成原文 | 重构后 两列表格 Markdown。
+    逻辑章以父章为单位：非虚拟章用自身 id；虚拟章组折叠到其 original_id（父章）输出一次。
+    纯由既有文件派生（02_workspace/split 原文 + reconstructed 重构稿），天然幂等可覆盖。"""
+    output_path = Path(output_path)
+    comp_dir = output_path / "00_comparison"
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    counts = {"written": 0, "skipped": 0}
+    seen = set()
+    for ch in progress.get('chapters', []):
+        if ch.get('is_empty'):
+            continue
+        if ch.get('is_virtual') or ch.get('is_virtual_parent'):
+            out_id = ch.get('original_id') or ch.get('id')
+        else:
+            out_id = ch.get('id')
+        if not out_id or out_id in seen:
+            continue
+        seen.add(out_id)
+
+        original_file = output_path / "02_workspace/split" / f"{out_id}.txt"
+        recon_file = output_path / "02_workspace/reconstructed" / f"chapter_{out_id}.txt"
+        if not (original_file.exists() and recon_file.exists()):
+            counts["skipped"] += 1
+            logger.warning(f"[comparison] 缺失文件，跳过章 {out_id}: {original_file.name}/{recon_file.name}")
+            continue
+        original = original_file.read_text(encoding='utf-8', newline='')
+        reconstructed = recon_file.read_text(encoding='utf-8', newline='')
+        _write_chapter_comparison(comp_dir, out_id, original, reconstructed)
+        counts["written"] += 1
+    return counts
+
+
+def _write_chapter_comparison(comp_dir: Path, out_id, original: str, reconstructed: str) -> str:
+    """写单个章的两列表格对照文件。Markdown 单元格含多段文本时用 <pre> 保留换行与空白，
+    文本做 HTML 转义避免破坏表格结构。"""
+    esc = lambda s: html.escape(s, quote=False)
+    rel = f"chapter_{out_id}.comparison.md"
+    md = (
+        f"# 章节 {out_id} 左右对照\n\n"
+        f"> 左侧为原文，右侧为重构后。\n\n"
+        f"<table>\n<tr><th>原文</th><th>重构后</th></tr>\n"
+        f"<tr><td><pre>{esc(original)}</pre></td>\n"
+        f"<td><pre>{esc(reconstructed)}</pre></td></tr>\n"
+        f"</table>\n"
+    )
+    atomic_write_text(comp_dir / rel, md)
+    return rel
 
 async def _wait_pause(progress, progress_path):
     while not state.pause_event.is_set():

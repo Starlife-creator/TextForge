@@ -40,6 +40,8 @@ class StartRequest(BaseModel):
     fix_list: List[str] = Field(default_factory=list)
     # P1.4 诊断输出路径（可选，与 batch_XX.txt 并存）
     diagnose_json: Optional[str] = None
+    # P1.6 左右对照：phase3 后按章生成「原文 | 重构后」Markdown 对照（默认关）
+    compare_output: bool = False
     # P0.3 可选拆书预览门：默认 False（phase0 后直接进 phase1，保持旧行为）
     review_split: bool = False
     # P4.1 分阶段模型，缺省 = 单一 model
