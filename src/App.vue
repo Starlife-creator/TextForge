@@ -23,6 +23,7 @@ const model = ref('');
 const contextWindow = ref(8000);
 const authorStyle = ref('出版级文学重构，文笔凝练，注重画面感');
 const novelName = ref('');
+const refactorMode = ref<'full_rewrite' | 'fidelity' | 'fix_gaps' | 'reskin'>('full_rewrite');
 const proxy = ref('');
 const richText = ref(false);
 // 各阶段温度（高级项，对应后端 Temperatures）
@@ -40,6 +41,9 @@ const eventLog = ref<string[]>([]);
 const totalChapters = ref(0);
 const blueprintText = ref('');
 const showBlueprint = ref(false);
+// P0.5：诊断摘要预览（可开关查看本步蓝图摘要）
+const summaries = ref<any[]>([]);
+const showSummaries = ref(false);
 // A: 操作防重复标志
 const confirmingBlueprint = ref(false);
 const controlling = ref(false);
@@ -105,6 +109,7 @@ async function fetchStatus() {
       prompt: s.usage?.prompt_tokens || 0,
       completion: s.usage?.completion_tokens || 0,
     };
+    if (s.summaries) summaries.value = s.summaries;
     if (s.total_chapters) totalChapters.value = s.total_chapters;
     if (s.batches) batchStats.value = {
       total: s.batches.total || 0,
@@ -255,6 +260,7 @@ async function startPipeline() {
     context_window: contextWindow.value,
     author_style: authorStyle.value,
     novel_name: novelName.value || null,
+    refactor_mode: refactorMode.value,
     proxy: proxy.value || null,
     rich_text: richText.value,
     temperatures: {
@@ -405,6 +411,16 @@ const canStart = computed(() =>
         </div>
 
         <div class="row">
+          <label>重构模式</label>
+          <select v-model="refactorMode">
+            <option value="full_rewrite">全部重构（默认）</option>
+            <option value="fidelity">保真润色</option>
+            <option value="fix_gaps">修断层</option>
+            <option value="reskin">换皮</option>
+          </select>
+        </div>
+
+        <div class="row">
           <label>输出书名</label>
           <input v-model="novelName" placeholder="可选，默认取输入文件夹名" />
         </div>
@@ -456,7 +472,7 @@ const canStart = computed(() =>
           <span class="stat">总章节：<b>{{ totalChapters || '-' }}</b></span>
           <span class="stat">批次：<b>{{ batchStats.phase1 }}/{{ batchStats.total }}</b>（诊断）</span>
           <span class="stat">重构：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b></span>
-          <span class="stat">Tokens：<b>{{ usageTokens.prompt + usageTokens.completion }}</b></span>
+          <span class="stat">Tokens：<b>{{ usageTokens.prompt }}</b>输入 / <b>{{ usageTokens.completion }}</b>输出</span>
         </div>
 
         <div v-if="streamingText" class="stream-box"><b class="stream-title">流式输出</b>{{ streamingText }}</div>
@@ -473,7 +489,20 @@ const canStart = computed(() =>
       <div class="modal">
         <h3>请确认重构蓝图</h3>
         <p class="hint">可直接编辑后确认，蓝图将作为后续重构的系统提示词。</p>
-        <textarea v-model="blueprintText" rows="18" class="blueprint-area"></textarea>
+        <textarea v-model="blueprintText" rows="16" class="blueprint-area"></textarea>
+
+        <label class="sum-toggle" :class="{ off: !showSummaries }">
+          <input type="checkbox" v-model="showSummaries" />
+          查看本步诊断摘要（生成蓝图的输入）
+        </label>
+        <div v-if="showSummaries" class="sum-list">
+          <div v-if="!summaries.length" class="sum-empty">暂无诊断摘要</div>
+          <details v-for="(s, i) in summaries" :key="i" class="sum-item">
+            <summary>{{ s.name }}</summary>
+            <div class="sum-preview">{{ s.preview }}</div>
+          </details>
+        </div>
+
         <div class="modal-actions">
           <span class="count">{{ blueprintText.length }} 字</span>
           <button @click="confirmBlueprint" :disabled="confirmingBlueprint">
@@ -702,6 +731,19 @@ const canStart = computed(() =>
   align-items: center;
   margin-top: 12px;
 }
+.sum-toggle {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: #4a5568; cursor: pointer; margin: 10px 0 4px;
+}
+.sum-toggle input { width: auto; margin: 0; }
+.sum-list {
+  max-height: 160px; overflow-y: auto;
+  border: 1px solid #e2e8f0; border-radius: 5px; padding: 8px 10px;
+  font-size: 12px; background: #f7fafc;
+}
+.sum-empty { color: #718096; }
+.sum-item summary { cursor: pointer; color: #2d3748; margin-bottom: 2px; }
+.sum-preview { color: #4a5568; white-space: pre-wrap; word-break: break-all; }
 .count { font-size: 12px; color: #718096; }
 .modal-actions button {
   padding: 8px 20px;

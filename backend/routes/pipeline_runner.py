@@ -2,7 +2,7 @@ import asyncio, json, time, logging
 from pathlib import Path
 from routes import state
 from routes.events import sse_emit
-from core.api_client import FatalAPIError, EmptyContentError, RetryableBusinessError
+from core.api_client import FatalAPIError, EmptyContentError, RetryableBusinessError, RateLimitError
 from core.splitter import phase0_split, phase1_diagnose
 from core.pipeline import phase2_blueprint
 from core.refactor import phase3_refactor_stitch
@@ -52,6 +52,11 @@ async def run_pipeline(req, run_id: str):
     except EmptyContentError as e:
         logger.error(f"[run_pipeline] EmptyContentError msg={str(e)[:200]}")
         sse_emit("error", {"kind": "empty_content", "code": "empty", "message": str(e)}, run_id)
+        log_error(progress_path, e)
+    except RateLimitError as e:
+        logger.error(f"[run_pipeline] 429 限流重试用尽 retry_after={e.retry_after}")
+        sse_emit("error", {"kind": "rate_limit", "code": 429,
+            "message": f"API 持续限流（429），请稍后再试或降低并发。"}, run_id)
         log_error(progress_path, e)
     except RetryableBusinessError as e:
         # v8.8 修正：重试后用尽的业务格式错误，保留进度以便下次恢复
@@ -117,6 +122,13 @@ def init_progress(req, run_id):
         "input_format": req.input_format, "input_path": req.input_path, "output_path": req.output_path,
         "api_config": {"api_url": req.api_url, "model": req.model, "context_window": req.context_window},
         "novel_name": novel_name, "rich_text": req.rich_text,
+        # 优化方案增量：重构档位与门开关（缺省 full_rewrite，旧 run 无字段即按此恢复）
+        "refactor_mode": getattr(req, "refactor_mode", "full_rewrite"),
+        "refactor_gates": getattr(req, "refactor_gates", {}),
+        "forbidden_canon": getattr(req, "forbidden_canon", []),
+        "name_map": getattr(req, "name_map", {}),
+        "fix_list": getattr(req, "fix_list", []),
+        "models": getattr(req, "models", {}),
         "chapters": [], "batches": [], "virtual_chapter_map": [], "cross_batch_virtual": [],
         "stitch_anchors": [], "current_phase": "phase0", "sub_step": None,
         "blueprint_confirmed": False, "blueprint_user_edited": False,

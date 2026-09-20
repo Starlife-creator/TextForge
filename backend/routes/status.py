@@ -52,4 +52,14 @@ async def status(output_path: str | None = None):
         story_bible = Path(target) / "Story_Bible.md"
         if story_bible.exists():
             data["blueprint"] = story_bible.read_text(encoding='utf-8')
+
+    # P0.5：诊断摘要预览（供前端「可开关查看本步蓝图摘要」），每文件仅取前 200 字避免接口过大
+    summaries_dir = Path(target) / "01_summaries"
+    if summaries_dir.is_dir():
+        prev = []
+        for f in sorted(summaries_dir.glob("batch_*.txt")):
+            txt = f.read_text(encoding='utf-8', errors='replace')
+            prev.append({"name": f.name, "preview": txt[:200]})
+        if prev:
+            data["summaries"] = prev
     return data

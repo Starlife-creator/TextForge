@@ -25,17 +25,41 @@ class FatalAPIError(Exception):
 class EmptyContentError(Exception):
     pass
 
+class RateLimitError(Exception):
+    """P0.4：429 限流。携带服务端 Retry-After（秒，可缺省）。"""
+    def __init__(self, retry_after: int | None = None, message: str = ""):
+        self.retry_after = retry_after
+        self.message = message
+        super().__init__(message or f"429 限流，Retry-After={retry_after}")
+
 class RetryableBusinessError(Exception):
     """模型输出不符合契约，需要重试的业务异常基类。"""
     pass
 
 async def call_with_retry(client, api_url, payload, sse_emit_fn, run_id, max_retries=3):
-    """带重试的 API 调用。RetryableBusinessError 重试 1 次（给模型修正机会）。"""
+    """带分策略重试的 API 调用（P0.4）：
+    - RetryableBusinessError（缺分隔符等契约错误）：重试 1 次给模型修正机会
+    - EmptyContentError（空响应）：按全部次数重试（分开处理）
+    - RateLimitError（429）：按 Retry-After / 退避重试
+    - 网络错误：指数退避重试"""
     last_exc = None
     for attempt in range(max_retries):
         try:
             result, usage = await _stream_call(client, api_url, payload, sse_emit_fn, run_id)
             return result, usage, attempt
+        except RateLimitError as e:
+            delay = (e.retry_after or 0) or (2 * (attempt + 1))
+            logger.warning(f"[api] 429 限流 attempt={attempt+1} retry_after={e.retry_after or 'n/a'}")
+            if attempt >= max_retries - 1:
+                raise
+            last_exc = e
+            await asyncio.sleep(min(delay, 30))
+        except EmptyContentError as e:   # P0.4：空响应与业务错误分开重试
+            logger.warning(f"[api] 空响应 attempt={attempt+1}: {str(e)[:200]}")
+            if attempt >= max_retries - 1:
+                raise
+            last_exc = e
+            await asyncio.sleep(2 * (attempt + 1))
         except RetryableBusinessError as e:
             # 业务格式错误：只重试 1 次
             logger.warning(f"[api] 业务格式错误 attempt={attempt+1}: {str(e)[:200]}")
@@ -82,6 +106,15 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
                     logger.info("[api] 400 涉及 stream_options，去掉该字段重试")
                     return await _do(clean)
                 raise FatalAPIError("api_error", resp.status_code, text[:500])
+            elif resp.status_code == 429:   # P0.4：限流，读取 Retry-After 供上层按秒重试
+                retry_after = None
+                if resp.headers.get("retry-after"):
+                    try:
+                        retry_after = int(resp.headers["retry-after"])
+                    except ValueError:
+                        retry_after = None
+                await resp.aread()
+                raise RateLimitError(retry_after)
             elif resp.status_code != 200:
                 raise FatalAPIError("api_error", resp.status_code,
                     (await resp.aread()).decode('utf-8', errors='replace')[:500])
