@@ -95,6 +95,47 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
 
+async def regen_single_chapter(req, output_path, chapter_id):
+    """A1：单章重生成。复用运行中 req（含鉴权，仅内存），对单章重新走一次重构，
+    覆盖 reconstructed/chapter_{chapter_id}.txt，返回新正文。用于逐章验收「驳回→重写」。"""
+    from core.api_client import make_httpx_client, call_with_retry
+    output_path = Path(output_path)
+    split_file = output_path / "02_workspace/split" / f"{chapter_id}.txt"
+    if not split_file.exists():
+        raise ValueError(f"章节原始文件不存在: chapter_{chapter_id}")
+    batch_content = split_file.read_text(encoding='utf-8', newline='')
+    try:
+        blueprint_text = (output_path / "Story_Bible.md").read_text(encoding='utf-8')
+    except OSError:
+        blueprint_text = ""
+    gates = getattr(req, "refactor_gates", {}) or {}
+    prompt = _build_refactor_prompt(
+        getattr(req, "refactor_mode", "full_rewrite"),
+        blueprint_text, req.author_style, batch_content,
+        forbidden_canon=getattr(req, "forbidden_canon", []) or [],
+        name_map=getattr(req, "name_map", {}) or {},
+        fix_list=getattr(req, "fix_list", []) or [],
+        gates=gates,
+    )
+    payload = {
+        "model": pick_model(req, "refactor"),
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": req.temperatures.refactor,
+        "max_tokens": int(len(batch_content) / 1.5),
+        "stream": True,
+    }
+    logger.info(f"[regen] 单章重生成 chapter_{chapter_id} 开始")
+    async with make_httpx_client(req) as client:
+        result, usage, _ = await call_with_retry(client, req.api_url, payload, sse_emit, "regen", max_retries=2)
+    chapter_texts = _split_refactored_by_chapters(result, [chapter_id])
+    new_text = chapter_texts[chapter_id]
+    recon_dir = output_path / "02_workspace/reconstructed"
+    recon_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(recon_dir / f"chapter_{chapter_id}.txt", new_text)
+    logger.info(f"[regen] 单章重生成完成 chapter_{chapter_id}")
+    return new_text
+
+
 async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_text, chars,
                               progress, batch, run_id):
     """v8.8 新增：将 '调用 + 按章拆分' 包成一个可重试单元。

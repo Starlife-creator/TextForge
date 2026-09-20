@@ -15,6 +15,7 @@ logger = logging.getLogger("textforge")
 # 批次级恢复见各 phase 内对 batch status 的判断。
 
 async def run_pipeline(req, run_id: str):
+    state.current_req = req  # A1：单章重生成复用鉴权（仅内存）
     progress_path = Path(req.output_path) / "progress.json"
     progress = None  # v8.8：finally 防护，极端情况下 _load_or_init_progress 之前异常也不引发 NameError
     logger.info(f"[run_pipeline] 开始 run_id={run_id} input={req.input_path}")

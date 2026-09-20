@@ -123,6 +123,42 @@ async def export_force(payload: dict = Body(...)):
     state.qc_confirm.set()
     return {"status": "exporting"}
 
+@router.post("/api/regen_chapter")
+async def regen_chapter(payload: dict = Body(...)):
+    """A1：逐章验收中驳回某章并重生成。仅 phase3_accept 阶段允许；复用运行中 req 鉴权（内存）。"""
+    _check_run_id(payload.get("run_id"))
+    chapter_id = payload.get("chapter_id")
+    if not chapter_id:
+        raise HTTPException(422, "缺少 chapter_id")
+    req = state.current_req
+    output_path = state.current_output_path
+    if not req or not output_path:
+        raise HTTPException(409, "no_active_run")
+    progress_path = Path(output_path) / "progress.json"
+    async with state.progress_lock:
+        if not progress_path.exists():
+            raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
+        try:
+            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(409, f"progress.json 无法读取: {e}")
+        if progress.get('current_phase') != 'phase3_accept':
+            raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许重生成")
+        pend = progress.get('accept_pending_batch')
+        allowed = any(str(cid) == str(chapter_id)
+                      for b in progress.get('batches', []) if b.get('batch_id') == pend
+                      for cid in b.get('chapter_ids', []))
+        if not allowed:
+            raise HTTPException(422, f"章节 {chapter_id} 不在当前待验收批次内")
+    from core.refactor import regen_single_chapter
+    try:
+        new_text = await regen_single_chapter(req, output_path, str(chapter_id))
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"单章重生成失败: {e}")
+    return {"status": "regenerated", "chapter_id": chapter_id, "preview": new_text[:80]}
+
 @router.post("/api/accept")
 async def accept(payload: dict = Body(...)):
     """逐章验收确认：仅 phase3_accept 阶段允许。记录该批次已验收章节后放行进下一批。"""

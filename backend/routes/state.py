@@ -18,6 +18,7 @@ qc_confirm.set()
 stop_requested = False
 current_run_id: Optional[str] = None
 current_output_path: Optional[str] = None
+current_req = None  # A1：运行中的 StartRequest（含 api_key，仅内存、不落盘），供单章重生成复用鉴权
 progress_lock = asyncio.Lock()
 log_listener = None
 

@@ -38,6 +38,7 @@ const showAccept = ref(false);
 const acceptBatch = ref<number | null>(null);
 const acceptChapters = ref<any[]>([]);
 const confirmingAccept = ref(false);
+const regenerating = ref<Set<string>>(new Set());
 // 质检拦截决策弹窗
 const showQcBlock = ref(false);
 const qcIssues = ref<string[]>([]);
@@ -603,6 +604,29 @@ async function confirmAccept() {
   }
 }
 
+async function regenChapter(c: any) {
+  if (regenerating.value.has(c.id)) return; // 防重复
+  regenerating.value.add(c.id);
+  try {
+    const res = await fetch(`${apiBase()}/api/regen_chapter`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId.value, chapter_id: c.id }),
+    });
+    const d = await res.json();
+    if (res.ok) {
+      c.preview = d.preview || '';
+      addLog(`章节 ${c.id} 已重写，请重新验收`, 'accent');
+    } else {
+      alert(`重写失败：${d.detail || res.status}`);
+    }
+  } catch (e: any) {
+    alert(`请求失败：${e.message}`);
+  } finally {
+    regenerating.value.delete(c.id);
+  }
+}
+
 async function openOutput() {
   await callOpenOutput(outputPath.value);
 }
@@ -1043,9 +1067,10 @@ const canStart = computed(() =>
         <h3>验收重构稿：批次 {{ acceptBatch }}</h3>
         <p class="hint">以下为本批已产出的章节（预览为开头 80 字）。验收通过后继续下一批；不通过请停止后调整或重跑。</p>
         <div class="sum-list">
-          <div v-for="c in acceptChapters" :key="c.id" class="split-row">
+          <div v-for="c in acceptChapters" :key="c.id" class="split-row accept-row">
             <span class="split-id">{{ c.id }}</span>
             <span class="fix-desc">{{ c.preview }}</span>
+            <button class="min-btn" :disabled="regenerating.has(c.id)" @click="regenChapter(c)">{{ regenerating.has(c.id) ? '重写中…' : '重写此章' }}</button>
           </div>
         </div>
         <div class="modal-actions">
@@ -1380,6 +1405,9 @@ const canStart = computed(() =>
 .fix-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; cursor: pointer; }
 .fix-row input { width: auto; margin: 0; }
 .fix-desc { color: #4a5568; word-break: break-all; }
+.accept-row { display: flex; align-items: center; gap: 6px; }
+.accept-row .fix-desc { flex: 1; }
+.accept-row .min-btn { margin-left: auto; flex: 0 0 auto; }
 .sum-item summary { cursor: pointer; color: #2d3748; margin-bottom: 2px; }
 .sum-preview { color: #4a5568; white-space: pre-wrap; word-break: break-all; }
 .count { font-size: 12px; color: #718096; }
