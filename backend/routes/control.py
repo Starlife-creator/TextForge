@@ -32,6 +32,7 @@ async def stop(run_id: str | None = Body(None, embed=True)):
     state.split_confirm.set()  # P0.3：解除拆书预览等待
     state.fix_review_confirm.set()  # 解除断层勾选等待
     state.accept_confirm.set()  # 解除逐章验收等待
+    state.qc_confirm.set()  # 解除质检拦截等待
     return {"status": "stopping"}
 
 @router.post("/api/split/confirm")
@@ -98,6 +99,29 @@ async def open_output(payload: dict = Body(...)):
     except Exception as e:
         raise HTTPException(500, f"打开目录失败: {e}")
     return {"status": "opened"}
+
+@router.post("/api/export/force")
+async def export_force(payload: dict = Body(...)):
+    """质检拦截决策：用户选择「忽略质检、强制导出」。仅 phase3_qc 阶段允许。
+    记录 _qc_force 后放行，管道继续进入 phase4。"""
+    _check_run_id(payload.get("run_id"))
+    output_path = state.current_output_path
+    if not output_path: raise HTTPException(409, "no_active_run")
+    progress_path = Path(output_path) / "progress.json"
+    async with state.progress_lock:
+        if not progress_path.exists():
+            raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
+        try:
+            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(409, f"progress.json 无法读取: {e}")
+        if progress.get('current_phase') != 'phase3_qc':
+            raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许强制导出")
+        progress['_qc_force'] = True
+        progress['current_phase'] = 'phase2'
+        atomic_write_json(progress_path, progress)
+    state.qc_confirm.set()
+    return {"status": "exporting"}
 
 @router.post("/api/accept")
 async def accept(payload: dict = Body(...)):

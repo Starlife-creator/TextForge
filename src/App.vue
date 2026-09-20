@@ -38,6 +38,10 @@ const showAccept = ref(false);
 const acceptBatch = ref<number | null>(null);
 const acceptChapters = ref<any[]>([]);
 const confirmingAccept = ref(false);
+// 质检拦截决策弹窗
+const showQcBlock = ref(false);
+const qcIssues = ref<string[]>([]);
+const forcingExport = ref(false);
 const proxy = ref('');
 const richText = ref(false);
 // 各阶段温度（高级项，对应后端 Temperatures）
@@ -252,9 +256,10 @@ function handleSSEEvent(event: string, payload: any) {
       addLog(`批次 ${payload.batch_id} 重构稿已产出，请验收后继续`, 'warn');
       break;
     case 'qc_failed':
-      // 质检拦截导出：展示质检问题
-      addLog(`质检未通过（${(payload.issues || []).length} 项问题），已阻止导出`, 'err');
-      alert(`质检未通过，已阻止导出：\n\n${(payload.issues || []).join('\n')}`);
+      // 质检拦截导出门：展示质检问题，供用户选择强制导出或停止
+      qcIssues.value = payload.issues || [];
+      showQcBlock.value = true;
+      addLog(`质检未通过（${qcIssues.value.length} 项问题），请决定是否强制导出`, 'err');
       break;
     case 'blueprint_ready':
       blueprintText.value = payload.blueprint || '';
@@ -486,6 +491,29 @@ async function openOutput() {
     }
   } catch (e: any) {
     alert(`请求失败：${e.message}`);
+  }
+}
+
+async function forceExport() {
+  if (forcingExport.value) return; // 防重复点击
+  forcingExport.value = true;
+  try {
+    const res = await fetch(`${apiBase()}/api/export/force`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId.value }),
+    });
+    if (res.ok) {
+      showQcBlock.value = false;
+      addLog('已忽略质检，强制导出', 'warn');
+    } else {
+      const d = await res.json();
+      alert(`强制导出失败：${d.detail || res.status}`);
+    }
+  } catch (e: any) {
+    alert(`请求失败：${e.message}`);
+  } finally {
+    forcingExport.value = false;
   }
 }
 
@@ -812,6 +840,21 @@ const canStart = computed(() =>
         <div class="modal-actions">
           <span></span>
           <button :disabled="confirmingAccept" @click="confirmAccept">验收通过，继续</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 质检拦截决策弹窗 -->
+    <div v-if="showQcBlock" class="modal-mask">
+      <div class="modal">
+        <h3>质检未通过（{{ qcIssues.length }} 项）</h3>
+        <p class="hint">以下问题按规则检出不满足导出条件。可选择「强制导出」忽略并继续，或「停止」保留进度待修正后重跑。</p>
+        <div class="sum-list">
+          <div v-for="(it, i) in qcIssues" :key="i" class="split-row"><span class="fix-desc">{{ it }}</span></div>
+        </div>
+        <div class="modal-actions">
+          <button class="danger" @click="control('stop')">停止</button>
+          <button class="primary" :disabled="forcingExport" @click="forceExport">强制导出</button>
         </div>
       </div>
     </div>

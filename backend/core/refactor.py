@@ -12,12 +12,6 @@ class ChapterBreakMissingError(RetryableBusinessError):
     """v8.8 修正：继承 RetryableBusinessError，才能进入 call_with_retry 的重试路径。"""
     pass
 
-class QCFailedError(Exception):
-    """质检拦截导出门未通过：阻止 phase4 导出，携带质检问题清单。"""
-    def __init__(self, message, issues):
-        self.issues = issues
-        super().__init__(message)
-
 async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     output_path = Path(req.output_path)
     recon_dir = output_path / "02_workspace/reconstructed"
@@ -82,15 +76,20 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         n = _write_snapshot_finals(output_path, progress)
         logger.info(f"[snapshot] 缝合终稿快照完成 final={n}")
 
-    # 质检拦截导出门：未通过则阻止 phase4（不设 current_phase=phase4）
+    # 质检拦截导出门：未通过则在 phase3_qc 等待用户决策（强制导出或停止），其后再进 phase4
     if gates.get("qc_block_export"):
         issues = _run_qc(output_path, progress)
         if issues:
             progress['qc_issues'] = issues
+            progress['current_phase'] = 'phase3_qc'
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
             sse_emit("qc_failed", {"issues": issues}, run_id)
-            raise QCFailedError("质检未通过，已阻止导出", issues)
+            await _wait_qc_confirm(progress, progress_path, run_id)
+            progress['_qc_force'] = True
+            progress['current_phase'] = 'phase2'
+            async with state.progress_lock:
+                atomic_write_json(progress_path, progress)
 
     progress['current_phase'] = 'phase4'
     async with state.progress_lock:
@@ -461,6 +460,17 @@ def _run_qc(output_path, progress):
             issues.append(f"章 {out_id}: 与第 {hashes[h]} 章内容重复（可能未重构）")
         hashes[h] = out_id
     return issues
+
+
+async def _wait_qc_confirm(progress, progress_path, run_id):
+    """质检决策等待：等待用户选择强制导出或停止。"""
+    state.qc_confirm.clear()
+    while not state.qc_confirm.is_set():
+        if state.stop_requested: raise asyncio.CancelledError()
+        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        async with state.progress_lock:
+            atomic_write_json(progress_path, progress)
+        await asyncio.sleep(1.0)
 
 
 async def _wait_pause(progress, progress_path):
