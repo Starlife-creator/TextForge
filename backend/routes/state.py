@@ -7,6 +7,8 @@ pipeline_task: Optional[asyncio.Task] = None
 pause_event = asyncio.Event()              # 用户主动暂停（仅内存，不落盘）
 pause_event.set()
 blueprint_confirmed = asyncio.Event()      # 蓝图确认
+split_confirm = asyncio.Event()            # P0.3 拆书预览确认（仅内存，不落盘）
+split_confirm.set()
 stop_requested = False
 current_run_id: Optional[str] = None
 current_output_path: Optional[str] = None

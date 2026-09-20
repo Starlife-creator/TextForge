@@ -44,6 +44,10 @@ const showBlueprint = ref(false);
 // P0.5：诊断摘要预览（可开关查看本步蓝图摘要）
 const summaries = ref<any[]>([]);
 const showSummaries = ref(false);
+// P0.3：拆书预览确认门
+const reviewSplit = ref(false);
+const showSplit = ref(false);
+const splitChapters = ref<any[]>([]);
 // A: 操作防重复标志
 const confirmingBlueprint = ref(false);
 const controlling = ref(false);
@@ -163,6 +167,12 @@ function handleSSEEvent(event: string, payload: any) {
       // #2 节流后的流式增量，保留最近 500 字
       streamingText.value = (streamingText.value + (payload.text || '')).slice(-500);
       break;
+    case 'split_ready':
+      // P0.3：拆书完成，等待用户确认拆分后进入诊断
+      splitChapters.value = payload.chapters || [];
+      showSplit.value = true;
+      addLog(`拆书完成，共 ${splitChapters.value.length} 章，请确认`);
+      break;
     case 'blueprint_ready':
       blueprintText.value = payload.blueprint || '';
       showBlueprint.value = true;
@@ -261,6 +271,7 @@ async function startPipeline() {
     author_style: authorStyle.value,
     novel_name: novelName.value || null,
     refactor_mode: refactorMode.value,
+    review_split: reviewSplit.value,
     proxy: proxy.value || null,
     rich_text: richText.value,
     temperatures: {
@@ -284,6 +295,25 @@ async function startPipeline() {
     runId.value = data.run_id;
     eventLog.value = [];
     addLog(`已提交流水线 run_id=${data.run_id.slice(0, 8)}...`);
+  } catch (e: any) {
+    alert(`请求失败：${e.message}`);
+  }
+}
+
+async function confirmSplit() {
+  try {
+    const res = await fetch(`${apiBase()}/api/split/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId.value }),
+    });
+    if (res.ok) {
+      showSplit.value = false;
+      addLog('拆分已确认，进入诊断');
+    } else {
+      const d = await res.json();
+      alert(`确认失败：${d.detail || res.status}`);
+    }
   } catch (e: any) {
     alert(`请求失败：${e.message}`);
   }
@@ -426,6 +456,11 @@ const canStart = computed(() =>
         </div>
 
         <div class="row">
+          <label>拆书确认</label>
+          <label class="rich"><input type="checkbox" v-model="reviewSplit" /> 拆书后先预览章节再继续</label>
+        </div>
+
+        <div class="row">
           <label>代理</label>
           <input v-model="proxy" placeholder="可选，如 http://127.0.0.1:7890" />
           <label class="rich"><input type="checkbox" v-model="richText" /> docx富文本</label>
@@ -483,6 +518,25 @@ const canStart = computed(() =>
         </div>
       </section>
     </main>
+
+    <!-- 拆书确认弹窗 -->
+    <div v-if="showSplit" class="modal-mask">
+      <div class="modal">
+        <h3>请确认拆书结果</h3>
+        <p class="hint">共拆分出 {{ splitChapters.length }} 章。确认后进入诊断；如需调整请停止后修改原始文档重跑。</p>
+        <div class="sum-list">
+          <div v-for="(c, i) in splitChapters" :key="i" class="split-row">
+            <span class="split-id">{{ c.filename }}</span>
+            <span v-if="c.is_virtual" class="badge paused">虚拟段</span>
+            <span v-if="c.is_empty" class="badge err2">空章</span>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <span></span>
+          <button @click="confirmSplit">确认拆分，继续</button>
+        </div>
+      </div>
+    </div>
 
     <!-- 蓝图确认弹窗 -->
     <div v-if="showBlueprint" class="modal-mask">
@@ -742,6 +796,9 @@ const canStart = computed(() =>
   font-size: 12px; background: #f7fafc;
 }
 .sum-empty { color: #718096; }
+.split-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
+.split-id { flex: 1; color: #2d3748; word-break: break-all; }
+.badge.err2 { background: #fed7d7; color: #822727; }
 .sum-item summary { cursor: pointer; color: #2d3748; margin-bottom: 2px; }
 .sum-preview { color: #4a5568; white-space: pre-wrap; word-break: break-all; }
 .count { font-size: 12px; color: #718096; }

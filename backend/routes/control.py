@@ -28,7 +28,29 @@ async def stop(run_id: str | None = Body(None, embed=True)):
     state.stop_requested = True
     state.pause_event.set()  # 解除暂停
     state.blueprint_confirmed.set()  # 解除蓝图等待
+    state.split_confirm.set()  # P0.3：解除拆书预览等待
     return {"status": "stopping"}
+
+@router.post("/api/split/confirm")
+async def split_confirm(payload: dict = Body(...)):
+    """P0.3：拆书预览确认。仅 phase0_confirm 阶段允许，确认后进入 phase1。"""
+    _check_run_id(payload.get("run_id"))
+    output_path = state.current_output_path
+    if not output_path: raise HTTPException(409, "no_active_run")
+    progress_path = Path(output_path) / "progress.json"
+    async with state.progress_lock:
+        if not progress_path.exists():
+            raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
+        try:
+            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(409, f"progress.json 无法读取: {e}")
+        if progress.get('current_phase') != 'phase0_confirm':
+            raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认拆分")
+        progress['current_phase'] = 'phase1'
+        atomic_write_json(progress_path, progress)
+    state.split_confirm.set()
+    return {"status": "confirmed"}
 
 @router.post("/api/blueprint/confirm")
 async def blueprint_confirm(payload: dict = Body(...)):

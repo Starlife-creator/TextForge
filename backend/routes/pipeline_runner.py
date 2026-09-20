@@ -29,6 +29,9 @@ async def run_pipeline(req, run_id: str):
         if state.stop_requested: raise asyncio.CancelledError()
         await check_pause(run_id)
 
+        # P0.3 可选拆书预览门：review_split=True 时在此等待用户确认拆分
+        await wait_split_confirm(req, progress, progress_path, run_id)
+
         await phase1_diagnose(req, progress, progress_path, run_id)
         if state.stop_requested: raise asyncio.CancelledError()
         await check_pause(run_id)
@@ -101,6 +104,31 @@ def _load_or_init_progress(req, run_id, progress_path):
     progress = init_progress(req, run_id)
     progress["resumed"] = False
     return progress
+
+async def wait_split_confirm(req, progress, progress_path, run_id):
+    """P0.3 可选拆书预览门：默认关闭（review_split=False）直接放行，保持旧行为。
+    开启时 phase0 后暂停，推送章节预览并等待用户确认后再进 phase1。"""
+    if not getattr(req, "review_split", False):
+        return
+    progress['current_phase'] = 'phase0_confirm'
+    async with state.progress_lock:
+        atomic_write_json(progress_path, progress)
+    chapters = [
+        {k: c.get(k) for k in ("id", "filename", "is_empty", "is_virtual")}
+        for c in progress['chapters']
+    ]
+    sse_emit("split_ready", {"chapters": chapters}, run_id)
+    logger.info(f"[P0.3] 拆书预览等待确认 run_id={run_id}")
+    state.split_confirm.clear()
+    while not state.split_confirm.is_set():
+        if state.stop_requested: raise asyncio.CancelledError()
+        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        async with state.progress_lock:
+            atomic_write_json(progress_path, progress)
+        await asyncio.sleep(1.0)
+    progress['current_phase'] = 'phase1'
+    async with state.progress_lock:
+        atomic_write_json(progress_path, progress)
 
 async def check_pause(run_id):
     """v8.8 修正：暂停状态仅用内存事件，不写 progress.json；进入/退出推事件。"""
