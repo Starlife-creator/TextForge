@@ -73,6 +73,8 @@ async def status(output_path: str | None = None):
 
     # B3：刷新后恢复等待态
     data["resume"] = _build_resume(progress, target)
+    # A3：章节概览（逻辑章折叠到父章，去重）
+    data["chapters_summary"] = _chapter_summary(progress, target)
     return data
 
 
@@ -134,6 +136,29 @@ def _logic_chapter_ids(chapters) -> list:
             seen.add(out_id)
             ids.append(out_id)
     return ids
+
+
+def _chapter_summary(progress, target) -> list:
+    """A3：逻辑章概览 [{id, label, status}]。status ∈ pending|reconstructed。"""
+    seen = set()
+    rows = []
+    for ch in progress.get('chapters', []):
+        if ch.get('is_empty'):
+            continue
+        if ch.get('is_virtual'):
+            out_id = ch.get('original_id') or ch.get('id')
+        else:
+            out_id = ch.get('id')
+        if not out_id or out_id in seen:
+            continue
+        seen.add(out_id)
+        recon = (Path(target) / "02_workspace/reconstructed" / f"chapter_{out_id}.txt").exists()
+        rows.append({
+            "id": out_id,
+            "label": ch.get("filename") or str(out_id),
+            "status": "reconstructed" if recon else "pending",
+        })
+    return rows
 
 
 @router.get("/api/final_files")

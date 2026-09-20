@@ -133,6 +133,8 @@ const streamingText = ref('');
 const usageTokens = ref({ prompt: 0, completion: 0 });
 const batchStats = ref({ total: 0, phase1: 0, phase3: 0 });
 const chapterProgress = ref({ total: 0, done: 0 });
+const chapterRows = ref<{ id: string; label: string; status: string }[]>([]);
+const showChapterTree = ref(false);
 const topError = ref<string | null>(null);
 const topTip = ref<string | null>(null);
 // B4：僵尸运行检测
@@ -306,6 +308,7 @@ async function fetchStatus() {
       total: s.total_logic_chapters || 0,
       done: s.reconstructed_chapters || 0,
     };
+    if (Array.isArray(s.chapters_summary)) chapterRows.value = s.chapters_summary;
     if (s.pipeline_running) {
       pipelineRunning.value = true;
       if (s.current_phase) currentPhase.value = phaseLabel[s.current_phase] || s.current_phase;
@@ -1023,6 +1026,18 @@ const canStart = computed(() =>
           </div>
         </div>
 
+        <div class="tree-head" v-if="chapterRows.length">
+          <button class="tree-toggle" @click="showChapterTree = !showChapterTree">
+            {{ showChapterTree ? '▾' : '▸' }} 章节概览（{{ chapterRows.filter(c => c.status === 'reconstructed').length }}/{{ chapterRows.length }} 已重构）
+          </button>
+        </div>
+        <div v-if="showChapterTree && chapterRows.length" class="tree-box">
+          <div v-for="c in chapterRows" :key="c.id" class="tree-row">
+            <span class="split-id">{{ c.label }}</span>
+            <span class="badge" :class="c.status === 'reconstructed' ? 'running' : ''">{{ c.status === 'reconstructed' ? '已重构' : '待处理' }}</span>
+          </div>
+        </div>
+
         <div v-if="streamingText" class="stream-box"><b class="stream-title">流式输出</b>{{ streamingText }}</div>
 
         <div class="log-head">
@@ -1239,6 +1254,12 @@ const canStart = computed(() =>
 .bar-fill.recon { background: #38a169; }
 .bar-fill.chapter { background: #805ad5; }
 .bar-num { flex: 0 0 60px; text-align: right; }
+.tree-head { margin-bottom: 6px; }
+.tree-toggle { background: transparent; border: none; color: #4a5568; font-size: 13px; font-weight: 600; cursor: pointer; padding: 4px 0; }
+.tree-box { max-height: 150px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 5px; padding: 6px 10px; margin-bottom: 10px; background: #f7fafc; }
+.tree-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
+html.dark .tree-box { background: #232b39; border-color: #4a5568; }
+html.dark .tree-toggle { color: #a0aec0; }
 .open-btn { margin-left: auto; padding: 4px 12px; border: 1px solid #3182ce; color: #3182ce; background: #fff; border-radius: 5px; font-size: 12px; cursor: pointer; }
 .open-btn:hover { background: #ebf8ff; }
 .open-btn.ghost { margin-left: 6px; border-color: #38a169; color: #38a169; }
