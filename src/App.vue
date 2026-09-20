@@ -98,6 +98,8 @@ const batchStats = ref({ total: 0, phase1: 0, phase3: 0 });
 const chapterProgress = ref({ total: 0, done: 0 });
 const topError = ref<string | null>(null);
 const topTip = ref<string | null>(null);
+// B4：僵尸运行检测
+const zombieWarn = ref(false);
 const darkMode = ref(false);
 function toggleTheme() {
   darkMode.value = !darkMode.value;
@@ -245,6 +247,13 @@ async function fetchStatus() {
     if (!res.ok) return;
     const s = await res.json();
     isPaused.value = !!s.paused;
+    // B4：心跳超时判定后端假死（阈值 90s）
+    if (s.pipeline_running && s.last_heartbeat) {
+      const ageMs = Date.now() - new Date(s.last_heartbeat).getTime();
+      zombieWarn.value = ageMs > 90_000;
+    } else if (!s.pipeline_running) {
+      zombieWarn.value = false;
+    }
     usageTokens.value = {
       prompt: s.usage?.prompt_tokens || 0,
       completion: s.usage?.completion_tokens || 0,
@@ -701,6 +710,10 @@ const canStart = computed(() =>
         <span>⚠ {{ topError }}</span>
         <button class="banner-close" @click="topError = null">×</button>
       </div>
+      <div v-if="zombieWarn" class="banner warn">
+        <span>⚠ 后端进程超过 90 秒未响应，可能已假死。可尝试「停止」，或检查后端是否仍在运行。</span>
+        <button class="banner-close" @click="zombieWarn = false">×</button>
+      </div>
 
       <!-- 配置区 -->
       <section class="panel config" :class="{ disabled: pipelineRunning }">
@@ -1064,6 +1077,7 @@ const canStart = computed(() =>
 }
 .banner.tip { background: #c6f6d5; color: #22543d; border: 1px solid #9ae6b4; }
 .banner.err { background: #fed7d7; color: #822727; border: 1px solid #feb2b2; }
+.banner.warn { background: #fefcbf; color: #975a16; border: 1px solid #f6e05e; }
 .banner-close {
   background: transparent; border: none; font-size: 16px; cursor: pointer;
   color: inherit; padding: 0 4px;
