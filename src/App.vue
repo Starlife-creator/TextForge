@@ -350,6 +350,10 @@ async function startPipeline() {
     alert('请填写完整：输入路径、输出路径、API URL、模型名');
     return;
   }
+  if (refactorMode.value === 'fix_gaps' && !diagnoseJson.value.trim()) {
+    alert('「修断层」模式依赖结构化断层清单：请在「优化项」中填写诊断JSON路径，诊断后勾选断层才能闭环修复。');
+    return;
+  }
   const body = {
     input_mode: inputMode.value,
     input_path: inputPath.value,
