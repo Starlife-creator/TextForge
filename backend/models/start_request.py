@@ -22,6 +22,8 @@ class StartRequest(BaseModel):
     ssl_verify: bool = True
     proxy: Optional[str] = None
     temperatures: Temperatures = Temperatures()
+    # B1 限流参数：批次间串行间隔（秒），避免连续请求触发云端限流
+    batch_interval_sec: float = Field(default=2.0, ge=0)
 
     # ---- 优化方案增量字段（默认值 = 旧版行为，无字段即 full_rewrite + 门全关） ----
     # P1.1 重构模式：缺省 full_rewrite（= 原「全部重构」极端档，行为不变）

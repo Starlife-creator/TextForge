@@ -57,10 +57,10 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
             # 逐章验收门：开启时每个批次重构稿产出后暂停，等待用户验收再继续
             if gates.get("require_chapter_accept"):
                 await _wait_batch_accept(progress, progress_path, batch, output_path, run_id)
-            # 铁律8：批次间保持 2s 串行间隔，避免连续请求触发云端限流
+            # 铁律8：批次间保持串行间隔，避免连续请求触发云端限流（间隔可配置，缺省 2s）
             pending_batches -= 1
             if pending_batches > 0:
-                await asyncio.sleep(2)
+                await asyncio.sleep(getattr(req, "batch_interval_sec", 2.0))
         
         # 阶段 3-2：缝合（同一个 client）
         await stitch_pipeline(output_path, progress, client, payload_base, sse_emit, run_id, chars)

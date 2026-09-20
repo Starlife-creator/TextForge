@@ -214,9 +214,9 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
                 atomic_write_json(progress_path, progress)
             logger.info(f"[phase1] batch {batch['batch_id']} 完成 -> {summary_file}")
             sse_emit("batch_done", {"batch_id": batch['batch_id'], "output_file": summary_file}, run_id)
-            # 铁律8：批次间保持 2s 串行间隔，避免连续请求触发云端限流
+            # 铁律8：批次间保持串行间隔，避免连续请求触发云端限流（间隔可配置，缺省 2s）
             if idx < len(progress['batches']) - 1:
-                await asyncio.sleep(2)
+                await asyncio.sleep(getattr(req, "batch_interval_sec", 2.0))
     
     progress['current_phase'] = 'phase2'
     async with state.progress_lock:

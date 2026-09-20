@@ -1,6 +1,9 @@
-import asyncio, json, time, logging, httpx
+import asyncio, json, time, logging, httpx, os
 
 logger = logging.getLogger("textforge")
+
+# D2：流式输出节流阈值（SSE 增量最少多少字符冲刷一次），可用环境变量覆盖
+STREAM_THROTTLE = int(os.environ.get("TEXTFORGE_STREAM_THROTTLE", "80"))
 
 def pick_model(req, phase: str) -> str:
     """P4.1 分阶段模型：models[phase] 优先，缺省回退到单一 req.model。
@@ -128,7 +131,7 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
                 chunk = _process_sse_line(line, full_text, usage)
                 if chunk:
                     _stream["buf"] += chunk
-                    if len(_stream["buf"]) >= 80:
+                    if len(_stream["buf"]) >= STREAM_THROTTLE:
                         _flush_stream_chunk()
     
     await _do(payload)

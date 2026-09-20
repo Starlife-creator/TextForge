@@ -57,6 +57,8 @@ const mStitch = ref('');
 // 禁改清单（inject_forbidden 门用，每行一条）+ reskin 人名映射（每行 旧名=新名）
 const forbiddenCanon = ref('');
 const nameMapText = ref('');
+// B1 批次间隔（秒）
+const batchInterval = ref(2.0);
 
 // ---------- 运行状态 ----------
 const runId = ref<string | null>(null);
@@ -100,6 +102,56 @@ const darkMode = ref(false);
 function toggleTheme() {
   darkMode.value = !darkMode.value;
   document.documentElement.classList.toggle('dark', darkMode.value);
+  persist();
+}
+
+// C2：本地持久化记忆设置项
+const PERSIST_KEY = 'textforge_prefs_v1';
+function persist() {
+  try {
+    localStorage.setItem(PERSIST_KEY, JSON.stringify({
+      apiUrl: apiUrl.value, model: model.value, contextWindow: contextWindow.value,
+      authorStyle: authorStyle.value, refactorMode: refactorMode.value,
+      batchInterval: batchInterval.value, darkMode: darkMode.value,
+      forbiddenCanon: forbiddenCanon.value, nameMapText: nameMapText.value,
+      outputPath: outputPath.value, inputPath: inputPath.value,
+    }));
+  } catch { /* 忽略持久化失败 */ }
+}
+function restore() {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY);
+    if (!raw) return;
+    const p = JSON.parse(raw);
+    if (typeof p.apiUrl === 'string') apiUrl.value = p.apiUrl;
+    if (typeof p.model === 'string') model.value = p.model;
+    if (typeof p.contextWindow === 'number') contextWindow.value = p.contextWindow;
+    if (typeof p.authorStyle === 'string') authorStyle.value = p.authorStyle;
+    if (p.refactorMode) refactorMode.value = p.refactorMode;
+    if (typeof p.batchInterval === 'number') batchInterval.value = p.batchInterval;
+    if (typeof p.darkMode === 'boolean') { darkMode.value = p.darkMode; document.documentElement.classList.toggle('dark', p.darkMode); }
+    if (typeof p.forbiddenCanon === 'string') forbiddenCanon.value = p.forbiddenCanon;
+    if (typeof p.nameMapText === 'string') nameMapText.value = p.nameMapText;
+    if (typeof p.outputPath === 'string') outputPath.value = p.outputPath;
+    if (typeof p.inputPath === 'string') inputPath.value = p.inputPath;
+  } catch { /* 忽略损坏数据 */ }
+}
+
+// C3：键盘快捷键（Space 暂停/恢复，Enter 确认当前弹窗）；输入组件内不触发
+function onKeydown(e: KeyboardEvent) {
+  const t = e.target as HTMLElement | null;
+  const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+  if (typing) return;
+  if (e.code === 'Space' && pipelineRunning.value && !e.repeat) {
+    e.preventDefault();
+    control(isPaused.value ? 'resume' : 'pause');
+  }
+  if (e.key === 'Enter' && !e.repeat) {
+    if (showSplit.value) { confirmSplit(); return; }
+    if (showFixReview.value) { confirmFix(); return; }
+    if (showAccept.value) { confirmAccept(); return; }
+    if (showQcBlock.value) { forceExport(); return; }
+  }
 }
 
 const phaseLabel: Record<string, string> = {
@@ -137,6 +189,8 @@ watch(eventLog, () => {
 });
 
 onMounted(async () => {
+  restore();
+  window.addEventListener('keydown', onKeydown);
   try {
     port.value = await waitForPort();
     backendReady.value = true;
@@ -152,7 +206,12 @@ onMounted(async () => {
   }
 });
 
-onUnmounted(() => { stopStatusPolling(); stopElapsed(); });
+onUnmounted(() => {
+  stopStatusPolling();
+  stopElapsed();
+  window.removeEventListener('keydown', onKeydown);
+  persist();
+});
 
 function startStatusPolling() {
   stopStatusPolling();
@@ -399,6 +458,7 @@ async function startPipeline() {
       refactor: tRefactor.value,
       stitch: tStitch.value,
     },
+    batch_interval_sec: batchInterval.value,
     models: Object.fromEntries(
       Object.entries({ diagnose: mDiagnose.value, blueprint: mBlueprint.value, refactor: mRefactor.value, stitch: mStitch.value })
         .filter(([, v]) => v && v.trim()),
@@ -419,6 +479,7 @@ async function startPipeline() {
     eventLog.value = [];
     addLog(`已提交流水线 run_id=${data.run_id.slice(0, 8)}...`);
     startElapsed();
+    persist();
   } catch (e: any) {
     alert(`请求失败：${e.message}`);
   }
@@ -756,6 +817,9 @@ const canStart = computed(() =>
           <div class="row">
             <label>重构</label> <input v-model.number="tRefactor" type="number" min="0" max="2" step="0.1" />
             <label class="t">缝合</label> <input v-model.number="tStitch" type="number" min="0" max="2" step="0.1" />
+          </div>
+          <div class="row">
+            <label>批次间隔(秒)</label> <input v-model.number="batchInterval" type="number" min="0" step="0.5" />
           </div>
         </details>
         <details class="adv">
