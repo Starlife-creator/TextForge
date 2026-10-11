@@ -13,6 +13,14 @@ from routes import state
 from routes import events as E
 import routes.events as ev
 
+# 控制台编码：本地 Windows 常是 GBK，GitHub runner 是 cp1252，
+# 直接 print 中文会 UnicodeEncodeError 让整套测试「假失败」。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 FAILS = []
 def check(name, cond, extra=""):
     try:

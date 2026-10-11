@@ -13,6 +13,14 @@
 import asyncio, json, os, shutil, sys, tempfile, time
 from pathlib import Path
 
+# 控制台编码：本地 Windows 常是 GBK，GitHub runner 是 cp1252，
+# 直接 print 中文会 UnicodeEncodeError 让整套测试「假失败」（在断言全过之后才崩）。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 sys.path.insert(0, str(Path(__file__).parent))
 # 绝不改 %APPDATA%：Windows 上它总是有值，改了等于污染开发者真实环境。
 # 需要隔离目录的测试各自用 tempfile.mkdtemp，并断言真实 APPDATA 未被触碰。

@@ -6,6 +6,14 @@
 import io, json, os, re, shutil, subprocess, sys, tempfile, time, urllib.request
 from pathlib import Path
 
+# 控制台编码：本地 Windows 常是 GBK，GitHub runner 是 cp1252，
+# 直接 print 中文会 UnicodeEncodeError 让整套测试「假失败」。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 BACKEND = Path(__file__).parent
 PY = str(BACKEND / "venv" / "Scripts" / "python.exe")
 if sys.platform.startswith("win"):          # CI 上由 CI 环境提供解释器路径
