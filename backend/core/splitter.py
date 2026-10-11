@@ -177,7 +177,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
                 continue
             chapter_ids = batch['chapter_ids']
             if state.stop_requested: raise asyncio.CancelledError()
-            await _wait_pause(progress, progress_path)
+            await _wait_pause()
             
             batch_content = "\n\n".join(
                 (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file']).read_text(encoding='utf-8', newline='')
@@ -209,7 +209,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
             # v8.8 修正：累计 usage
             _accum_usage(progress, usage)
             batch['status'] = 'phase1_done'
-            if batch['batch_id'] not in progress['processed_batches']:
+            if batch['batch_id'] not in progress.setdefault('processed_batches', []):
                 progress['processed_batches'].append(batch['batch_id'])
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
@@ -224,10 +224,18 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
         atomic_write_json(progress_path, progress)
 
 def _accum_usage(progress, usage):
-    """v8.8 新增：累计 token 用量。"""
+    """v8.8 新增：累计 token 用量。
+
+    用 setdefault 而非直接下标：init_progress 明确承诺兼容旧 run
+    （"旧 run 无字段即按此恢复"），但这里的 progress['usage'] 对 8.8 之前的
+    progress.json 会直接 KeyError，把整轮已完成的诊断结果打回。
+    """
     if not usage: return
-    progress['usage']['prompt_tokens'] += usage.get('prompt_tokens', 0) or 0
-    progress['usage']['completion_tokens'] += usage.get('completion_tokens', 0) or 0
+    acc = progress.setdefault('usage', {"prompt_tokens": 0, "completion_tokens": 0})
+    acc.setdefault('prompt_tokens', 0)
+    acc.setdefault('completion_tokens', 0)
+    acc['prompt_tokens'] += usage.get('prompt_tokens', 0) or 0
+    acc['completion_tokens'] += usage.get('completion_tokens', 0) or 0
 
 def _find_idx(chapters, cid):
     for i, c in enumerate(chapters):
@@ -264,6 +272,16 @@ def _load_batches(chapters, output_path, batch_limit):
             for ch in glist
         )
         group_ids = [ch['id'] for ch in glist]
+        # 虚拟组承诺「不拆散」，所以 group_chars 可能超过 batch_limit。
+        # 这里**只告警不报错**：batch_limit 由 context_window 推导，而用户填的
+        # context_window 未必等于模型真实窗口（例如填 8000、模型实际支持 128k）。
+        # 硬报错会把本来能正常跑完的配置直接判死；放行则最坏情况是服务商返回
+        # 上下文长度错误 —— 那是可读且可调参的反馈，而不是启动即失败。
+        if group_chars > batch_limit:
+            logger.warning(
+                f"[phase1] 章节组 {gk} 共 {group_chars} 字，超过单批上限 {int(batch_limit)} 字"
+                f"（章：{group_ids}）。该组因虚拟章保护不会被拆分；若服务商返回"
+                f"上下文超限，请调大「上下文」设置。")
         if current and (current_chars + group_chars > batch_limit or len(current) + len(group_ids) > 8):
             batches.append(current)
             current = list(group_ids)
@@ -394,10 +412,8 @@ def _parse_diag_json(result: str, batch_id: int) -> dict | None:
     obj["gaps"] = normalized
     return obj
 
-async def _wait_pause(progress, progress_path):
+async def _wait_pause():
+    """等待用户恢复。心跳由 pipeline_runner._heartbeat_loop 统一负责。"""
     while not state.pause_event.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
-        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        async with state.progress_lock:
-            atomic_write_json(progress_path, progress)
         await asyncio.sleep(1.0)

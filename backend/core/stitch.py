@@ -129,8 +129,17 @@ def _chapter_file_for_stitch(chapter_id: str, progress: dict) -> str:
             return f"02_workspace/reconstructed/chapter_{chapter_id}.txt"
     return f"02_workspace/reconstructed/chapter_{chapter_id}.txt"
 
+def _virtual_output_rel(v: dict) -> str:
+    """虚拟章重构稿的相对路径。
+
+    原实现在 _refactor_and_split 里把 output_file 写进 progress，但从没被重构过的
+    虚拟章（比如 progress.json 来自批次划分之前的旧版本）就没有这个键，
+    缝合阶段会以一个裸 KeyError 崩掉。这里直接由 virtual_id 推导，不再依赖缓存字段。
+    """
+    return f"02_workspace/reconstructed/chapter_{v['virtual_id']}.txt"
+
 async def apply_virtual_stitch(prev_v, next_v, client, payload_base, sse_emit_fn, run_id, chars):
-    patches = await _stitch_common(prev_v['output_file'], next_v['output_file'],
+    patches = await _stitch_common(_virtual_output_rel(prev_v), _virtual_output_rel(next_v),
         Path(payload_base['output_path']), payload_base, client, sse_emit_fn, run_id, chars)
     for p in patches:
         p["source"] = "virtual_stitch"
@@ -180,17 +189,36 @@ def _is_hard_break(text: str) -> bool:
 
 def merge_virtual_chapters(virtuals_sorted, output_path, progress):
     """v8.8 修正：用 \n\n 拼接避免粘连；合并后更新父章 hash。"""
-    merged = "\n\n".join((output_path / v['output_file']).read_text(encoding='utf-8', newline='') for v in virtuals_sorted)
+    merged = "\n\n".join((output_path / _virtual_output_rel(v)).read_text(encoding='utf-8', newline='') for v in virtuals_sorted)
     original_id = virtuals_sorted[0]['original_id']
     merged_file = output_path / "02_workspace/reconstructed" / f"chapter_{original_id}.txt"
     atomic_write_text(merged_file, merged)
-    for ch in progress['chapters']:
+    for ch in progress.get('chapters', []):
         if ch['id'] == original_id:
             ch['hash'] = sha256_of(merged)
             break
     rel = str(merged_file.relative_to(output_path)).replace('\\', '/')
     logger.info(f"[stitch] 虚拟章合并完成 {original_id} -> {rel}")
     return rel
+
+def _anchor_key(p: dict) -> tuple:
+    """缝合锚点的唯一标识：文件 + 原文指纹 + 替换文指纹。"""
+    return (p.get("file"), (p.get("original") or "")[:200], (p.get("replacement") or "")[:200])
+
+def _record_anchors(progress: dict, patches: list) -> None:
+    """记录缝合锚点，按指纹去重。
+
+    原实现无条件 extend，而锚点内容是从**当前文件内容**重新计算的，恢复后会整段重算。
+    崩溃在 extend 之后 / 落盘之前时，恢复会再追加一次同样的锚点；每个锚点内嵌
+    原文与替换文全文，progress.json 会随崩溃次数膨胀，缝合报告也随之出现重复行。
+    """
+    anchors = progress.setdefault('stitch_anchors', [])
+    known = {_anchor_key(a) for a in anchors}
+    for p in patches:
+        k = _anchor_key(p)
+        if k not in known:
+            known.add(k)
+            anchors.append(p)
 
 async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_fn, run_id, chars):
     from routes import state
@@ -200,9 +228,9 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
 
     # v8.8 修正：阶段 1 处理【所有】带虚拟章的 original_id（不论是否跨批次）
     # 幂等：merge 完成的 original_id 记入 stitch_virtual_done，恢复时整体跳过
-    original_ids = sorted({v['original_id'] for v in progress['virtual_chapter_map']})
+    original_ids = sorted({v['original_id'] for v in progress.setdefault('virtual_chapter_map', [])})
     todo_originals = [oid for oid in original_ids if oid not in virtual_done]
-    sse_emit("stitch_start", {"stage": 1, "count": len(original_ids),
+    sse_emit_fn("stitch_start", {"stage": 1, "count": len(original_ids),
         "skipped": len(original_ids) - len(todo_originals)}, run_id)
     for original_id in todo_originals:
         virtuals = [v for v in progress['virtual_chapter_map'] if v['original_id'] == original_id]
@@ -211,7 +239,7 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
             if state.stop_requested: raise asyncio.CancelledError()
             patches = await apply_virtual_stitch(virtuals_sorted[i], virtuals_sorted[i + 1],
                 client, payload_base, sse_emit_fn, run_id, chars)
-            progress['stitch_anchors'].extend(patches)
+            _record_anchors(progress, patches)
             patches_by_file = {}
             for p in patches: patches_by_file.setdefault(p['file'], []).append(p)
             apply_stitches(output_path, patches_by_file)
@@ -220,13 +248,13 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
         virtual_done.append(original_id)
         async with state.progress_lock:
             atomic_write_json(output_path / "progress.json", progress)
-    sse_emit("stitch_done", {"stage": 1}, run_id)
+    sse_emit_fn("stitch_done", {"stage": 1}, run_id)
     
     # v8.8 修正：阶段 2 批次间缝合，不再跳过任何边界
     # 幂等：已完成的边界（"prevBid-nextBid"）记入 stitch_batch_done，恢复时跳过
     total_pairs = max(0, len(completed_batches) - 1)
     if total_pairs > 0:
-        sse_emit("stitch_start", {"stage": 2, "count": total_pairs}, run_id)
+        sse_emit_fn("stitch_start", {"stage": 2, "count": total_pairs}, run_id)
     for i in range(total_pairs):
         if state.stop_requested: raise asyncio.CancelledError()
         pair_key = f"{completed_batches[i]['batch_id']}-{completed_batches[i + 1]['batch_id']}"
@@ -236,7 +264,7 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
         # v8.8：去掉 is_cross_batch_pair 跳过——虚拟章边界必须缝合
         patches = await apply_batch_stitch(completed_batches[i], completed_batches[i + 1],
             client, payload_base, sse_emit_fn, run_id, chars)
-        progress['stitch_anchors'].extend(patches)
+        _record_anchors(progress, patches)
         patches_by_file = {}
         for p in patches: patches_by_file.setdefault(p['file'], []).append(p)
         apply_stitches(output_path, patches_by_file)
@@ -244,4 +272,4 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
         async with state.progress_lock:
             atomic_write_json(output_path / "progress.json", progress)
     if total_pairs > 0:
-        sse_emit("stitch_done", {"stage": 2}, run_id)
+        sse_emit_fn("stitch_done", {"stage": 2}, run_id)

@@ -25,6 +25,7 @@ from routes.start import router as start_router
 from routes.events import router as events_router
 from routes.control import router as control_router
 from routes.status import router as status_router
+from routes.system import router as system_router
 
 app = FastAPI(title="TextForge", version="8.8", lifespan=lifespan)
 
@@ -42,3 +43,4 @@ app.include_router(start_router)
 app.include_router(events_router)
 app.include_router(control_router)
 app.include_router(status_router)
+app.include_router(system_router)

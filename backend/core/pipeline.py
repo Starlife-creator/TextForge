@@ -22,15 +22,15 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
     if current_phase == 'phase2_waiting' and story_bible.exists():
         existing_text = story_bible.read_text(encoding='utf-8')
         if len(existing_text) >= 100:
+            # 必须先 clear 再推送：否则用户在 SSE→HTTP 往返的这几毫秒里点下确认，
+            # 动作会被紧随其后的 clear() 抹掉，流水线永远卡在闸门上（必现竞态）。
+            state.blueprint_confirmed.clear()
             sse_emit("blueprint_ready", {"blueprint": existing_text, "resumed": True}, run_id)
             logger.info("[phase2] 检测到待确认蓝图，恢复等待用户确认")
-            state.blueprint_confirmed.clear()
             while not state.blueprint_confirmed.is_set():
                 if state.stop_requested: raise asyncio.CancelledError()
-                progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                async with state.progress_lock:
-                    atomic_write_json(progress_path, progress)
                 await asyncio.sleep(1.0)
+            await state.absorb_gate_result(progress, progress_path, ['blueprint_confirmed', 'blueprint_user_edited'])
             progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
@@ -75,17 +75,15 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
     progress['current_phase'] = 'phase2_waiting'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
-    sse_emit("blueprint_ready", {"blueprint": result, "max_chars": blueprint_max}, run_id)
-    
-    # blueprint_confirmed 只在此处 clear 一次
+    # 同上：先 clear 再推送，否则「推送 → 用户确认 → clear」的顺序会让确认丢失。
     state.blueprint_confirmed.clear()
+    sse_emit("blueprint_ready", {"blueprint": result, "max_chars": blueprint_max}, run_id)
+    logger.info("[phase2] 蓝图已生成，等待用户确认")
     while not state.blueprint_confirmed.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
-        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        async with state.progress_lock:
-            atomic_write_json(progress_path, progress)
         await asyncio.sleep(1.0)
-    
+    # 用户是否编辑过蓝图由控制端点写入，这里并回内存
+    await state.absorb_gate_result(progress, progress_path, ['blueprint_confirmed', 'blueprint_user_edited'])
     blueprint_text = story_bible.read_text(encoding='utf-8')
     if len(blueprint_text) < 100:
         raise RuntimeError("蓝图过短，可能生成失败")

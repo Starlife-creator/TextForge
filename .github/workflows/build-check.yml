@@ -81,3 +81,16 @@ jobs:
           source venv/Scripts/activate
           pip install pytest
           python -m pytest tests -q
+
+      # 回归 / 事件流 / 端到端 三套脚本式测试。
+      # 端到端（mock LLM 真跑 phase0→phase4）能抓到单元测试结构上抓不到的问题，
+      # 例如 stitch.py 用了未导入的 sse_emit —— 那类 NameError 只有真正执行才暴露。
+      # 脚本形态而非 pytest 收集：这些文件在模块顶层执行并自行退出码。
+      - name: 回归 / 事件流 / 端到端测试
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          python regression_test.py
+          python test_event_stream.py
+          python test_e2e_pipeline.py

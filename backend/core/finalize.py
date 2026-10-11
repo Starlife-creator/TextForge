@@ -22,19 +22,25 @@ def find_reconstructed_chapter(output_path: Path, chapter_id: str, progress: dic
     raise FileNotFoundError(f"找不到章节 {chapter_id} 的重构稿：{ch_file}")
 
 def write_stitch_report(output_path: Path, progress: dict):
-    final_dir = output_path / "03_final"
-    final_dir.mkdir(parents=True, exist_ok=True)
+    """缝合补丁报告。
+
+    写到 `_diagnostics/` 而不是 `03_final/`：03_final 是交付目录，
+    混进 .json 报告会让「打开成品」把报告当章节列出来（/api/final_files 只能
+    靠扩展名过滤，那对 .txt 报告无效）。诊断产物应该和成品分开。
+    """
+    diag_dir = output_path / "_diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
     anchors = progress.get("stitch_anchors", [])
     txt_lines = ["缝合补丁报告", "=" * 60, ""]
     for a in anchors:
         txt_lines.append(f"[{a.get('source', 'unknown')}] {a['file']}")
-        txt_lines.append(f"  偏移: {a['start']} - {a['end']}")
-        txt_lines.append(f"  原文: {a['original'][:100]}...")
-        txt_lines.append(f"  替换: {a['replacement'][:100]}...")
+        txt_lines.append(f"  偏移: {a.get('start')} - {a.get('end')}")
+        txt_lines.append(f"  原文: {(a.get('original') or '')[:100]}...")
+        txt_lines.append(f"  替换: {(a.get('replacement') or '')[:100]}...")
         txt_lines.append(f"  已应用: {a.get('applied', False)}")
         txt_lines.append("")
-    atomic_write_text(final_dir / "缝合补丁报告.txt", "\n".join(txt_lines))
-    atomic_write_json(final_dir / "缝合补丁报告.json", {"anchors": anchors})
+    atomic_write_text(diag_dir / "缝合补丁报告.txt", "\n".join(txt_lines))
+    atomic_write_json(diag_dir / "缝合补丁报告.json", {"anchors": anchors})
 
 def _safe_filename(name: str) -> str:
     for ch in '<>:"/\\|?*': name = name.replace(ch, '_')
@@ -43,14 +49,26 @@ def _safe_filename(name: str) -> str:
     return name.strip() or "重构终稿"
 
 def _cleanup_backups(backup_dir: Path, keep: int = BACKUP_KEEP):
-    """v8.8 新增：_backup 只保留最近 keep 个，避免无限增长。"""
+    """v8.8 新增：_backup 只保留最近 keep 个，避免无限增长。
+
+    注意 p.stat() 必须包在 try 内：原实现放在 try 外面，一个并发消失或无权限的条目
+    就会抛 OSError 穿透 phase4_finalize —— 此时成品其实已经写完了，却报 code="exception"
+    且不发 done 事件，用户会以为失败而重跑。
+    """
     if not backup_dir.exists():
         return
-    backups = sorted(backup_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    for old in backups[keep:]:
+    stamped = []
+    for p in backup_dir.iterdir():
+        try:
+            if p.is_file():
+                stamped.append((p.stat().st_mtime, p))
+        except OSError:
+            continue
+    stamped.sort(key=lambda x: x[0], reverse=True)
+    for _, old in stamped[keep:]:
         try:
             old.unlink(missing_ok=True)
-        except Exception:
+        except OSError:
             pass
 
 def phase4_finalize(output_path: Path, progress: dict, req):
@@ -71,14 +89,24 @@ def phase4_finalize(output_path: Path, progress: dict, req):
             if ch.get('is_empty'): merged_texts.append("")
             else: raise
     
-    novel_name = _safe_filename(progress['novel_name'])
-    
+    novel_name = _safe_filename(progress.get('novel_name') or '重构终稿')
+
     if req.input_mode == "single_file":
         output_file = final_dir / f"{novel_name}_重构终稿.{output_format}"
         _write_with_backup(output_file, merged_texts, output_format, backup_dir)
     else:
+        # 逐章文件名必须去非法字符 + 去重：多文件模式允许 txt/md/docx 混放，
+        # 「001.txt」与「001.md」会生成同一个 重构_001.{fmt}，后者静默覆盖前者。
+        used = set()
         for ch, text in zip(original_chapters, merged_texts):
-            out_name = f"重构_{Path(ch['filename']).stem}.{output_format}"
+            stem = _safe_filename(Path(ch['filename']).stem)
+            out_name = f"重构_{stem}.{output_format}"
+            if out_name in used:
+                n = 2
+                while f"重构_{stem}({n}).{output_format}" in used:
+                    n += 1
+                out_name = f"重构_{stem}({n}).{output_format}"
+            used.add(out_name)
             output_file = final_dir / out_name
             _write_with_backup(output_file, [text], output_format, backup_dir)
         output_file = final_dir / f"{novel_name}_重构终稿.{output_format}"

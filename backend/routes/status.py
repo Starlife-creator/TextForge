@@ -99,8 +99,17 @@ def _read_diag_gaps(diag_path):
 
 
 def _build_resume(progress, target):
-    """按当前等待阶段返回可重开弹窗所需的前端数据，否则 None。"""
+    """按当前等待阶段返回可重开弹窗所需的前端数据，否则 None。
+
+    必须覆盖**所有**会无限等待的闸门阶段：wait_split_confirm 是无界 while，
+    漏掉任何一个，刷新页面/SSE 重连后就再也弹不出确认框，任务 0% 死转且无法恢复。
+    """
     phase = progress.get("current_phase")
+    if phase == "phase0_confirm":
+        # 拆书预览：与 split_ready 推送的字段保持一致
+        return {"key": "split",
+                "chapters": [{k: c.get(k) for k in ("id", "filename", "is_empty", "is_virtual")}
+                             for c in progress.get("chapters", [])]}
     if phase == "phase1_fixreview":
         djson = progress.get("diagnose_json")
         return {"key": "fix", "gaps": _read_diag_gaps(djson) if djson else []}
@@ -163,13 +172,16 @@ def _chapter_summary(progress, target) -> list:
 
 @router.get("/api/final_files")
 async def final_files(output_path: str):
-    """C4：列出 03_final 成品目录内的文件（供前端一键打开成品文档）。"""
+    """C4：列出 03_final 成品目录内的交付文档（供前端一键打开成品文档）。
+
+    只收 txt/md/docx：03_final 里可能出现诊断类产物，按扩展名过滤比按文件名可靠。
+    """
     fin = Path(output_path) / "03_final"
     if not fin.is_dir():
         return {"files": []}
     files = []
     for f in sorted(fin.iterdir()):
-        if f.is_file():
+        if f.is_file() and f.suffix.lower() in (".txt", ".md", ".docx"):
             files.append({"name": f.name, "path": str(f)})
     return {"files": files}
 

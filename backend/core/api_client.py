@@ -1,4 +1,5 @@
 import asyncio, json, time, logging, httpx, os
+from urllib.parse import urlparse
 
 logger = logging.getLogger("textforge")
 
@@ -11,10 +12,54 @@ def pick_model(req, phase: str) -> str:
     return pick_endpoint(req, phase)["model"]
 
 
+def _host_of(u: str) -> str:
+    """取主机名（忽略 scheme/端口），本机回环统一成 localhost。
+
+    解析不出主机名时返回带 `__` 前缀的占位串（绝不返回空串，也绝不悄悄
+    退化成「整条 URL 字符串比较」—— 那会让所有同主机不同路径的配置都被误判成
+    换了服务商、进而丢掉用户的 API Key，表现为莫名其妙的 401）。
+    具体怎么解读这个占位串由 _same_provider 决定（那里是 fail-open）。
+    """
+    try:
+        h = (urlparse(u or "").hostname or "").lower()
+    except Exception as e:
+        logger.warning(f"[api] URL 解析失败: {u!r} ({e})")
+        return f"__unparsable__:{u}"
+    if not h:
+        return f"__nohost__:{u}"
+    return "localhost" if h in ("127.0.0.1", "::1", "0.0.0.0") else h
+
+
+def _same_provider(a: str, b: str) -> bool:
+    """判断两个 URL 是否指向同一个服务商。
+
+    只比主机名、忽略 scheme/端口，并把 localhost / 127.0.0.1 / ::1 视为同一主机。
+    否则下面这些**完全正常**的配置会被误判成「换了服务商」而丢掉密钥 → 401：
+      127.0.0.1:1234 ↔ localhost:1234
+      http://api.x.com ↔ https://api.x.com
+      :8000 ↔ :8080（同一台机器上的反向代理）
+
+    解析不出主机名时**保守判为同一服务商**（保留 Key）：这类 URL 本来也发不出
+    成功请求（httpx 会先因 scheme 非法而拒绝），谈不上泄露；而误丢 Key 只会把
+    本来能跑的配置变成 401。这是有意的 fail-open。
+    """
+    ha, hb = _host_of(a), _host_of(b)
+    if ha.startswith("__") or hb.startswith("__"):
+        return True
+    return ha == hb
+
+
 def pick_endpoint(req, phase: str) -> dict:
     """A2 分阶段端点：返回该阶段 {model, api_url, api_key}。
     models[phase] 可为字符串（旧：同名模型但同一端点）或 dict {model, api_url?, api_key?}。
-    缺省回退到全局 req.model / req.api_url / req.api_key，旧行为不变。"""
+    缺省回退到全局 req.model / req.api_url / req.api_key，旧行为不变。
+
+    安全：该阶段指向**不同主机**且没配自己的 api_key 时，不把全局密钥发过去 ——
+    否则「本地匿名诊断 + 云端 Key」会把云端凭据泄露给第三方。
+    同一主机的不同 scheme/端口仍沿用全局 Key，不打断既有配置。
+    """
+    # 延迟导入：core 不应反向依赖 routes（sse_emit 内部已默认用 current_run_id）
+    from routes.events import sse_emit
     models = getattr(req, "models", {}) or {}
     model = req.model
     url = req.api_url
@@ -29,6 +74,15 @@ def pick_endpoint(req, phase: str) -> dict:
             url = entry["api_url"]
         if "api_key" in entry:
             key = entry.get("api_key") or ""
+        elif key and not _same_provider(url, req.api_url):
+            msg = (f"[api] 阶段 {phase} 指向了不同主机 {_host_of(url)}（全局是 {_host_of(req.api_url)}）"
+                   f"且未单独提供 api_key，已丢弃全局密钥以避免向第三方泄露；"
+                   f"如该服务需要鉴权，请在「分阶段模型」里为 {phase} 单独填写密钥")
+            logger.warning(msg)
+            # 必须同时推给用户：只写 backend.log 的话，用户只会看到 401 却在界面上毫无线索
+            sse_emit("error", {"kind": "warning", "code": "phase_key_dropped",
+                               "message": msg + "（该阶段请求将不带鉴权）"})
+            key = ""
     return {"model": model, "api_url": url, "api_key": key}
 
 

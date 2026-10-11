@@ -3,11 +3,14 @@ import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue';
 import { open } from '@tauri-apps/plugin-dialog';
 import { isTauri } from '@tauri-apps/api/core';
 import { waitForPort } from './api/backend';
-import { connectSSE, disconnectSSE } from './api/sse';
+import { connectSSE, disconnectSSE, type SSEHandlers } from './api/sse';
+import SettingsModal from './components/SettingsModal.vue';
 
 // ---------- 后端连接 ----------
 const port = ref<number | null>(null);
 const backendReady = ref(false);
+/** SSE 已连续失败次数（>0 表示正在退避重连）；用于把「瞬时抖动」和「真断了」区分开 */
+const sseAttempts = ref(0);
 const errorMsg = ref('');
 // 运行计时
 const startedAt = ref<number | null>(null);
@@ -15,6 +18,19 @@ const elapsed = ref('00:00');
 let elapsedTimer: number | null = null;
 const inTauri = isTauri();
 let statusTimer: number | null = null;
+// 后端设置面板
+const showSettings = ref(false);
+const sseHandlers: SSEHandlers = {
+  onEvent: (e, p) => handleSSEEvent(e, p),
+  onStatus: (s) => {
+    backendReady.value = s.connected;
+    sseAttempts.value = s.attempt;
+    // 只有连续失败到第 3 次才提示，避免一次网络抖动就弹红字
+    errorMsg.value = s.connected
+      ? ''
+      : (s.attempt >= 3 ? `后端连接断开，正在自动重连（第 ${s.attempt} 次）` : '');
+  },
+};
 
 // ---------- 输入配置 ----------
 const inputMode = ref<'single_file' | 'multi_file'>('single_file');
@@ -45,6 +61,9 @@ const qcIssues = ref<string[]>([]);
 const forcingExport = ref(false);
 const proxy = ref('');
 const richText = ref(false);
+// HTTPS 证书校验：后端 StartRequest.ssl_verify 必须真正收到这个值，
+// 否则设置面板里那个开关只影响自检、实际运行恒为 True
+const sslVerify = ref(true);
 // 各阶段温度（高级项，对应后端 Temperatures）
 const tDiagnose = ref(0.3);
 const tBlueprint = ref(0.5);
@@ -55,11 +74,17 @@ const mDiagnose = ref('');
 const mBlueprint = ref('');
 const mRefactor = ref('');
 const mStitch = ref('');
-// A2：各阶段可选独立 API 地址（留空则用全局端点）
+// A2：各阶段可选独立 API 地址与密钥（留空则用全局端点）
 const uDiagnose = ref('');
 const uBlueprint = ref('');
 const uRefactor = ref('');
 const uStitch = ref('');
+// A2 逃生口：分阶段端点换了主机时后端会丢弃全局 Key（防泄露），
+// 此时必须有一个能单独填密钥的地方，否则该配置无解、直接 401。
+const kDiagnose = ref('');
+const kBlueprint = ref('');
+const kRefactor = ref('');
+const kStitch = ref('');
 // 禁改清单（inject_forbidden 门用，每行一条）+ reskin 人名映射（每行 旧名=新名）
 const forbiddenCanon = ref('');
 const nameMapText = ref('');
@@ -78,16 +103,20 @@ function applyPreset() {
   contextWindow.value = p.ctx;
   batchInterval.value = p.interval;
 }
-// A2：构建 models 字典——仅模型则为字符串；配了独立端点则为 {model, api_url}
-function buildModels(): Record<string, string | { model: string; api_url: string }> {
-  const out: Record<string, string | { model: string; api_url: string }> = {};
-  const put = (ph: string, m: string, u: string) => {
-    if (m && m.trim()) out[ph] = (u && u.trim()) ? { model: m.trim(), api_url: u.trim() } : m.trim();
+// A2：构建 models 字典——仅模型则为字符串；配了独立端点则为 {model, api_url[, api_key]}
+function buildModels(): Record<string, string | { model: string; api_url: string; api_key?: string }> {
+  const out: Record<string, string | { model: string; api_url: string; api_key?: string }> = {};
+  const put = (ph: string, m: string, u: string, k: string) => {
+    if (!m || !m.trim()) return;
+    if (!u || !u.trim()) { out[ph] = m.trim(); return; }
+    const entry: { model: string; api_url: string; api_key?: string } = { model: m.trim(), api_url: u.trim() };
+    if (k && k.trim()) entry.api_key = k.trim();
+    out[ph] = entry;
   };
-  put('diagnose', mDiagnose.value, uDiagnose.value);
-  put('blueprint', mBlueprint.value, uBlueprint.value);
-  put('refactor', mRefactor.value, uRefactor.value);
-  put('stitch', mStitch.value, uStitch.value);
+  put('diagnose', mDiagnose.value, uDiagnose.value, kDiagnose.value);
+  put('blueprint', mBlueprint.value, uBlueprint.value, kBlueprint.value);
+  put('refactor', mRefactor.value, uRefactor.value, kRefactor.value);
+  put('stitch', mStitch.value, uStitch.value, kStitch.value);
   return out;
 }
 // C4 成品文档直开
@@ -118,6 +147,7 @@ const chapterSnapshots = ref(false);
 const diagnoseJson = ref('');
 const showSplit = ref(false);
 const splitChapters = ref<any[]>([]);
+const confirmingSplit = ref(false);
 // fix_gaps 闭环：断层勾选弹窗
 const showFixReview = ref(false);
 const fixGaps = ref<any[]>([]);
@@ -156,6 +186,17 @@ function persist() {
       batchInterval: batchInterval.value, darkMode: darkMode.value,
       forbiddenCanon: forbiddenCanon.value, nameMapText: nameMapText.value,
       outputPath: outputPath.value, inputPath: inputPath.value,
+      // inputMode / inputFormat / novelName 必须一起存：后端 paths.py 会硬校验
+      // 「声明格式 == 文件扩展名」，只存 inputPath 会让重开后的默认 txt + .docx 直接 422
+      inputMode: inputMode.value, inputFormat: inputFormat.value, novelName: novelName.value,
+      sslVerify: sslVerify.value,
+      tDiagnose: tDiagnose.value, tBlueprint: tBlueprint.value,
+      tRefactor: tRefactor.value, tStitch: tStitch.value,
+      proxy: proxy.value, richText: richText.value,
+      // 刻意不持久化 apiKey：后端全链路约定「Key 仅存内存、不落盘、不进日志」
+      // （api_client.make_httpx_client / routes/state.current_req），明文写进
+      // WebView2 localStorage 会打破这个不变量，也会让设置面板上
+      // 「仅存内存不落盘」的提示变成假话。
     }));
   } catch { /* 忽略持久化失败 */ }
 }
@@ -175,6 +216,17 @@ function restore() {
     if (typeof p.nameMapText === 'string') nameMapText.value = p.nameMapText;
     if (typeof p.outputPath === 'string') outputPath.value = p.outputPath;
     if (typeof p.inputPath === 'string') inputPath.value = p.inputPath;
+    if (p.inputMode === 'single_file' || p.inputMode === 'multi_file') inputMode.value = p.inputMode;
+    if (['txt', 'md', 'docx'].includes(p.inputFormat)) inputFormat.value = p.inputFormat;
+    if (typeof p.novelName === 'string') novelName.value = p.novelName;
+    if (typeof p.sslVerify === 'boolean') sslVerify.value = p.sslVerify;
+    if (typeof p.proxy === 'string') proxy.value = p.proxy;
+    if (typeof p.richText === 'boolean') richText.value = p.richText;
+    // 不恢复 apiKey：见 persist() 处的说明（凭据不落盘）
+    for (const [k, ref] of [['tDiagnose', tDiagnose], ['tBlueprint', tBlueprint],
+                            ['tRefactor', tRefactor], ['tStitch', tStitch]] as const) {
+      if (typeof p[k] === 'number') ref.value = p[k];
+    }
   } catch { /* 忽略损坏数据 */ }
 }
 
@@ -197,9 +249,13 @@ function onKeydown(e: KeyboardEvent) {
 
 const phaseLabel: Record<string, string> = {
   phase0: '阶段0：拆书',
+  phase0_confirm: '阶段0：等待拆书确认',
   phase1: '阶段1：诊断',
+  phase1_fixreview: '阶段1：等待断层勾选',
   phase2: '阶段2：蓝图生成',
   phase2_waiting: '阶段2：等待蓝图确认',
+  'phase3_accept': '阶段3：等待逐章验收',
+  'phase3_qc': '阶段3：等待质检决策',
   'phase3-1': '阶段3-1：重构',
   phase4: '阶段4：收尾',
 };
@@ -223,31 +279,44 @@ const chapterPercent = computed(() => {
   return t ? `${Math.round((chapterProgress.value.done / t) * 100)}%` : '0%';
 });
 
-// 新日志自动滚到底部
+// 新日志自动滚到底部。必须 deep：eventLog 是 ref 数组，addLog 用的是 push（原地修改），
+// 不开 deep 时 watch 永远不触发，运行中日志不会自动跟随。
 watch(eventLog, () => {
   const el = logBoxRef.value;
   if (el) el.scrollTop = el.scrollHeight;
-});
+}, { deep: true });
 
 onMounted(async () => {
   restore();
   window.addEventListener('keydown', onKeydown);
+  void connectBackend();
+});
+
+/** 建立后端连接：拿端口 → 接 SSE → 拉状态 → 起轮询。失败也让用户能进设置面板自救。 */
+async function connectBackend() {
   try {
     port.value = await waitForPort();
-    backendReady.value = true;
-    connectSSE(port.value, {
-      onEvent: handleSSEEvent,
-      onError: (msg) => { errorMsg.value = msg; backendReady.value = false; },
-    });
+    connectSSE(port.value, sseHandlers);
     // 页面刷新/SSE 晚连接时，从后端恢复 UI 状态（暂停态、待确认蓝图、用量等）
     await fetchStatus();
     startStatusPolling();
   } catch (e: any) {
     errorMsg.value = e.message || String(e);
+    backendReady.value = false;
   }
-});
+}
+
+/** 设置面板里的「重新连接」：重置退避计数，重新走一遍握手。 */
+function reconnectBackend() {
+  disconnectSSE();
+  backendReady.value = false;
+  sseAttempts.value = 0;
+  errorMsg.value = '正在重新连接后端…';
+  void connectBackend();
+}
 
 onUnmounted(() => {
+  disconnectSSE();
   stopStatusPolling();
   stopElapsed();
   window.removeEventListener('keydown', onKeydown);
@@ -278,21 +347,33 @@ function stopElapsed() {
   if (elapsedTimer !== null) { clearInterval(elapsedTimer); elapsedTimer = null; }
 }
 
-async function fetchStatus() {
-  if (!port.value) return;
+// ---------- 闸门闩锁 ----------
+// 控制端点不再写 current_phase，流水线最多 1s 后才推进阶段；这 1s 窗口内
+// 5s 一次的 fetchStatus 仍会看到旧阶段，把刚确认完的弹窗重新弹出来。
+// 用户再点一次会拿到 409，而该弹窗没有关闭按钮 → 全屏锁死。
+// 用 run_id + 闸门名做闩锁，确认过后不再响应 _build_resume。
+const confirmedGates = ref<Set<string>>(new Set());
+function gateKey(k: string) { return `${runId.value || '-'}:${k}`; }
+function isGateSettled(k: string) { return confirmedGates.value.has(gateKey(k)); }
+function markGateSettled(k: string) { confirmedGates.value.add(gateKey(k)); }
+
+async function fetchStatus(): Promise<boolean> {
+  if (!port.value) return false;
   try {
     const q = outputPath.value ? `?output_path=${encodeURIComponent(outputPath.value)}` : '';
     const res = await fetch(`http://127.0.0.1:${port.value}/api/status${q}`);
-    if (!res.ok) return;
+    if (!res.ok) return false;
     const s = await res.json();
     isPaused.value = !!s.paused;
-    // B4：心跳超时判定后端假死（阈值 90s）
-    if (s.pipeline_running && s.last_heartbeat) {
-      const ageMs = Date.now() - new Date(s.last_heartbeat).getTime();
-      zombieWarn.value = ageMs > 90_000;
-    } else if (!s.pipeline_running) {
-      zombieWarn.value = false;
-    }
+    // 必须无条件赋值：原实现只有 `if (s.pipeline_running) pipelineRunning = true`，
+    // 没有 else。后端进程一死，fetch 抛异常被空 catch 吞掉，pipelineRunning 就永远
+    // 卡在 true → canStart 恒 false → .panel.config.disabled 的 pointer-events:none
+    // 把整个配置面板冻住，只能刷新页面。
+    pipelineRunning.value = !!s.pipeline_running;
+    // B4：僵尸检测。后端已改为后台任务每 10s 刷新心跳（覆盖 LLM 调用期间），
+    // 所以 90s 阈值现在是真的「进程卡死」，不会再在跑大批次时误报。
+    zombieWarn.value = !!(s.pipeline_running && s.last_heartbeat
+      && Date.now() - new Date(s.last_heartbeat).getTime() > 90_000);
     usageTokens.value = {
       prompt: s.usage?.prompt_tokens || 0,
       completion: s.usage?.completion_tokens || 0,
@@ -309,10 +390,7 @@ async function fetchStatus() {
       done: s.reconstructed_chapters || 0,
     };
     if (Array.isArray(s.chapters_summary)) chapterRows.value = s.chapters_summary;
-    if (s.pipeline_running) {
-      pipelineRunning.value = true;
-      if (s.current_phase) currentPhase.value = phaseLabel[s.current_phase] || s.current_phase;
-    }
+    if (pipelineRunning.value && s.current_phase) currentPhase.value = phaseLabel[s.current_phase] || s.current_phase;
     // 恢复时重新弹出蓝图确认（SSE 事件已错过）
     if (s.current_phase === 'phase2_waiting' && s.blueprint && !showBlueprint.value) {
       blueprintText.value = s.blueprint;
@@ -321,27 +399,34 @@ async function fetchStatus() {
     }
     const lastErr = s.error_logs?.[s.error_logs.length - 1];
     if (lastErr && !pipelineRunning.value) topError.value = lastErr.message;
-    // B3：刷新后恢复等待态弹窗
+    // B3：刷新后恢复等待态弹窗（必须覆盖后端 _build_resume 的全部分支）
     if (s.resume) {
       const r = s.resume;
-      if (r.key === 'accept' && !showAccept.value) {
+      if (r.key === 'split' && !showSplit.value && !isGateSettled('split')) {
+        splitChapters.value = r.chapters || [];
+        showSplit.value = true;
+        addLog('已恢复拆书确认（刷新后重开）', 'warn');
+      } else if (r.key === 'accept' && !showAccept.value && !isGateSettled(`accept:${r.batch_id}`)) {
         acceptBatch.value = r.batch_id;
         acceptChapters.value = r.chapters || [];
         showAccept.value = true;
         addLog('已恢复逐章验收（刷新后重开）', 'warn');
-      } else if (r.key === 'fix' && !showFixReview.value) {
+      } else if (r.key === 'fix' && !showFixReview.value && !isGateSettled('fix')) {
         fixGaps.value = r.gaps || [];
         fixSelected.value = fixGaps.value.map((g: any) => g.id).filter(Boolean);
         showFixReview.value = true;
         addLog('已恢复断层勾选（刷新后重开）', 'warn');
-      } else if (r.key === 'qc' && !showQcBlock.value) {
+      } else if (r.key === 'qc' && !showQcBlock.value && !isGateSettled('qc')) {
         qcIssues.value = r.issues || [];
         showQcBlock.value = true;
         addLog('已恢复质检决策（刷新后重开）', 'err');
       }
     }
+    return true;
   } catch {
-    // 轮询失败静默，等待下一次
+    // 轮询失败静默，等待下一次。返回 false 表示「本轮没有拿到权威状态」，
+    // 调用方不能据此判定流水线已停。
+    return false;
   }
 }
 
@@ -350,9 +435,20 @@ function handleSSEEvent(event: string, payload: any) {
     case 'run_id':
       runId.value = payload.run_id;
       break;
-    case 'run_start':
+case 'run_start':
+      // 「重放」由服务端用 _replay 标记（backend/routes/events.py）。
+      // **不能**用 `payload.run_id === runId.value` 判断：后端在重放 run_start
+      // 之前必定先发 run_id 事件并把它写进 runId.value，那样判据 100% 命中，
+      // 会把整个 handler 变成死代码 —— 断点恢复提示、运行计时器、阶段标签全部失效。
+      if (payload._replay) {
+        addLog('已重新连接事件流', 'warn');
+        break;
+      }
       pipelineRunning.value = true;
       topError.value = null;
+      runId.value = payload.run_id || runId.value;
+      confirmedGates.value = new Set(); // 新一轮 run：清掉上一轮的闸门闩锁
+      finalFiles.value = [];
       currentPhase.value = payload.resumed ? '（断点恢复中）' : '启动';
       topTip.value = payload.resumed
         ? '检测到未完成的进度，将从断点继续（已完成的阶段/批次自动跳过）'
@@ -425,31 +521,50 @@ function handleSSEEvent(event: string, payload: any) {
     case 'done':
       pipelineRunning.value = false;
       currentPhase.value = '完成';
-      stopStatusPolling(); // C: 结束后停掉轮询，避免空转
-      disconnectSSE();     // #4 结束后断开 SSE，避免 keep-alive 空挂
+      closeAllGates();
+      stopStatusPolling();   // 空闲期不空转轮询；下次 startPipeline 会重新拉起
+      // 不再断开 SSE：后端 /api/events 会「跟随」current_run_id，
+      // 保持连接才能让下一次 run 自动接上；断开等于把流打死且不再重连。
       topTip.value = `全部完成！成品在：${payload.output_dir}\\03_final`;
       addLog(`全部完成！输出目录：${payload.output_dir}`, 'ok');
       stopElapsed();
       break;
     case 'stopped':
       pipelineRunning.value = false;
+      // 必须关掉所有闸门弹窗：.modal-mask 是 fixed + z-index:100，
+      // 残留一个「停止/强制导出」弹窗会全屏锁死界面，用户连关闭按钮都点不到。
+      closeAllGates();
       stopStatusPolling();
-      disconnectSSE();
       topTip.value = '流水线已停止，进度已保留；再次点击“开始重构”可从断点继续';
       addLog('流水线已停止', 'warn');
       stopElapsed();
       break;
     case 'error':
-      addLog(`错误：${payload.message || payload.code}`, 'err');
-      if (payload.kind !== 'warning') {
-        pipelineRunning.value = false;
-        stopStatusPolling();
-        disconnectSSE();
-        topError.value = payload.message || payload.code || '未知错误';
+      // kind='warning' 是非致命提示（如摘要超长被截断），不应停表、也不该记成错误
+      if (payload.kind === 'warning') {
+        addLog(`提示：${payload.message || payload.code}`, 'warn');
+        break;
       }
+      addLog(`错误：${payload.message || payload.code}`, 'err');
+      pipelineRunning.value = false;
+      closeAllGates();
+      stopStatusPolling();
+      topError.value = payload.message || payload.code || '未知错误';
       stopElapsed();
       break;
+    case 'comparison_done':
+      addLog(`左右对照已生成：写入 ${payload.written} 章 / 跳过 ${payload.skipped} 章`, 'ok');
+      break;
   }
+}
+
+/** 关闭所有人工闸门弹窗（停止 / 出错 / 完成时统一调用，避免全屏锁死）。 */
+function closeAllGates() {
+  showSplit.value = false;
+  showFixReview.value = false;
+  showAccept.value = false;
+  showQcBlock.value = false;
+  showBlueprint.value = false;
 }
 
 // ---------- 文件夹选择 ----------
@@ -461,7 +576,13 @@ async function selectInput() {
         multiple: false,
         filters: [{ name: '文档', extensions: ['txt', 'md', 'docx'] }],
       });
-      if (typeof selected === 'string') inputPath.value = selected;
+      if (typeof selected === 'string') {
+        inputPath.value = selected;
+        // 选了 .docx 却仍声明 txt，后端 paths.py 会直接 422：
+        // 「输入格式选择(txt)与文件扩展名(.docx)不一致」
+        const ext = selected.split('.').pop()?.toLowerCase();
+        if (ext === 'txt' || ext === 'md' || ext === 'docx') inputFormat.value = ext;
+      }
     } else {
       const selected = await open({ directory: true });
       if (typeof selected === 'string') inputPath.value = selected;
@@ -492,7 +613,7 @@ async function startPipeline() {
     return;
   }
   if (refactorMode.value === 'fix_gaps' && !diagnoseJson.value.trim()) {
-    alert('「修断层」模式依赖结构化断层清单：请在「优化项」中填写诊断JSON路径，诊断后勾选断层才能闭环修复。');
+    alert('「修断层」模式依赖结构化断层清单：请在「优化项」中填写诊断JSON输出目录，诊断后勾选断层才能闭环修复。');
     return;
   }
   const body = {
@@ -503,7 +624,8 @@ async function startPipeline() {
     api_url: apiUrl.value,
     api_key: apiKey.value,
     model: model.value,
-    context_window: contextWindow.value,
+    // 数字输入框被清空时 v-model.number 得到 ''，序列化后后端 int/float 校验直接 422
+    context_window: num(contextWindow.value, 8000, 8000),
     author_style: authorStyle.value,
     novel_name: novelName.value || null,
     refactor_mode: refactorMode.value,
@@ -513,20 +635,23 @@ async function startPipeline() {
     name_map: Object.fromEntries(
       nameMapText.value.split('\n').map(s => s.trim()).filter(Boolean)
         .map(s => s.split(/[=→：]/).map(p => p.trim()))
-        .filter(p => p.length === 2 && p[0]),
+        // 旧实现只校验 key 非空，「林晚=」会产出 {"林晚": ""}，
+        // 渲染进提示词后等于让模型把人名映射成空串
+        .filter(p => p.length === 2 && p[0] && p[1]),
     ),
     compare_output: compareOutput.value,
     chapter_snapshots: chapterSnapshots.value,
     diagnose_json: diagnoseJson.value || null,
     proxy: proxy.value || null,
+    ssl_verify: sslVerify.value,
     rich_text: richText.value,
     temperatures: {
-      diagnose: tDiagnose.value,
-      blueprint: tBlueprint.value,
-      refactor: tRefactor.value,
-      stitch: tStitch.value,
+      diagnose: num(tDiagnose.value, 0, 0.3, 2),
+      blueprint: num(tBlueprint.value, 0, 0.5, 2),
+      refactor: num(tRefactor.value, 0, 0.8, 2),
+      stitch: num(tStitch.value, 0, 0.6, 2),
     },
-    batch_interval_sec: batchInterval.value,
+    batch_interval_sec: num(batchInterval.value, 0, 2.0, 300),
     models: buildModels(),
   };
   try {
@@ -535,37 +660,50 @@ async function startPipeline() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      alert(`启动失败：${data.detail || res.status}`);
-      return;
-    }
+    const data = await res.json().catch(() => null);
+    if (!res.ok) { await checkRes(res, '启动', data); return; }
     runId.value = data.run_id;
+    // 新一轮 run：这里是最权威的重置时机（前端已经拿到新 run_id）。
+    // 不能只依赖 SSE 的 run_start —— 那个事件 emit 得比 SSE 订阅更早，
+    // 没有后端重放缓冲时必然丢失（已靠 events.py 的 _recent 兜住，双保险）。
+    confirmedGates.value = new Set();
+    finalFiles.value = [];
+    topError.value = null;
     eventLog.value = [];
     addLog(`已提交流水线 run_id=${data.run_id.slice(0, 8)}...`);
     startElapsed();
+    startStatusPolling();
+    // /api/start 立即返回，快速失败的任务可能已经把 error 事件发出去并停掉了轮询。
+    // 主动拉一次权威状态再决定要不要继续 —— 注意不能写成
+    // `if (pipelineRunning.value) startStatusPolling()`：此刻 pipelineRunning 几乎必然
+    // 还是 false（run_start 走 SSE、轮询要 5s 后才跑），那样就永远起不来轮询。
+    if (await fetchStatus() && !pipelineRunning.value) stopStatusPolling();
+    // SSE 若已断（例如手动停过后端），这里补一次握手
+    if (!backendReady.value) reconnectBackend();
     persist();
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
   }
 }
 
 async function confirmSplit() {
+  if (confirmingSplit.value) return; // 防重复点击：Enter 键和鼠标都会触发
+  confirmingSplit.value = true;
   try {
     const res = await fetch(`${apiBase()}/api/split/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
     });
-    if (res.ok) {
+    if (await checkRes(res, '确认拆分')) {
+      markGateSettled('split');
       showSplit.value = false;
       addLog('拆分已确认，进入诊断');
-    } else {
-      const d = await res.json();
-      alert(`确认失败：${d.detail || res.status}`);
     }
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
+  } finally {
+    confirmingSplit.value = false;
   }
 }
 
@@ -575,24 +713,38 @@ function toggleFix(gapId: string) {
   else fixSelected.value.push(gapId);
 }
 
+/** 把勾选的断层 id 转成可读文本再提交。
+ *  旧实现直接发 id（如 "B3G2"），后端 refactor.py 原样拼进提示词，
+ *  模型收到的是无意义 token，于是无视勾选、全书自由发挥，且没有任何报错。 */
+function selectedGapDescriptions(): string[] {
+  return fixGaps.value
+    .filter((g: any) => fixSelected.value.includes(g.id))
+    // 三级兜底：模型产出的 gap 不保证有 description/location，
+    // 一律为空的项若被 filter(Boolean) 丢掉，fix_list 会变空 → 退化成「自由改写」，
+    // 而界面上仍显示「已勾选 N 处」。
+    .map((g: any) => {
+      const text = [g.location, g.description].filter(Boolean).join('：');
+      return text || `${g.type || '断层'} @ ${g.batch_id || '?'}${g.severity ? ` [${g.severity}]` : ''} (${g.id})`;
+    });
+}
+
 async function confirmFix() {
   if (confirmingFix.value) return; // 防重复点击
   confirmingFix.value = true;
   try {
+    const descriptions = selectedGapDescriptions();
     const res = await fetch(`${apiBase()}/api/fix/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ run_id: runId.value, fix_list: fixSelected.value }),
+      body: JSON.stringify({ run_id: runId.value, fix_list: descriptions }),
     });
-    if (res.ok) {
+    if (await checkRes(res, '确认断层')) {
+      markGateSettled('fix');
       showFixReview.value = false;
-      addLog(`已勾选 ${fixSelected.value.length} 处断层，开始修复`);
-    } else {
-      const d = await res.json();
-      alert(`确认失败：${d.detail || res.status}`);
+      addLog(`已勾选 ${descriptions.length} 处断层，开始修复`);
     }
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
   } finally {
     confirmingFix.value = false;
   }
@@ -607,15 +759,13 @@ async function confirmAccept() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
     });
-    if (res.ok) {
+if (await checkRes(res, '验收')) {
+      markGateSettled('accept:' + acceptBatch.value);
       showAccept.value = false;
       addLog(`批次 ${acceptBatch.value} 已验收，继续重构`);
-    } else {
-      const d = await res.json();
-      alert(`验收失败：${d.detail || res.status}`);
     }
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
   } finally {
     confirmingAccept.value = false;
   }
@@ -630,15 +780,15 @@ async function regenChapter(c: any) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value, chapter_id: c.id }),
     });
-    const d = await res.json();
+    const d = await res.json().catch(() => null);
     if (res.ok) {
-      c.preview = d.preview || '';
+      c.preview = d?.preview || '';
       addLog(`章节 ${c.id} 已重写，请重新验收`, 'accent');
     } else {
-      alert(`重写失败：${d.detail || res.status}`);
+      await checkRes(res, '重写', d);
     }
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
   } finally {
     regenerating.value.delete(c.id);
   }
@@ -659,10 +809,10 @@ async function openFinal() {
       const files = d.files || [];
       if (files.length) {
         finalFiles.value = files;
-        // 若只有一个成品文件，直接打开它
+        // 单个成品直开；多个则打开成品目录，并在界面上列出清单供逐个点开
         if (files.length === 1) { await callOpenOutput(files[0].path); return; }
-        // 多个则打开成品目录（保持简单）
         await callOpenOutput(`${root}/03_final`);
+        addLog(`成品目录含 ${files.length} 个文件，可在上方「成品文件」逐个打开`);
         return;
       }
     }
@@ -678,13 +828,12 @@ async function callOpenOutput(path: string): Promise<boolean> {
       body: JSON.stringify({ output_path: path }),
     });
     if (!res.ok) {
-      const d = await res.json();
-      alert(`打开失败：${d.detail || res.status}`);
+      await checkRes(res, '打开');
       return false;
     }
     return true;
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
     return false;
   }
 }
@@ -698,15 +847,13 @@ async function forceExport() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
     });
-    if (res.ok) {
+    if (await checkRes(res, '强制导出')) {
+      markGateSettled('qc');
       showQcBlock.value = false;
       addLog('已忽略质检，强制导出', 'warn');
-    } else {
-      const d = await res.json();
-      alert(`强制导出失败：${d.detail || res.status}`);
     }
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
   } finally {
     forcingExport.value = false;
   }
@@ -739,9 +886,9 @@ async function openComparisons() {
     comparisonItems.value = d.items || [];
     comparisonSel.value = comparisonItems.value[0]?.name ?? '';
     showComparisons.value = true;
-    if (!comparisonItems.value.length) alert('当前输出目录还没有左右对照文件（需开启「左右对照」并跑完 phase3）');
+    if (!comparisonItems.value.length) topError.value = '当前输出目录还没有左右对照文件（需开启「左右对照」并跑完 phase3）';
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
   }
 }
 
@@ -762,34 +909,69 @@ async function confirmBlueprint() {
         user_edited: true,
       }),
     });
-    if (res.ok) {
+    if (await checkRes(res, '确认蓝图')) {
       showBlueprint.value = false;
       addLog('蓝图已确认，继续重构');
-    } else {
-      const data = await res.json();
-      alert(`确认失败：${data.detail || res.status}`);
     }
   } catch (e: any) {
-    alert(`请求失败：${e.message}`);
+    topError.value = `请求失败：${e.message}`;
   } finally {
     confirmingBlueprint.value = false;
   }
+}
+
+/** fetch 不会因 4xx/5xx reject，必须自己判 res.ok，否则 409/422 全被静默吞掉。
+ *  parsed 传入已解析的响应体：body 只能读一次，重复 res.json() 会抛
+ *  "Body is unusable"，错误信息会退化成裸状态码。 */
+async function checkRes(res: Response, action: string, parsed?: any): Promise<boolean> {
+  if (res.ok) return true;
+  let detail: any = parsed?.detail;
+  if (detail === undefined) {
+    try { detail = (await res.json())?.detail; } catch { /* 非 JSON 或已读完 */ }
+  }
+  // Pydantic 校验错误的 detail 是数组，直接插值会渲染成 [object Object]
+  if (Array.isArray(detail)) {
+    detail = detail.map((e: any) => `${(e.loc || []).slice(1).join('.')}: ${e.msg}`).join('; ');
+  }
+  const msg = detail || `HTTP ${res.status}`;
+  topError.value = `${action}失败：${msg}`;
+  addLog(`${action}失败：${msg}`, 'err');
+  return false;
+}
+
+/** 数字输入框被清空时 v-model.number 得到的是 ''，必须夹回合法值，否则后端 422。 */
+function num(v: any, min: number, fallback: number, max = Number.MAX_SAFE_INTEGER) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
 }
 
 async function control(action: 'pause' | 'resume' | 'stop') {
   if (controlling.value) return; // 防重复点击
   controlling.value = true;
   try {
-    await fetch(`${apiBase()}/api/${action}`, {
+    const label = { pause: '暂停', resume: '恢复', stop: '停止' }[action];
+    const res = await fetch(`${apiBase()}/api/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
     });
-  } catch (e) {
-    console.error(e);
+    await checkRes(res, label);
+  } catch (e: any) {
+    topError.value = `请求失败：${e.message}`;
   } finally {
     controlling.value = false;
   }
+}
+
+/** 设置面板里改完模型配置后写回主表单并持久化。 */
+function applyModelFromSettings(v: { model: string; apiUrl: string; apiKey: string; proxy: string; sslVerify: boolean }) {
+  model.value = v.model;
+  apiUrl.value = v.apiUrl;
+  apiKey.value = v.apiKey;
+  proxy.value = v.proxy;
+  sslVerify.value = v.sslVerify;
+  persist();
 }
 
 const canStart = computed(() =>
@@ -803,8 +985,11 @@ const canStart = computed(() =>
     <header class="header">
       <h1>文炼工坊 <span class="version">TextForge v8.8</span></h1>
       <div class="status">
-        <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
-        {{ backendReady ? '后端已连接' : (errorMsg || '连接中...') }}
+        <button class="status-link" :title="backendReady ? '查看后端设置' : '后端未连接，点击排查/重启'" @click="showSettings = true">
+          <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
+          {{ backendReady ? '后端已连接' : (errorMsg || '连接中...') }}
+        </button>
+        <button class="gear" title="系统与后端设置" @click="showSettings = true">⚙</button>
         <button class="theme-toggle" @click="toggleTheme">{{ darkMode ? '☀︎' : '☾' }}</button>
       </div>
     </header>
@@ -814,6 +999,14 @@ const canStart = computed(() =>
       <div v-if="topTip" class="banner tip">
         <span>{{ topTip }}</span>
         <button class="banner-close" @click="topTip = null">×</button>
+      </div>
+      <div v-if="errorMsg" class="banner err">
+        <span>⚠ {{ errorMsg }}</span>
+        <span class="banner-act">
+          <button class="banner-btn" @click="reconnectBackend">重新连接</button>
+          <button class="banner-btn primary" @click="showSettings = true">打开后端设置</button>
+          <button class="banner-close" @click="errorMsg = ''">×</button>
+        </span>
       </div>
       <div v-if="topError" class="banner err">
         <span>⚠ {{ topError }}</span>
@@ -826,7 +1019,20 @@ const canStart = computed(() =>
 
       <!-- 配置区 -->
       <section class="panel config" :class="{ disabled: pipelineRunning }">
-        <h2>运行配置</h2>
+        <h2>
+          运行配置
+          <button class="panel-gear" title="系统与后端设置" @click="showSettings = true">⚙ 后端设置</button>
+        </h2>
+
+        <div class="row backend-row">
+          <label>后端服务</label>
+          <span class="backend-state">
+            <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
+            {{ backendReady ? `已连接 :${port ?? '—'}` : (sseAttempts > 0 ? `重连中 (${sseAttempts})` : '未连接') }}
+          </span>
+          <button @click="reconnectBackend" :disabled="backendReady">重新连接</button>
+          <button class="ghost" @click="showSettings = true">设置</button>
+        </div>
 
         <div class="row">
           <label>输入模式</label>
@@ -927,8 +1133,8 @@ const canStart = computed(() =>
             <label class="rich"><input type="checkbox" v-model="chapterSnapshots" /> 章快照（保留重构初稿与缝合终稿）</label>
           </div>
           <div class="row">
-            <label>诊断JSON路径</label>
-            <input v-model="diagnoseJson" placeholder="可选，留空关闭；设置后按批次输出结构化断层 JSON" />
+            <label>诊断JSON输出目录</label>
+            <input v-model="diagnoseJson" placeholder="可选，留空关闭；设置后按批次把结构化断层 JSON 写入该目录" />
           </div>
         </details>
 
@@ -936,6 +1142,7 @@ const canStart = computed(() =>
           <label>代理</label>
           <input v-model="proxy" placeholder="可选，如 http://127.0.0.1:7890" />
           <label class="rich"><input type="checkbox" v-model="richText" /> docx富文本</label>
+          <label class="rich" title="仅在使用 https 自签证书的服务端时需要关闭"><input type="checkbox" v-model="sslVerify" /> 校验HTTPS证书</label>
         </div>
 
         <details class="adv">
@@ -949,27 +1156,32 @@ const canStart = computed(() =>
             <label class="t">缝合</label> <input v-model.number="tStitch" type="number" min="0" max="2" step="0.1" />
           </div>
           <div class="row">
-            <label>批次间隔(秒)</label> <input v-model.number="batchInterval" type="number" min="0" step="0.5" />
+            <label>批次间隔(秒)</label> <input v-model.number="batchInterval" type="number" min="0" max="300" step="0.5" />
           </div>
         </details>
         <details class="adv">
           <summary>分阶段模型（可选，留空用全局模型）</summary>
+          <p class="ph-note">地址与全局<strong>不同主机</strong>时，全局 API Key 不会带过去（防泄露）；需要鉴权请在对应「密钥」里单独填。</p>
           <div class="row">
             <label>诊断</label> <input v-model="mDiagnose" placeholder="诊断用模型" />
             <label class="t">地址</label> <input v-model="uDiagnose" placeholder="(留空=全局)" />
           </div>
+          <div class="row"><label class="rich-k">密钥</label> <input v-model="kDiagnose" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
           <div class="row">
             <label>蓝图</label> <input v-model="mBlueprint" placeholder="蓝图用模型" />
             <label class="t">地址</label> <input v-model="uBlueprint" placeholder="(留空=全局)" />
           </div>
+          <div class="row"><label class="rich-k">密钥</label> <input v-model="kBlueprint" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
           <div class="row">
             <label>重构</label> <input v-model="mRefactor" placeholder="重构用模型" />
             <label class="t">地址</label> <input v-model="uRefactor" placeholder="(留空=全局)" />
           </div>
+          <div class="row"><label class="rich-k">密钥</label> <input v-model="kRefactor" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
           <div class="row">
             <label>缝合</label> <input v-model="mStitch" placeholder="缝合用模型" />
             <label class="t">地址</label> <input v-model="uStitch" placeholder="(留空=全局)" />
           </div>
+          <div class="row"><label class="rich-k">密钥</label> <input v-model="kStitch" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
         </details>
 
         <div class="row col">
@@ -989,9 +1201,9 @@ const canStart = computed(() =>
           <span v-if="currentPhase" class="phase">{{ currentPhase }}</span>
           <span v-if="isPaused" class="badge paused">已暂停</span>
           <span v-if="pipelineRunning" class="badge running">运行中</span>
-          <button v-if="outputPath" class="open-btn" @click="openOutput">打开输出目录</button>
-          <button v-if="outputPath" class="open-btn ghost" @click="openFinal">打开成品</button>
-          <button v-if="outputPath" class="open-btn ghost" @click="openComparisons">对照预览</button>
+          <button v-if="outputPath && port" class="open-btn" @click="openOutput">打开输出目录</button>
+          <button v-if="outputPath && port" class="open-btn ghost" @click="openFinal">打开成品</button>
+          <button v-if="outputPath && port" class="open-btn ghost" @click="openComparisons">对照预览</button>
         </div>
 
         <div class="controls" v-if="pipelineRunning">
@@ -1046,6 +1258,12 @@ const canStart = computed(() =>
           <button class="min-btn" @click="exportLog">导出</button>
           <button class="min-btn" @click="eventLog = []">清空</button>
         </div>
+        <div class="bar chapter-row-bar" v-if="finalFiles.length">
+          <span class="bar-label">成品文件</span>
+          <div class="final-list">
+            <button v-for="f in finalFiles" :key="f.path" class="min-btn" @click="callOpenOutput(f.path)">{{ f.name }}</button>
+          </div>
+        </div>
         <div ref="logBoxRef" class="log-box">
           <div v-for="(line, i) in eventLog" :key="i" class="log-line" :class="`log-${line.level}`"><span class="log-ts">{{ line.ts }}</span>{{ line.text }}</div>
           <div v-if="!eventLog.length" class="log-empty">暂无事件</div>
@@ -1067,7 +1285,9 @@ const canStart = computed(() =>
         </div>
         <div class="modal-actions">
           <span></span>
-          <button @click="confirmSplit">确认拆分，继续</button>
+          <button :disabled="confirmingSplit" @click="confirmSplit">
+            {{ confirmingSplit ? '确认中…' : '确认拆分，继续' }}
+          </button>
         </div>
       </div>
     </div>
@@ -1175,6 +1395,21 @@ const canStart = computed(() =>
         </div>
       </div>
     </div>
+
+    <!-- 系统与后端设置 -->
+    <SettingsModal
+      v-if="showSettings"
+      :port="port"
+      :connected="backendReady"
+      :model="model"
+      :api-url="apiUrl"
+      :api-key="apiKey"
+      :proxy="proxy"
+      :ssl-verify="sslVerify"
+      @close="showSettings = false"
+      @reconnect="reconnectBackend"
+      @apply-model="applyModelFromSettings"
+    />
   </div>
 </template>
 
@@ -1217,9 +1452,52 @@ const canStart = computed(() =>
   box-shadow: 0 1px 3px rgba(0,0,0,0.08);
   overflow-y: auto;
 }
-.panel h2 { font-size: 15px; margin: 0 0 14px; color: #2d3748; }
+.panel h2 { font-size: 15px; margin: 0 0 14px; color: #2d3748; display: flex; align-items: center; }
+.panel-gear {
+  margin-left: auto; padding: 3px 12px; font-size: 12px;
+  background: #fff; border: 1px solid #cbd5e0; color: #4a5568;
+  border-radius: 5px; cursor: pointer;
+}
+.panel-gear:hover { background: #edf2f7; }
 .panel.config.disabled { opacity: 0.55; pointer-events: none; }
 .panel.progress { display: flex; flex-direction: column; }
+
+/* 后端服务行 */
+.backend-row {
+  background: #f7fafc; border: 1px solid #e2e8f0; border-radius: 6px;
+  padding: 8px 10px; margin-bottom: 12px;
+}
+.backend-state { flex: 1; display: flex; align-items: center; gap: 6px; font-size: 13px; color: #2d3748; }
+.backend-row button {
+  padding: 4px 12px; border: 1px solid #d1d5db; background: #fff;
+  border-radius: 5px; cursor: pointer; font-size: 12px;
+}
+.backend-row button:disabled { opacity: 0.4; cursor: not-allowed; }
+.backend-row button.ghost { border-color: #3182ce; color: #3182ce; }
+
+/* 顶栏：状态可点击 + 齿轮入口 */
+.status-link {
+  display: flex; align-items: center; gap: 6px;
+  background: transparent; border: none; color: #fff;
+  font-size: 13px; cursor: pointer; padding: 2px 4px; border-radius: 4px;
+  max-width: 340px;
+}
+.status-link:hover { background: rgba(255, 255, 255, 0.12); }
+.gear {
+  background: transparent; border: 1px solid rgba(255, 255, 255, 0.4);
+  color: #fff; border-radius: 5px; font-size: 15px; cursor: pointer;
+  width: 28px; height: 24px; line-height: 1;
+}
+.gear:hover { background: rgba(255, 255, 255, 0.12); }
+
+/* 断连横幅里的操作按钮 */
+.banner-act { display: flex; align-items: center; gap: 6px; }
+.banner-btn {
+  padding: 3px 10px; font-size: 12px; cursor: pointer;
+  border: 1px solid currentColor; background: transparent;
+  color: inherit; border-radius: 4px;
+}
+.banner-btn.primary { background: #822727; border-color: #822727; color: #fff; }
 
 .banner {
   grid-column: 1 / -1;
@@ -1292,6 +1570,8 @@ html.dark .tree-toggle { color: #a0aec0; }
   font-size: 13px;
 }
 .row label.t + input, .row label.rich + input { flex: 1; }
+.row label.rich-k { width: auto; margin-left: 12px; font-size: 12px; color: #718096; }
+.ph-note { font-size: 12px; color: #718096; margin: 4px 0 8px; line-height: 1.5; }
 .adv { border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; }
 .adv summary { font-size: 13px; color: #4a5568; cursor: pointer; }
 .adv.gates { display: flex; flex-direction: column; flex: 1; }
@@ -1480,10 +1760,19 @@ html.dark .tree-toggle { color: #a0aec0; }
 }
 .theme-toggle:hover { background: rgba(255, 255, 255, 0.12); }
 
+.final-list { display: flex; flex-wrap: wrap; gap: 6px; }
+/* .min-btn 默认 margin-left:auto（为「导出/清空」右对齐设计），在列表里要归零 */
+.final-list .min-btn { margin-left: 0; }
+.chapter-row-bar { align-items: center; }
+
 /* 深色主题（html.dark）最小覆盖 */
 html.dark .app { background: #171923; color: #e2e8f0; }
 html.dark .panel { background: #1f2733; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
 html.dark .panel h2 { color: #e2e8f0; }
+html.dark .panel-gear { background: #2d3748; border-color: #4a5568; color: #e2e8f0; }
+html.dark .backend-row { background: #232b39; border-color: #4a5568; }
+html.dark .backend-state { color: #e2e8f0; }
+html.dark .backend-row button { background: #2d3748; color: #e2e8f0; border-color: #4a5568; }
 html.dark .row label,
 html.dark .phase, html.dark .phase-bar .open-btn { color: #e2e8f0; }
 html.dark input, html.dark select, html.dark textarea {

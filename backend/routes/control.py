@@ -1,8 +1,15 @@
+"""人工闸门控制端点。
+
+铁律：本模块**只写业务字段，不写 current_phase**。
+阶段推进由流水线在读到 Event 后自行完成（state.absorb_gate_result 负责并回用户选择）。
+端点若也去写 current_phase，会与等待循环的写盘互相覆盖，且历史上曾错误地回退到
+'phase2'，导致断点恢复时蓝图被重新生成（见 routes/state.py:absorb_gate_result 注释）。
+"""
 import os, subprocess, sys
 from fastapi import APIRouter, HTTPException, Body
 from routes import state
 from pathlib import Path
-from utils.atomic import atomic_write_text, atomic_write_json
+from utils.atomic import atomic_write_text, atomic_write_json as _atomic_write
 import json
 
 router = APIRouter()
@@ -37,7 +44,7 @@ async def stop(run_id: str | None = Body(None, embed=True)):
 
 @router.post("/api/split/confirm")
 async def split_confirm(payload: dict = Body(...)):
-    """P0.3：拆书预览确认。仅 phase0_confirm 阶段允许，确认后进入 phase1。"""
+    """P0.3：拆书预览确认。仅 phase0_confirm 阶段允许，确认后流水线自行推进到 phase1。"""
     _check_run_id(payload.get("run_id"))
     output_path = state.current_output_path
     if not output_path: raise HTTPException(409, "no_active_run")
@@ -51,15 +58,13 @@ async def split_confirm(payload: dict = Body(...)):
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase0_confirm':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认拆分")
-        progress['current_phase'] = 'phase1'
-        atomic_write_json(progress_path, progress)
     state.split_confirm.set()
     return {"status": "confirmed"}
 
 @router.post("/api/fix/confirm")
 async def fix_confirm(payload: dict = Body(...)):
     """fix_gaps 断层勾选确认：仅 phase1_fixreview 阶段允许；
-    持久化勾选断层 fix_list 到 progress.json，确认后进入 phase2。"""
+    持久化勾选断层 fix_list 到 progress.json，确认后流水线自行推进到 phase2。"""
     _check_run_id(payload.get("run_id"))
     fix_list = payload.get("fix_list", []) or []
     if not isinstance(fix_list, list):
@@ -77,8 +82,7 @@ async def fix_confirm(payload: dict = Body(...)):
         if progress.get('current_phase') != 'phase1_fixreview':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认断层")
         progress['fix_list'] = fix_list
-        progress['current_phase'] = 'phase2'
-        atomic_write_json(progress_path, progress)
+        _atomic_write(progress_path, progress)
     state.fix_review_confirm.set()
     return {"status": "confirmed", "fix_list": fix_list}
 
@@ -118,8 +122,7 @@ async def export_force(payload: dict = Body(...)):
         if progress.get('current_phase') != 'phase3_qc':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许强制导出")
         progress['_qc_force'] = True
-        progress['current_phase'] = 'phase2'
-        atomic_write_json(progress_path, progress)
+        _atomic_write(progress_path, progress)
     state.qc_confirm.set()
     return {"status": "exporting"}
 
@@ -162,6 +165,7 @@ async def regen_chapter(payload: dict = Body(...)):
 @router.post("/api/accept")
 async def accept(payload: dict = Body(...)):
     """逐章验收确认：仅 phase3_accept 阶段允许。记录该批次已验收章节后放行进下一批。"""
+    _check_run_id(payload.get("run_id"))
     output_path = state.current_output_path
     if not output_path: raise HTTPException(409, "no_active_run")
     progress_path = Path(output_path) / "progress.json"
@@ -178,8 +182,7 @@ async def accept(payload: dict = Body(...)):
         pend = progress.get('accept_pending_batch')
         if pend is not None and pend not in progress['accepted_batches']:
             progress['accepted_batches'].append(pend)
-        progress['current_phase'] = 'phase2'
-        atomic_write_json(progress_path, progress)
+        _atomic_write(progress_path, progress)
     state.accept_confirm.set()
     return {"status": "accepted"}
 
@@ -214,7 +217,7 @@ async def blueprint_confirm(payload: dict = Body(...)):
         atomic_write_text(story_bible, blueprint)
         progress["blueprint_confirmed"] = True
         progress["blueprint_user_edited"] = user_edited
-        atomic_write_json(progress_path, progress)
+        _atomic_write(progress_path, progress)
     
     state.blueprint_confirmed.set()
     return {"status": "confirmed"}

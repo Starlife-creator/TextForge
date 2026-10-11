@@ -1,5 +1,5 @@
 mod backend;
-use backend::{BackendProcess, get_backend_port, restart_backend, port_file_path, get_port_from_json, spawn_backend};
+use backend::{BackendProcess, get_backend_port, backend_info, restart_backend, port_file_path, get_port_from_json, spawn_backend};
 use std::sync::Mutex;
 use tauri::Manager;
 
@@ -12,7 +12,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(BackendProcess(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![get_backend_port, restart_backend])
+        .invoke_handler(tauri::generate_handler![get_backend_port, backend_info, restart_backend])
         .setup(|app| {
             if !cfg!(debug_assertions) {
                 let child = spawn_backend(app.handle())?;

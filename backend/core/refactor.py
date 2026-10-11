@@ -35,19 +35,32 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         "skip_smooth": bool(gates.get("skip_stitch_if_smooth")),
     }
     
-    completed_batches = [b for b in progress['batches'] if b['status'] == 'phase1_done']
-    
+    # 断点恢复：逐章验收门开启时，若上次停在 phase3_accept 且该批未验收，
+    # 必须重新推送预览。原实现里批次在 _refactor_and_split 内就被标成 phase3_done，
+    # 而下面只筛 phase1_done 的批次 → 恢复时该批被直接跳过，用户根本没看过就进了缝合。
+    if gates.get("require_chapter_accept"):
+        pend = progress.get('accept_pending_batch')
+        done = progress.get('accepted_batches') or []
+        if progress.get('current_phase') == 'phase3_accept' and pend is not None and pend not in done:
+            pending_batch = next((b for b in progress['batches'] if b.get('batch_id') == pend), None)
+            if pending_batch is None:
+                logger.warning(f"[accept] 恢复失败：progress.json 里的 accept_pending_batch={pend} 不在 batches 中")
+            else:
+                logger.info(f"[accept] 恢复：批次 {pend} 尚未验收，重新推送预览")
+                await _wait_batch_accept(progress, progress_path, pending_batch, output_path, run_id)
+
+    # 含 phase3_done：恢复时跳过已完成的批次（否则会重复计费并覆盖已产出稿）
+    completed_batches = [b for b in progress['batches'] if b['status'] in ('phase1_done', 'phase3_done')]
+
     async with make_httpx_client(req, api_url=ep_ref["api_url"], api_key=ep_ref["api_key"]) as client:
         # 阶段 3-1：无重叠重构
         pending_batches = len([b for b in completed_batches if b['status'] != 'phase3_done'])
         for batch in completed_batches:
-            # v8.8 修正：恢复时跳过已 phase3_done 的批次
             if batch['status'] == 'phase3_done':
                 continue
             if state.stop_requested: raise asyncio.CancelledError()
-            await _wait_pause(progress, progress_path)
-            
-            chapter_ids = batch['chapter_ids']
+            await _wait_pause()
+
             output_files = await _refactor_and_split(
                 client, req, output_path, recon_dir, blueprint_text, chars,
                 progress, batch, run_id, ep_ref)
@@ -65,8 +78,9 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                 await asyncio.sleep(getattr(req, "batch_interval_sec", 2.0))
     
     # 阶段 3-2：缝合（用缝合阶段的独立端点 client）
-        async with make_httpx_client(req, api_url=ep_stitch["api_url"], api_key=ep_stitch["api_key"]) as stitch_client:
-            await stitch_pipeline(output_path, progress, stitch_client, payload_base, sse_emit, run_id, chars)
+    # 注意：必须与上面的重构 client 平级，否则重构的连接池会在整个缝合阶段空占
+    async with make_httpx_client(req, api_url=ep_stitch["api_url"], api_key=ep_stitch["api_key"]) as stitch_client:
+        await stitch_pipeline(output_path, progress, stitch_client, payload_base, sse_emit, run_id, chars)
     
     # P1.6 左右对照：仅开启时按章生成「原文 | 重构后」对照文档（默认关；由既有文件派生，幂等）
     if getattr(req, "compare_output", False):
@@ -89,8 +103,8 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                 atomic_write_json(progress_path, progress)
             sse_emit("qc_failed", {"issues": issues}, run_id)
             await _wait_qc_confirm(progress, progress_path, run_id)
-            progress['_qc_force'] = True
-            progress['current_phase'] = 'phase2'
+            await state.absorb_gate_result(progress, progress_path, ['_qc_force'])
+            progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
 
@@ -130,7 +144,10 @@ async def regen_single_chapter(req, output_path, chapter_id):
     }
     logger.info(f"[regen] 单章重生成 chapter_{chapter_id} 开始")
     async with make_httpx_client(req, api_url=ep["api_url"], api_key=ep["api_key"]) as client:
-        result, usage, _ = await call_with_retry(client, ep["api_url"], payload, sse_emit, "regen", max_retries=2)
+        # run_id 必须传真实的当前 run：写死 "regen" 会让 sse_emit 找不到订阅者，
+        # 流式预览将毫无反应（界面上仍显示上一批的文本）。
+        result, usage, _ = await call_with_retry(client, ep["api_url"], payload, sse_emit,
+                                                 state.current_run_id, max_retries=2)
     chapter_texts = _split_refactored_by_chapters(result, [chapter_id])
     new_text = chapter_texts[chapter_id]
     recon_dir = output_path / "02_workspace/reconstructed"
@@ -147,6 +164,13 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
     A2：ep = pick_endpoint(req,'refactor')，未传则回退全局（单厂商兼容）。"""
     ep = ep or pick_endpoint(req, "refactor")
     chapter_ids = batch['chapter_ids']
+    # 批次与章节表的一致性前置校验：否则下面 _find_idx 抛错时无从判断是哪个批次出的问题
+    known = {c['id'] for c in progress.get('chapters', [])}
+    missing = [cid for cid in chapter_ids if cid not in known]
+    if missing:
+        raise RuntimeError(
+            f"批次 {batch.get('batch_id')} 引用了 progress['chapters'] 中不存在的章 {missing}；"
+            f"progress.json 很可能来自不兼容的旧版本，建议换一个输出目录重跑")
     batch_content = "\n\n".join(
         (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file']).read_text(encoding='utf-8', newline='')
         for cid in chapter_ids
@@ -181,15 +205,15 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
             draft_dir = output_path / "02_workspace/snapshots/drafts"
             draft_dir.mkdir(parents=True, exist_ok=True)
             atomic_write_text(draft_dir / f"chapter_{cid}.txt", ctext)
-        if rel not in progress['completed_files']:
+        if rel not in progress.setdefault('completed_files', []):
             progress['completed_files'].append(rel)
         output_files.append(rel)
-    
-    for v in progress['virtual_chapter_map']:
+
+    for v in progress.setdefault('virtual_chapter_map', []):
         if v['virtual_id'] in chapter_ids:
             v['output_file'] = f"02_workspace/reconstructed/chapter_{v['virtual_id']}.txt"
             v['batch_id'] = batch['batch_id']
-    
+
     from core.splitter import _accum_usage
     _accum_usage(progress, usage)
     batch['status'] = 'phase3_done'
@@ -199,21 +223,39 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
 def _find_idx(chapters, cid):
     for i, c in enumerate(chapters):
         if c['id'] == cid: return i
-    raise KeyError(cid)
+    # 不抛裸 KeyError：那会被 run_pipeline 的兜底 except 吞成 code="exception"，
+    # 消息只剩一个章号，完全看不出是哪个批次/文件出的问题。
+    raise KeyError(f"章节 id={cid} 不在 progress['chapters'] 中（批次与章节表不一致）")
 
 def _split_refactored_by_chapters(text: str, chapter_ids: list) -> dict:
-    """只按 ===CHAPTER_BREAK=== 精确分隔；数量不符时抛 ChapterBreakMissingError。"""
+    """按 ===CHAPTER_BREAK=== 精确分隔；数量不符或出现空章时抛 ChapterBreakMissingError。"""
     if len(chapter_ids) == 1:
-        return {chapter_ids[0]: text}
-    parts = [p.strip() for p in text.split("===CHAPTER_BREAK===")]
-    parts = [p for p in parts if p]
-    if len(parts) == len(chapter_ids):
-        return {cid: p for cid, p in zip(chapter_ids, parts)}
-    raise ChapterBreakMissingError(
-        f"重构输出缺少 ===CHAPTER_BREAK=== 分隔符：需要 {len(chapter_ids)-1} 个，"
-        f"实际得到 {len(parts)-1 if parts else 0} 段（期望 {len(chapter_ids)} 段）。"
-        f"请检查提示词或重试。"
-    )
+        # 单章批次（每本书的最后一个批次都是）也必须走空章检查：
+        # 早先这里直接 return，模型返回空内容时会静默写出一个空 chapter_*.txt，
+        # 再被 document.py 的「跳过空段」吞掉 —— 最终 docx 凭空少一章且零诊断。
+        t = text.strip()
+        if not t:
+            raise ChapterBreakMissingError(
+                f"重构输出为空：章节 {chapter_ids[0]}。空章不应进入成品，请重试。")
+        return {chapter_ids[0]: t}
+    # 先按标记切、再比对数量，并**按位**对齐到 chapter_ids。
+    # 原实现先过滤空段再比对，任一章重构为纯空白就会被丢弃 → 数量对不上 → 整轮白跑。
+    raw_parts = text.split("===CHAPTER_BREAK===")
+    # 容忍结尾多打的空标记（模型常犯），旧实现过滤空段后能通过，不能因此白白烧掉一次重试
+    while len(raw_parts) > 1 and not raw_parts[-1].strip():
+        raw_parts.pop()
+    n_marks = len(raw_parts) - 1
+    if n_marks != len(chapter_ids) - 1:
+        raise ChapterBreakMissingError(
+            f"重构输出 ===CHAPTER_BREAK=== 数量不符：需要 {len(chapter_ids)-1} 个，实际 {n_marks} 个"
+            f"（切出 {len(raw_parts)} 段，期望 {len(chapter_ids)} 段）。请重试。"
+        )
+    aligned = [raw_parts[i].strip() for i in range(len(chapter_ids))]
+    blanks = [cid for i, cid in enumerate(chapter_ids) if not aligned[i]]
+    if blanks:
+        raise ChapterBreakMissingError(
+            f"重构输出中以下章节为空：{blanks}。空章不应进入成品，请重试。")
+    return {cid: aligned[i] for i, cid in enumerate(chapter_ids)}
 
 def _build_refactor_prompt(mode, blueprint, author_style, batch_content, *,
                            forbidden_canon=(), name_map=None, fix_list=(), gates=None):
@@ -451,7 +493,10 @@ def _write_chapter_comparison(comp_dir: Path, out_id, original: str, reconstruct
 
 async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id):
     """逐章验收门：批次重构稿产出后暂停，推送该批章节预览等待用户验收，确认后继续下一批。
-    未验收前 current_phase='phase3_accept'，恢复时该批仍 pending 会重新推送，幂等。"""
+
+    current_phase 固定停在 'phase3_accept'，由 phase3_refactor_stitch 开头据此判断是否需要
+    重新推送（幂等）。用户点确认后由 /api/accept 写入 accepted_batches，这里并回内存；
+    阶段推进到 'phase3-1'（绝不回退到 'phase2'，否则恢复时蓝图会被重新生成）。"""
     output_path = Path(output_path)
     chapters = []
     for cid in batch['chapter_ids']:
@@ -466,17 +511,17 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
     progress['accept_pending_batch'] = batch['batch_id']
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
+    # 先 clear 再推送：否则用户在 SSE→HTTP 往返的几毫秒内点「验收通过」，
+    # 动作会被紧随其后的 clear() 抹掉，流水线带着这一批直接往下走或永久卡住。
+    state.accept_confirm.clear()
     sse_emit("accept_ready", {"batch_id": batch['batch_id'], "chapters": chapters,
         "accepted": progress.get('accepted_batches', [])}, run_id)
     logger.info(f"[accept] 批次 {batch['batch_id']} 待验收（{len(chapters)} 章）")
-    state.accept_confirm.clear()
     while not state.accept_confirm.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
-        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        async with state.progress_lock:
-            atomic_write_json(progress_path, progress)
         await asyncio.sleep(1.0)
-    progress['current_phase'] = 'phase2'
+    await state.absorb_gate_result(progress, progress_path, ['accepted_batches'])
+    progress['current_phase'] = 'phase3-1'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
 
@@ -514,16 +559,11 @@ async def _wait_qc_confirm(progress, progress_path, run_id):
     state.qc_confirm.clear()
     while not state.qc_confirm.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
-        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        async with state.progress_lock:
-            atomic_write_json(progress_path, progress)
         await asyncio.sleep(1.0)
 
 
-async def _wait_pause(progress, progress_path):
+async def _wait_pause():
+    """等待用户恢复。心跳由 pipeline_runner._heartbeat_loop 统一负责，此处只轮询。"""
     while not state.pause_event.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
-        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        async with state.progress_lock:
-            atomic_write_json(progress_path, progress)
         await asyncio.sleep(1.0)

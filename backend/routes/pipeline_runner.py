@@ -19,6 +19,10 @@ async def run_pipeline(req, run_id: str):
     progress_path = Path(req.output_path) / "progress.json"
     progress = None  # v8.8：finally 防护，极端情况下 _load_or_init_progress 之前异常也不引发 NameError
     logger.info(f"[run_pipeline] 开始 run_id={run_id} input={req.input_path}")
+    # 统一心跳：原先只有各个「等待循环」在写 last_heartbeat，导致跑 LLM 批次期间
+    # 心跳停更，前端 90s 僵尸检测误报「后端假死」，用户会点停止毁掉正在跑的任务。
+    # 后台任务在 await 期间持续运行，能覆盖整个流水线生命周期。
+    hb = asyncio.create_task(_heartbeat_loop(progress_path))
     try:
         # v8.8 修正：断点恢复。若存在未完成的 progress.json，恢复而非覆盖。
         progress = _load_or_init_progress(req, run_id, progress_path)
@@ -48,48 +52,100 @@ async def run_pipeline(req, run_id: str):
 
         # phase4 含 docx 渲染与大量文件写盘，放入线程池避免阻塞事件循环（SSE/控制接口保持响应）
         await asyncio.to_thread(phase4_finalize, Path(req.output_path), progress, req)
+        # 必须在发 done 之前就复位并落盘：否则前端收到 done 就认为结束，但
+        # /api/start 仍会因 pipeline_running=True 拒掉重跑（409），
+        # 凭空多出「界面说完成、按钮点不动」的窗口；磁盘状态也会滞后于事件。
+        state.pipeline_running = False
+        try:
+            progress["pipeline_running"] = False
+            progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            async with state.progress_lock:
+                atomic_write_json(progress_path, progress)
+            logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
+        except Exception:
+            logger.exception("[run_pipeline] 完成前写 progress.json 失败")
         sse_emit("done", {"output_dir": req.output_path, "novel_name": progress["novel_name"]}, run_id)
         logger.info(f"[run_pipeline] 完成 run_id={run_id}")
-        await asyncio.sleep(3)
+        await asyncio.sleep(1)
     
     except FatalAPIError as e:
         logger.error(f"[run_pipeline] FatalAPIError kind={e.kind} code={e.code} msg={e.message[:200]}")
         sse_emit("error", {"kind": e.kind, "code": str(e.code), "message": e.message}, run_id)
-        log_error(progress_path, e)
+        await log_error(progress_path, e)
     except EmptyContentError as e:
         logger.error(f"[run_pipeline] EmptyContentError msg={str(e)[:200]}")
         sse_emit("error", {"kind": "empty_content", "code": "empty", "message": str(e)}, run_id)
-        log_error(progress_path, e)
+        await log_error(progress_path, e)
     except RateLimitError as e:
         logger.error(f"[run_pipeline] 429 限流重试用尽 retry_after={e.retry_after}")
         sse_emit("error", {"kind": "rate_limit", "code": 429,
             "message": f"API 持续限流（429），请稍后再试或降低并发。"}, run_id)
-        log_error(progress_path, e)
+        await log_error(progress_path, e)
     except RetryableBusinessError as e:
         # v8.8 修正：重试后用尽的业务格式错误，保留进度以便下次恢复
         logger.error(f"[run_pipeline] RetryableBusinessError 重试用尽 msg={str(e)[:300]}")
         sse_emit("error", {"kind": "business", "code": "retry_exhausted", "message": str(e)[:500]}, run_id)
-        log_error(progress_path, e)
+        await log_error(progress_path, e)
+    except state.GateReadError as e:
+        # 闸门回读失败：进度仍停在闸门处、用户选择仍写在 progress.json 里，
+        # 重新开始会原样恢复该弹窗。所以必须说清「可恢复」，而不是抛一句文件系统错误。
+        logger.error(f"[run_pipeline] 闸门回读失败 run_id={run_id}: {e}")
+        sse_emit("error", {"kind": "gate_read_failed", "code": "progress_unreadable",
+                           "message": str(e)}, run_id)
+        await log_error(progress_path, e)
     except asyncio.CancelledError:
         logger.info(f"[run_pipeline] 已停止 run_id={run_id}")
         sse_emit("stopped", {"incomplete": True}, run_id)
     except Exception as e:
         logger.exception(f"[run_pipeline] 未捕获异常 run_id={run_id}")
         sse_emit("error", {"kind": "unknown", "code": "exception", "message": str(e)[:500]}, run_id)
-        log_error(progress_path, e)
+        await log_error(progress_path, e)
     finally:
-        state.pipeline_running = False
-        # v8.8 修正：progress.json 里 pipeline_running 复位为 False，便于前端判定
+        hb.cancel()
+        # 只清理「自己」持有的全局状态。
+        # 新 run 可能已经接手（用户在上一轮 done 后 1s 内重跑就会发生），
+        # 此时迟到的 finally 会把 current_output_path / pipeline_task 清成 None，
+        # 于是新 run 的 pause/stop/blueprint/accept 等全部返回 409 no_active_run，
+        # 用户被永久卡在第一个闸门上。
+        if state.current_run_id == run_id:
+            state.pipeline_running = False   # 幂等；正常路径已在发 done 前复位
+            state.current_output_path = None
+            state.pipeline_task = None
+        else:
+            logger.info(f"[run_pipeline] run_id={run_id} 已被更新的 run 接管，跳过全局状态清理")
+        # progress.json 始终要写：它属于本轮自己的输出目录
         if progress is not None:
             try:
                 progress["pipeline_running"] = False
+                progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 async with state.progress_lock:
                     atomic_write_json(progress_path, progress)
+                logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
             except Exception:
                 logger.exception("[run_pipeline] finally 写 progress.json 失败")
-        # 不清 current_run_id，等待下次 /api/start 覆盖
-        state.current_output_path = None
-        state.pipeline_task = None
+
+
+async def _heartbeat_loop(progress_path: Path, interval: float = 15.0):
+    """后台心跳：整个 run 期间（含 LLM 调用）刷新 last_heartbeat。
+    只改这一个键，不碰其它进度字段，避免与各阶段的写盘互相覆盖。
+
+    间隔 15s + 紧凑写 + 不 fsync：progress.json 在缝合阶段可能因锚点内嵌全文而
+    达到数十 MB，用 indent=2 + fsync 每 10s 全量重写会在事件循环上造成数十毫秒停顿，
+    足以让 SSE 心跳抖动、pause/stop 等控制端点排队。15s 对 90s 死狗看门狗仍有 6 倍余量。
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            async with state.progress_lock:
+                if not progress_path.exists():
+                    continue
+                progress = json.loads(progress_path.read_text(encoding='utf-8'))
+                progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                atomic_write_json(progress_path, progress, pretty=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[heartbeat] 写入失败（忽略）: {e}")
 
 def _load_or_init_progress(req, run_id, progress_path):
     """v8.8 新增：存在未完成 progress 则恢复，否则新建。"""
@@ -121,14 +177,13 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
         {k: c.get(k) for k in ("id", "filename", "is_empty", "is_virtual")}
         for c in progress['chapters']
     ]
+    # 先 clear 再推送：闸门必须先「上膛」再让用户看到弹窗，否则用户在
+    # SSE→HTTP 往返的几毫秒内点确认，动作会被紧随的 clear() 抹掉，流水线永久卡死。
+    state.split_confirm.clear()
     sse_emit("split_ready", {"chapters": chapters}, run_id)
     logger.info(f"[P0.3] 拆书预览等待确认 run_id={run_id}")
-    state.split_confirm.clear()
     while not state.split_confirm.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
-        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        async with state.progress_lock:
-            atomic_write_json(progress_path, progress)
         await asyncio.sleep(1.0)
     progress['current_phase'] = 'phase1'
     async with state.progress_lock:
@@ -146,15 +201,16 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     progress['current_phase'] = 'phase1_fixreview'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
+    # 同 wait_split_confirm：先 clear 再推送，否则确认会被紧随的 clear() 抹掉。
+    state.fix_review_confirm.clear()
     sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
     logger.info(f"[fix_review] 断层勾选等待确认（{len(gaps)} 项）run_id={run_id}")
-    state.fix_review_confirm.clear()
     while not state.fix_review_confirm.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
-        progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        async with state.progress_lock:
-            atomic_write_json(progress_path, progress)
         await asyncio.sleep(1.0)
+    # 用户勾选的断层清单由控制端点写入 progress.json，这里并回内存（否则会被本循环的写盘覆盖）
+    await state.absorb_gate_result(progress, progress_path, ['fix_list'])
+    logger.info(f"[fix_review] 已吸收用户勾选 fix_list={progress.get('fix_list')}")
     progress['current_phase'] = 'phase2'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
@@ -219,16 +275,23 @@ def init_progress(req, run_id):
         "pipeline_running": True, "last_heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-def log_error(progress_path, error):
+async def log_error(progress_path: Path, error):
+    """追加一条错误到 progress.json。
+
+    必须与 _heartbeat_loop 共用 progress_lock：不加锁时会出现
+    「心跳读到旧值 → log_error 读改写 → 心跳把旧值写回」把 error_logs 抹掉，
+    刷新页面后就再也看不到失败原因。
+    """
     try:
-        progress = json.loads(progress_path.read_text(encoding='utf-8'))
-        progress.setdefault("error_logs", []).append({
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "kind": getattr(error, "kind", "unknown"),
-            "code": str(getattr(error, "code", "unknown")),
-            "message": str(error)[:500],
-        })
-        progress["error_logs"] = progress["error_logs"][-100:]
-        atomic_write_json(progress_path, progress)
+        async with state.progress_lock:
+            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress.setdefault("error_logs", []).append({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "kind": getattr(error, "kind", "unknown"),
+                "code": str(getattr(error, "code", "unknown")),
+                "message": str(error)[:500],
+            })
+            progress["error_logs"] = progress["error_logs"][-100:]
+            atomic_write_json(progress_path, progress)
     except Exception:
         pass
