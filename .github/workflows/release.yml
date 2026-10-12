@@ -98,6 +98,11 @@ jobs:
 
       - name: 上传便携包到 Release
         shell: pwsh
+        # gh CLI 不会自动读取 Actions 内置凭据，缺 GH_TOKEN 会直接报
+        # "To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN
+        # environment variable" 并 exit 1。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ver = (Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
           # 用单引号 here-string：正文里有 markdown 反引号，在双引号 here-string
