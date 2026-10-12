@@ -100,19 +100,27 @@ jobs:
         shell: pwsh
         run: |
           $ver = (Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
-          $body = @"
-          文炼工坊 TextForge $ver —— **免安装便携版**
+          # 用单引号 here-string：正文里有 markdown 反引号，在双引号 here-string
+          # 里会被 PowerShell 当成转义符吃掉。版本号靠 -replace 事后替换。
+          $notes = @'
+          文炼工坊 TextForge __VER__ —— **免安装便携版**
 
-          - 下载 `TextForge_${ver}_portable_x64.zip`，**解压**后双击 `textforge.exe`
+          - 下载 `TextForge___VER___portable_x64.zip`，**解压**后双击 `textforge.exe`
           - 不需要安装、不需要管理员权限、不写注册表
           - 整个文件夹可随意搬移；删除文件夹即彻底卸载，不留残余
           - 用 SHA256SUMS.txt 校验下载完整性：`certutil -hashfile 文件名 SHA256`
 
-          ## 为什么是便携版
+          ## 为什么改用便携版
           之前的 NSIS 安装包会被 Windows Defender 误报拦截
-          （`Trojan:Win32/Wacatac.B!ml`，`!ml` 表示机器学习泛化判定而非病毒特征码）。
-          实测 PyInstaller 后端单独扫描是干净的，元凶是安装壳。
-          改为便携版后彻底去掉安装壳。
+          （`Trojan:Win32/Wacatac.B!ml`；末尾 `!ml` 表示机器学习泛化判定，不是病毒特征码）。
+          实测把 PyInstaller 后端单独拿出来扫描是干净的，元凶是安装壳把这份
+          高熵载荷又包了一层。便携版彻底去掉了安装壳。
+
+          ## 关于「删掉文件夹是否等于没装过」
+          实测：注册表、AppData、LocalAppData 均无新增项；历史/日志/端口文件
+          全部落在包内 `data\` 子目录。唯一例外是运行期间 `%TEMP%` 下的
+          `_MEIxxxxxx`（Python 自解压缓存，约 40MB），**正常关窗即自动删除**；
+          仅在进程被强杀或系统断电时才会残留，Windows 会自行清理临时目录。
 
           ## 仍可能提示未知发布者
           本项目未购买商业代码签名证书，因此没有数字签名。
@@ -121,10 +129,13 @@ jobs:
 
           ## 小说成品在哪
           不在本文件夹里 —— 成品路径由你在界面中自行选择。
-          "@
+          '@
+          $notes = $notes -replace '__VER__', $ver
+          $notes | Out-File -Encoding utf8 RELEASE_NOTES.md
+
           gh release create "${{ github.ref_name }}" `
             "TextForge_${ver}_portable_x64.zip" `
             "SHA256SUMS.txt" `
             --title "TextForge $ver（免安装便携版）" `
-            --body $body `
+            --notes-file RELEASE_NOTES.md `
             --repo "${{ github.repository }}"
