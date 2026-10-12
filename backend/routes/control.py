@@ -61,6 +61,36 @@ async def split_confirm(payload: dict = Body(...)):
     state.split_confirm.set()
     return {"status": "confirmed"}
 
+@router.post("/api/split/redo")
+async def split_redo(payload: dict = Body(...)):
+    """P0.5 在拆书预览里按自定义章节标记重新拆分。
+
+    必须与原文标题行**完全一致**（精确匹配）。用于规则与 AI 都搞不定的创新排版。
+    这里只登记标记并唤醒闸门，真正的重拆在流水线线程内串行执行（避免并发改 progress）。
+    """
+    _check_run_id(payload.get("run_id"))
+    markers = payload.get("markers", []) or []
+    if not isinstance(markers, list) or not any(str(m).strip() for m in markers):
+        raise HTTPException(422, "markers 必须是非空的字符串数组")
+    req = state.current_req
+    if getattr(req, "input_mode", "") != "single_file":
+        raise HTTPException(422, "只有单文件模式支持按自定义标记重新拆分；多文件模式请直接调整文件")
+    output_path = state.current_output_path
+    if not output_path: raise HTTPException(409, "no_active_run")
+    progress_path = Path(output_path) / "progress.json"
+    async with state.progress_lock:
+        if not progress_path.exists():
+            raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
+        try:
+            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError) as e:
+            raise HTTPException(409, f"progress.json 无法读取: {e}")
+        if progress.get('current_phase') != 'phase0_confirm':
+            raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许重新拆分")
+    state.split_redo_markers = [str(m).strip() for m in markers if str(m).strip()]
+    state.split_redo.set()
+    return {"status": "redoing", "markers": len(state.split_redo_markers)}
+
 @router.post("/api/fix/confirm")
 async def fix_confirm(payload: dict = Body(...)):
     """fix_gaps 断层勾选确认：仅 phase1_fixreview 阶段允许；

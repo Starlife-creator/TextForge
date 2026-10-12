@@ -76,6 +76,15 @@ def phase4_finalize(output_path: Path, progress: dict, req):
     final_dir.mkdir(parents=True, exist_ok=True)
     backup_dir = output_path / "_backup"
     output_format = req.input_format
+    novel_name_raw = progress.get('novel_name') or '重构终稿'
+
+    # 重跑覆盖前先把**上一版成品**整版快照到 _versions/，供用户一键回滚
+    # （逐文件 _backup 仍在，但它们是给「单文件意外覆盖」兜底的，不作为版本入口）
+    try:
+        from core.versions import snapshot as _snapshot
+        _snapshot(output_path, novel_name=novel_name_raw)
+    except Exception as e:
+        logger.warning(f"[finalize] 成品版本快照失败（继续）: {e}")
     
     original_chapters = [c for c in progress['chapters'] if not c.get('is_virtual')]
     original_chapters.sort(key=lambda c: natural_sort_key(c['filename']))

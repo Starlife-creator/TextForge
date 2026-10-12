@@ -5,6 +5,10 @@ import { isTauri } from '@tauri-apps/api/core';
 import { waitForPort } from './api/backend';
 import { connectSSE, disconnectSSE, type SSEHandlers } from './api/sse';
 import SettingsModal from './components/SettingsModal.vue';
+import {
+  fetchHistory, forgetHistory, fetchVersions, restoreVersion,
+  type HistoryItem, type VersionInfo,
+} from './api/system';
 
 // ---------- 后端连接 ----------
 const port = ref<number | null>(null);
@@ -142,11 +146,13 @@ const summaries = ref<any[]>([]);
 const showSummaries = ref(false);
 // P0.3：拆书预览确认门
 const reviewSplit = ref(false);
+const aiSplit = ref(true);
 const compareOutput = ref(false);
 const chapterSnapshots = ref(false);
 const diagnoseJson = ref('');
 const showSplit = ref(false);
 const splitChapters = ref<any[]>([]);
+const splitDetection = ref<any | null>(null);
 const confirmingSplit = ref(false);
 // fix_gaps 闭环：断层勾选弹窗
 const showFixReview = ref(false);
@@ -185,7 +191,7 @@ function persist() {
       authorStyle: authorStyle.value, refactorMode: refactorMode.value,
       batchInterval: batchInterval.value, darkMode: darkMode.value,
       forbiddenCanon: forbiddenCanon.value, nameMapText: nameMapText.value,
-      outputPath: outputPath.value, inputPath: inputPath.value,
+      outputPath: outputPath.value, inputPath: inputPath.value, aiSplit: aiSplit.value,
       // inputMode / inputFormat / novelName 必须一起存：后端 paths.py 会硬校验
       // 「声明格式 == 文件扩展名」，只存 inputPath 会让重开后的默认 txt + .docx 直接 422
       inputMode: inputMode.value, inputFormat: inputFormat.value, novelName: novelName.value,
@@ -218,6 +224,7 @@ function restore() {
     if (typeof p.inputPath === 'string') inputPath.value = p.inputPath;
     if (p.inputMode === 'single_file' || p.inputMode === 'multi_file') inputMode.value = p.inputMode;
     if (['txt', 'md', 'docx'].includes(p.inputFormat)) inputFormat.value = p.inputFormat;
+    if (typeof p.aiSplit === 'boolean') aiSplit.value = p.aiSplit;
     if (typeof p.novelName === 'string') novelName.value = p.novelName;
     if (typeof p.sslVerify === 'boolean') sslVerify.value = p.sslVerify;
     if (typeof p.proxy === 'string') proxy.value = p.proxy;
@@ -300,6 +307,7 @@ async function connectBackend() {
     // 页面刷新/SSE 晚连接时，从后端恢复 UI 状态（暂停态、待确认蓝图、用量等）
     await fetchStatus();
     startStatusPolling();
+    refreshHistory();          // 任务历史（跨会话）
   } catch (e: any) {
     errorMsg.value = e.message || String(e);
     backendReady.value = false;
@@ -357,6 +365,180 @@ function gateKey(k: string) { return `${runId.value || '-'}:${k}`; }
 function isGateSettled(k: string) { return confirmedGates.value.has(gateKey(k)); }
 function markGateSettled(k: string) { confirmedGates.value.add(gateKey(k)); }
 
+// 输出目录状态：是否可续跑 / 已完成 / 失败原因。用于「重跑为什么没保存」的困惑：
+// 数据其实一直在盘上，缺的是让用户看见、并能一键重来。
+const outInfo = ref<any | null>(null);
+const clearingOutput = ref(false);
+
+// ---------- 任务历史（跨会话）----------
+const historyItems = ref<HistoryItem[]>([]);
+const showHistory = ref(false);
+const histQuery = ref('');
+const histSort = ref<'recent' | 'name' | 'progress'>('recent');
+const histBusy = ref(false);
+
+async function refreshHistory() {
+  if (!port.value || histBusy.value) return;
+  histBusy.value = true;
+  try { historyItems.value = (await fetchHistory(port.value)).items || []; }
+  catch { /* 后端未起/无历史：静默 */ }
+  finally { histBusy.value = false; }
+}
+
+/** 过滤 + 排序后的可见列表。搜索同时匹配书名与输出/输入路径。 */
+const historyView = computed(() => {
+  const q = histQuery.value.trim().toLowerCase();
+  let list = historyItems.value.filter((h) => {
+    if (!q) return true;
+    return [h.novel_name, h.output_path, h.input_path]
+      .some((v) => (v || '').toLowerCase().includes(q));
+  });
+  const byUpdated = (a: HistoryItem, b: HistoryItem) =>
+    (b.updated_at || '').localeCompare(a.updated_at || '');
+  if (histSort.value === 'recent') list = [...list].sort(byUpdated);
+  else if (histSort.value === 'name') {
+    list = [...list].sort((a, b) =>
+      (a.novel_name || a.output_path || '').localeCompare(b.novel_name || b.output_path || ''));
+  } else {
+    // 进度低（未完成）的排前面：它们才是用户回来要续跑的
+    list = [...list].sort((a, b) => {
+      const pa = a.batches_total ? (a.batches_done || 0) / a.batches_total : (a.finished ? 1 : 0);
+      const pb = b.batches_total ? (b.batches_done || 0) / b.batches_total : (b.finished ? 1 : 0);
+      return pa - pb || byUpdated(a, b);
+    });
+  }
+  return list;
+});
+
+/** 未完成且可续跑的数量，用于按钮上的角标提醒 */
+const historyPendingCount = computed(() =>
+  historyItems.value.filter((h) => !h.finished && !h.running && h.current_phase).length);
+
+function historyState(h: HistoryItem): { text: string; cls: string } {
+  if (h.running) return { text: '运行中', cls: 'badge running' };
+  if (h.finished) return { text: '已完成', cls: 'badge ok' };
+  if (h.last_error) return { text: '出错中断', cls: 'badge err2' };
+  if (h.current_phase && h.current_phase !== 'phase0') return { text: '未完成·可续跑', cls: 'badge paused' };
+  return { text: '未开始', cls: '' };
+}
+
+/** 批次进度百分比（无批次信息时按完成与否给 0/100） */
+function historyPct(h: HistoryItem): number {
+  if (h.finished) return 100;
+  if (!h.batches_total) return 0;
+  return Math.min(100, Math.round(((h.batches_done || 0) / h.batches_total) * 100));
+}
+
+/** 相对时间：比 ISO 串友好得多（"3 分钟前" vs "2026-10-12T04:56:33Z"） */
+function historyAgo(iso?: string | null): string {
+  if (!iso) return '';
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return iso;
+  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (s < 60) return '刚刚';
+  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
+  if (s < 86400 * 30) return `${Math.floor(s / 86400)} 天前`;
+  return iso.slice(0, 10);
+}
+
+async function clearAllHistory() {
+  if (!port.value) return;
+  if (!window.confirm('清空任务历史列表吗？\n（只清除这份记录，不动任何磁盘文件）')) return;
+  try {
+    await req0('/api/history/clear');
+    await refreshHistory();
+    addLog('已清空任务历史记录（磁盘文件未动）');
+  } catch (e: any) { topError.value = `清空历史失败：${e.message}`; }
+}
+/** 裸请求（供不需要强类型的清空操作使用） */
+async function req0(path: string) {
+  const res = await fetch(`${apiBase()}${path}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+/** 把历史条目填回配置（不自动开跑，用户确认后再点开始） */
+function loadFromHistory(h: HistoryItem) {
+  if (h.input_path) inputPath.value = h.input_path;
+  if (h.input_mode === 'single_file' || h.input_mode === 'multi_file') inputMode.value = h.input_mode;
+  if (h.input_path) {
+    const dot = h.input_path.lastIndexOf('.');
+    if (dot > 0) {
+      const ext = h.input_path.slice(dot + 1).toLowerCase();
+      if (ext === 'txt' || ext === 'md' || ext === 'docx') inputFormat.value = ext;
+    }
+  }
+  outputPath.value = h.output_path;
+  if (h.novel_name) novelName.value = h.novel_name;
+  refreshOutInfo();
+  addLog(`已载入历史任务「${h.novel_name || h.output_path}」，确认无误后点开始即可续跑`);
+}
+async function forgetHistoryItem(h: HistoryItem) {
+  if (!port.value) return;
+  try { await forgetHistory(port.value, h.output_path); await refreshHistory(); }
+  catch (e: any) { topError.value = `移除失败：${e.message}`; }
+}
+
+// ---------- 成品版本（重跑前的整版快照，可回滚）----------
+const showVersions = ref(false);
+const versionList = ref<VersionInfo[]>([]);
+const versionBusy = ref(false);
+async function openVersions() {
+  if (!port.value || !outputPath.value) return;
+  showVersions.value = true;
+  versionBusy.value = true;
+  try { versionList.value = (await fetchVersions(port.value, outputPath.value)).versions || []; }
+  catch (e: any) { versionList.value = []; topError.value = `读取版本失败：${e.message}`; }
+  finally { versionBusy.value = false; }
+}
+async function doRestore(v: VersionInfo) {
+  if (!port.value || !outputPath.value) return;
+  if (!window.confirm(`把成品恢复到版本 ${v.id} 吗？\n（恢复前会先给当前版本留一份快照，仍可再回退）`)) return;
+  versionBusy.value = true;
+  try {
+    await restoreVersion(port.value, outputPath.value, v.id);
+    addLog(`已恢复成品版本 ${v.id}`);
+    await openVersions();
+    await fetchStatus();
+  } catch (e: any) { topError.value = `恢复失败：${e.message}`; }
+  finally { versionBusy.value = false; }
+}
+function fmtSize(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function refreshOutInfo() {
+  if (!port.value || !outputPath.value) { outInfo.value = null; return; }
+  try {
+    const res = await fetch(`${apiBase()}/api/output/inspect?output_path=${encodeURIComponent(outputPath.value)}`);
+    outInfo.value = res.ok ? await res.json() : null;
+  } catch { outInfo.value = null; }
+}
+async function clearOutputDir() {
+  if (!outputPath.value) return;
+  if (!window.confirm('确定清空输出目录里的 TextForge 产物吗？\n（只删 01_summaries / 02_workspace / 03_final / _diagnostics / Story_Bible.md / progress.json，不影响你的其它文件）')) return;
+  clearingOutput.value = true;
+  try {
+    const res = await fetch(`${apiBase()}/api/output/clear`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ output_path: outputPath.value }),
+    });
+    if (await checkRes(res, '清空输出目录')) {
+      const body = await res.json().catch(() => ({}));
+      addLog(`已清空输出目录（删除 ${(body.removed || []).length} 项）`);
+      await refreshOutInfo();
+    }
+  } catch (e: any) {
+    topError.value = `清空失败：${e.message}`;
+  } finally { clearingOutput.value = false; }
+}
+watch(outputPath, () => { persist(); refreshOutInfo(); });
+watch([port, () => pipelineRunning.value], () => { refreshOutInfo(); });
+
 async function fetchStatus(): Promise<boolean> {
   if (!port.value) return false;
   try {
@@ -365,6 +547,10 @@ async function fetchStatus(): Promise<boolean> {
     if (!res.ok) return false;
     const s = await res.json();
     isPaused.value = !!s.paused;
+    if (Array.isArray(s.config_drift) && s.config_drift.length) {
+      // 续跑时配置变了 → 前几批用旧配置、后几批用新配置，可能风格割裂
+      topTip.value = `续跑注意：${s.config_drift.join('；')}。已完成批次不会重做，前后风格可能不一致。`;
+    }
     // 必须无条件赋值：原实现只有 `if (s.pipeline_running) pipelineRunning = true`，
     // 没有 else。后端进程一死，fetch 抛异常被空 catch 吞掉，pipelineRunning 就永远
     // 卡在 true → canStart 恒 false → .panel.config.disabled 的 pointer-events:none
@@ -468,6 +654,12 @@ case 'run_start':
     case 'batch_done':
       addLog(`批次 ${payload.batch_id} 完成`, 'accent');
       break;
+    case 'batch_split':
+      // 批次因「上下文超限 / 分隔符契约失败」被自动对半拆分重跑。
+      // 这是本应用在弱模型/小显存下的自愈机制，必须让用户看见：
+      // 否则用户只会觉得「怎么跑了这么久」，而不知道程序已在自动降规模。
+      addLog(payload.message || `批次 ${payload.from_batch} 自动拆分重跑`, 'warn');
+      break;
     case 'stream_chunk':
       // #2 节流后的流式增量，保留最近 500 字
       streamingText.value = (streamingText.value + (payload.text || '')).slice(-500);
@@ -475,6 +667,7 @@ case 'run_start':
     case 'split_ready':
       // P0.3：拆书完成，等待用户确认拆分后进入诊断
       splitChapters.value = payload.chapters || [];
+      splitDetection.value = payload.detection || null;
       showSplit.value = true;
       addLog(`拆书完成，共 ${splitChapters.value.length} 章，请确认`, 'warn');
       break;
@@ -528,6 +721,7 @@ case 'run_start':
       topTip.value = `全部完成！成品在：${payload.output_dir}\\03_final`;
       addLog(`全部完成！输出目录：${payload.output_dir}`, 'ok');
       stopElapsed();
+      refreshHistory(); refreshOutInfo();   // 历史里立刻显示「已完成」
       break;
     case 'stopped':
       pipelineRunning.value = false;
@@ -535,9 +729,10 @@ case 'run_start':
       // 残留一个「停止/强制导出」弹窗会全屏锁死界面，用户连关闭按钮都点不到。
       closeAllGates();
       stopStatusPolling();
-      topTip.value = '流水线已停止，进度已保留；再次点击“开始重构”可从断点继续';
+      topTip.value = '流水线已停止，进度已保留；再次点击"开始重构"可从断点继续';
       addLog('流水线已停止', 'warn');
       stopElapsed();
+      refreshHistory(); refreshOutInfo();
       break;
     case 'error':
       // kind='warning' 是非致命提示（如摘要超长被截断），不应停表、也不该记成错误
@@ -551,6 +746,7 @@ case 'run_start':
       stopStatusPolling();
       topError.value = payload.message || payload.code || '未知错误';
       stopElapsed();
+      refreshHistory(); refreshOutInfo();   // 历史里立刻显示「出错中断 + 原因」
       break;
     case 'comparison_done':
       addLog(`左右对照已生成：写入 ${payload.written} 章 / 跳过 ${payload.skipped} 章`, 'ok');
@@ -630,6 +826,7 @@ async function startPipeline() {
     novel_name: novelName.value || null,
     refactor_mode: refactorMode.value,
     review_split: reviewSplit.value,
+    ai_split: aiSplit.value,
     refactor_gates: { ...gates },
     forbidden_canon: forbiddenCanon.value.split('\n').map(s => s.trim()).filter(Boolean),
     name_map: Object.fromEntries(
@@ -704,6 +901,27 @@ async function confirmSplit() {
     topError.value = `请求失败：${e.message}`;
   } finally {
     confirmingSplit.value = false;
+  }
+}
+
+// 拆书预览里「按自定义标记重新拆分」：规则与 AI 都搞不定的创新排版，由用户拍板。
+const redoMarkers = ref('');
+const redoingSplit = ref(false);
+async function redoSplit() {
+  const markers = redoMarkers.value.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (!markers.length) { topError.value = '请至少填写一个章节标题行（每行一个，需与原文完全一致）'; return; }
+  redoingSplit.value = true;
+  try {
+    const res = await fetch(`${apiBase()}/api/split/redo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run_id: runId.value, markers }),
+    });
+    if (await checkRes(res, '重新拆分')) addLog(`已提交 ${markers.length} 个章节标记，正在重新拆分…`);
+  } catch (e: any) {
+    topError.value = `请求失败：${e.message}`;
+  } finally {
+    redoingSplit.value = false;
   }
 }
 
@@ -974,6 +1192,11 @@ function applyModelFromSettings(v: { model: string; apiUrl: string; apiKey: stri
   persist();
 }
 
+function applyContextFromSettings(n: number) {
+  if (typeof n === 'number' && n >= 8000) contextWindow.value = n;
+  persist();
+}
+
 const canStart = computed(() =>
   backendReady.value && !pipelineRunning.value &&
   !!inputPath.value && !!outputPath.value && !!apiUrl.value && !!model.value
@@ -1122,6 +1345,9 @@ const canStart = computed(() =>
         <div class="row">
           <label>拆书确认</label>
           <label class="rich"><input type="checkbox" v-model="reviewSplit" /> 拆书后先预览章节再继续</label>
+          <label class="rich" title="仅在规则识别不可靠（没认出章节 / 章节长度异常）时才额外调用一次模型，成本很低">
+            <input type="checkbox" v-model="aiSplit" /> 识别不到章节时用 AI 辅助定位边界（多一次模型调用）
+          </label>
         </div>
 
         <details class="adv">
@@ -1204,7 +1430,27 @@ const canStart = computed(() =>
           <button v-if="outputPath && port" class="open-btn" @click="openOutput">打开输出目录</button>
           <button v-if="outputPath && port" class="open-btn ghost" @click="openFinal">打开成品</button>
           <button v-if="outputPath && port" class="open-btn ghost" @click="openComparisons">对照预览</button>
+          <button v-if="outputPath && port" class="open-btn ghost" @click="openVersions">成品版本</button>
+          <button v-if="port" class="open-btn ghost" @click="showHistory = true; refreshHistory()">
+            任务历史<template v-if="historyPendingCount"> · {{ historyPendingCount }}</template>
+          </button>
+          <button v-if="outputPath && port" class="open-btn ghost" :disabled="pipelineRunning || clearingOutput"
+                  @click="clearOutputDir">{{ clearingOutput ? '清空中…' : '清空输出目录' }}</button>
         </div>
+        <p v-if="outInfo && outInfo.exists && outInfo.artifacts && outInfo.artifacts.length" class="out-status">
+          <template v-if="outInfo.resumable">
+            检测到<strong>未完成</strong>的进度：{{ outInfo.novel_name || '本书' }}
+            · 共 {{ outInfo.total_chapters }} 章 · 已完成批次 {{ outInfo.batches_done }}/{{ outInfo.batches_total }}
+            （阶段 {{ outInfo.current_phase }}）—— 点开始将<strong>断点续跑</strong>，已完成的批次不会重做。
+          </template>
+          <template v-else-if="outInfo.finished">该目录含已完成的成品，点开始会重新生成同名文件（旧文件自动备份）。</template>
+          <template v-else>该目录已含 TextForge 产物。</template>
+          <br />
+          如要彻底重来，请点「清空输出目录」（只删 TextForge 自己生成的文件，不影响你的其它文件）。
+        </p>
+        <p v-if="outInfo && outInfo.error_logs && outInfo.error_logs.length" class="out-status err">
+          上次中断原因：{{ outInfo.error_logs[outInfo.error_logs.length - 1].message }}
+        </p>
 
         <div class="controls" v-if="pipelineRunning">
           <button @click="control('pause')" :disabled="isPaused || controlling">暂停</button>
@@ -1275,14 +1521,28 @@ const canStart = computed(() =>
     <div v-if="showSplit" class="modal-mask">
       <div class="modal">
         <h3>请确认拆书结果</h3>
-        <p class="hint">共拆分出 {{ splitChapters.length }} 章。确认后进入诊断；如需调整请停止后修改原始文档重跑。</p>
+        <p class="hint">共拆分出 {{ splitChapters.length }} 章。确认后进入诊断。</p>
+        <p v-if="splitDetection" class="hint" :class="splitDetection.needs_review ? 'err' : 'ok'">
+          识别方式：{{ splitDetection.mode }}
+          <template v-if="splitDetection.confidence">· 置信度 {{ splitDetection.confidence }}</template>
+          <template v-if="splitDetection.reason">· {{ splitDetection.reason }}</template>
+        </p>
         <div class="sum-list">
           <div v-for="(c, i) in splitChapters" :key="i" class="split-row">
-            <span class="split-id">{{ c.filename }}</span>
+            <span class="split-id">{{ c.title || c.filename }}</span>
             <span v-if="c.is_virtual" class="badge paused">虚拟段</span>
             <span v-if="c.is_empty" class="badge err2">空章</span>
           </div>
         </div>
+        <!-- 兜底：规则与 AI 都搞不定的创新排版，让用户直接给出章节标题行 -->
+        <details class="redo-split">
+          <summary>拆分不对？按自定义章节标记重新拆分</summary>
+          <p class="hint">每行填一个章节标题，需与原文该行<strong>完全一致</strong>（含标点空格）。程序按这些行切分，正文不会改写。</p>
+          <textarea v-model="redoMarkers" rows="4" placeholder="楔子&#10;风起于青萍之末&#10;尾声"></textarea>
+          <button :disabled="redoingSplit" @click="redoSplit">
+            {{ redoingSplit ? '重拆中…' : '按此标记重新拆分' }}
+          </button>
+        </details>
         <div class="modal-actions">
           <span></span>
           <button :disabled="confirmingSplit" @click="confirmSplit">
@@ -1406,10 +1666,94 @@ const canStart = computed(() =>
       :api-key="apiKey"
       :proxy="proxy"
       :ssl-verify="sslVerify"
+      :context-window="contextWindow"
       @close="showSettings = false"
       @reconnect="reconnectBackend"
       @apply-model="applyModelFromSettings"
+      @apply-context="applyContextFromSettings"
     />
+
+    <!-- 任务历史（跨会话） -->
+    <div v-if="showHistory" class="modal-mask" @click.self="showHistory = false">
+      <div class="modal">
+        <h3>任务历史</h3>
+        <p class="hint">记录你跑过的每一本书：跑到哪一阶段、上次为什么停的都在这里。点「载入」填回配置，再点开始即可断点续跑。</p>
+        <div class="hist-toolbar">
+          <input v-model="histQuery" type="search" placeholder="搜索书名或路径…" />
+          <select v-model="histSort">
+            <option value="recent">最近更新</option>
+            <option value="progress">进度（未完成优先）</option>
+            <option value="name">书名</option>
+          </select>
+          <button class="ghost" :disabled="histBusy" @click="refreshHistory()">
+            {{ histBusy ? '刷新中…' : '刷新' }}
+          </button>
+        </div>
+        <div v-if="!historyView.length" class="log-empty">
+          {{ historyItems.length ? '没有匹配的任务' : '还没有历史任务' }}
+        </div>
+        <div class="sum-list">
+          <div v-for="(h, i) in historyView" :key="i" class="split-row hist-row">
+            <div class="hist-main">
+              <div class="hist-title">
+                {{ h.novel_name || '（未命名）' }}
+                <span class="badge" :class="historyState(h).cls">{{ historyState(h).text }}</span>
+                <span v-if="h.is_current" class="badge paused">当前目录</span>
+                <span class="hist-ago">{{ historyAgo(h.updated_at) }}</span>
+              </div>
+              <div class="hist-bar" :title="`批次 ${h.batches_done || 0}/${h.batches_total || 0}`">
+                <div class="hist-bar-fill" :style="{ width: historyPct(h) + '%' }"
+                     :class="{ done: h.finished, bad: !!h.last_error }"></div>
+              </div>
+              <div class="hint">
+                {{ h.total_chapters || 0 }} 章 · 批次 {{ h.batches_done || 0 }}/{{ h.batches_total || 0 }}
+                <template v-if="h.current_phase">· {{ h.current_phase }}</template>
+              </div>
+              <div class="hint mono">{{ h.output_path }}</div>
+              <div v-if="h.last_error" class="out-status err">上次中断：{{ h.last_error }}</div>
+              <div v-if="h.config_drift && h.config_drift.length" class="out-status err">
+                续跑配置与上次不同：{{ h.config_drift.join('；') }}
+              </div>
+            </div>
+            <div class="hist-actions">
+              <button class="open-btn" @click="loadFromHistory(h)">载入</button>
+              <button class="open-btn ghost" @click="forgetHistoryItem(h)">移除</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button v-if="historyItems.length" class="ghost" @click="clearAllHistory">清空历史记录</button>
+          <span></span>
+          <button @click="showHistory = false">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 成品版本（重跑前的整版快照，可回滚） -->
+    <div v-if="showVersions" class="modal-mask" @click.self="showVersions = false">
+      <div class="modal">
+        <h3>成品版本</h3>
+        <p class="hint">每次重跑覆盖成品前，都会把上一版完整快照到这里（保留最近 10 版）。点「恢复」即可回滚；恢复前当前版本也会再留一份。</p>
+        <div v-if="versionBusy" class="log-empty">读取中…</div>
+        <div v-else-if="!versionList.length" class="log-empty">还没有历史版本（重跑一次就会自动留存上一版）</div>
+        <div class="sum-list">
+          <div v-for="v in versionList" :key="v.id" class="split-row hist-row">
+            <div class="hist-main">
+              <div class="hist-title">{{ v.id }}</div>
+              <div class="hint">{{ v.files }} 个文件 · {{ fmtSize(v.size) }}</div>
+              <div class="hint mono">{{ v.names.slice(0, 3).join('、') }}{{ v.names.length > 3 ? '…' : '' }}</div>
+            </div>
+            <div class="hist-actions">
+              <button class="open-btn" :disabled="versionBusy" @click="doRestore(v)">恢复</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <span></span>
+          <button @click="showVersions = false">关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1720,6 +2064,26 @@ html.dark .tree-toggle { color: #a0aec0; }
 .sum-empty { color: #718096; }
 .split-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
 .split-id { flex: 1; color: #2d3748; word-break: break-all; }
+.redo-split { margin-top: 10px; }
+.out-status { margin: 6px 0 0; font-size: 12px; line-height: 1.6; color: #4a5568; }
+.out-status.err { color: #c53030; }
+.hist-row { align-items: flex-start; gap: 8px; }
+.hist-main { flex: 1; min-width: 0; }
+.hist-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.hist-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.hist-ago { margin-left: auto; font-size: 11px; color: #718096; font-weight: 400; }
+.hist-toolbar { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
+.hist-toolbar input { flex: 1; padding: 5px 8px; font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px; }
+.hist-toolbar select { padding: 5px 8px; font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px; }
+.hist-bar { height: 4px; background: #e2e8f0; border-radius: 2px; margin: 6px 0 4px; overflow: hidden; }
+.hist-bar-fill { height: 100%; background: #3182ce; transition: width .2s; }
+.hist-bar-fill.done { background: #38a169; }
+.hist-bar-fill.bad { background: #e53e3e; }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; word-break: break-all; }
+.redo-split summary { cursor: pointer; color: #4a5568; font-size: 13px; }
+.redo-split textarea { width: 100%; margin-top: 8px; padding: 6px 8px; font-family: inherit;
+  font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box; }
+.redo-split button { margin-top: 8px; }
 .badge.err2 { background: #fed7d7; color: #822727; }
 .badge-err { background: #fed7d7; color: #822727; }
 .badge-warn { background: #fefcbf; color: #975a16; }

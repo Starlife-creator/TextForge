@@ -1,10 +1,15 @@
-import asyncio, json, time, logging, html, hashlib
+import asyncio, json, re, time, logging, html, hashlib
+from collections import deque
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
 from routes.events import sse_emit
 from core.stitch import stitch_pipeline
-from core.api_client import call_with_retry, RetryableBusinessError, pick_model, pick_endpoint
+from core.api_client import (call_with_retry, RetryableBusinessError,
+                             ContextOverflowError, pick_model, pick_endpoint)
+from core.budget import output_token_reserve
+from core.batching import split_batch_in_progress as _split_batch_in_progress
+from utils.tokens import estimate_tokens
 
 logger = logging.getLogger("textforge")
 
@@ -54,17 +59,64 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
 
     async with make_httpx_client(req, api_url=ep_ref["api_url"], api_key=ep_ref["api_key"]) as client:
         # 阶段 3-1：无重叠重构
-        pending_batches = len([b for b in completed_batches if b['status'] != 'phase3_done'])
-        for batch in completed_batches:
+        #
+        # 用 deque 而不是 for：当某批触发「上下文超限」或「分隔符契约失败」时，
+        # 要把该批**对半拆细**再重新入队重跑，而不是让整轮报废。
+        # 这正是本地小模型/小显存（LM Studio OOM、8448 窗口）下最主要的可用性保障：
+        # 配置填错（或模型比预期弱）时，代价应当是「批次更多、更慢」，而不是「报错、跑不完」。
+        queue = deque(b for b in completed_batches if b['status'] != 'phase3_done')
+        while queue:
+            batch = queue.popleft()
             if batch['status'] == 'phase3_done':
                 continue
             if state.stop_requested: raise asyncio.CancelledError()
             await _wait_pause()
 
-            output_files = await _refactor_and_split(
-                client, req, output_path, recon_dir, blueprint_text, chars,
-                progress, batch, run_id, ep_ref)
-            
+            # 自适应上限：一旦发现过「撑爆」的批次，就把后续批次也预先拆到同尺度，
+            # 避免每批都先浪费一次失败调用（本地模型一次失败可能就是几分钟）。
+            cap = progress.get('adaptive_max_chapters')
+            if cap and len(batch['chapter_ids']) > cap:
+                parts = _split_batch_in_progress(progress, batch, reason="adaptive",
+                                                 detail=f"参考已失败批次，单批章数上限降为 {cap}",
+                                                 run_id=run_id)
+                if parts:
+                    queue.extendleft(reversed(parts))
+                    async with state.progress_lock:
+                        atomic_write_json(progress_path, progress)
+                    continue
+
+            try:
+                output_files = await _refactor_and_split(
+                    client, req, output_path, recon_dir, blueprint_text,
+                    progress, batch, run_id, ep_ref)
+            except ContextOverflowError as e:
+                # 第 2 层：上下文超限 → 对半拆批重跑
+                parts = _split_batch_in_progress(
+                    progress, batch, reason="overflow",
+                    detail=(f"模型上限 {e.available} token" if e.available else "超出模型上下文窗口"),
+                    run_id=run_id)
+                async with state.progress_lock:
+                    atomic_write_json(progress_path, progress)
+                if not parts:
+                    # 只含 1 章（或 1 个不可拆的虚拟组）仍超限：给出可执行的建议
+                    raise RuntimeError(
+                        f"单章仍超出模型上下文：批次 {batch['batch_id']} 章节={batch['chapter_ids']}，"
+                        + (f"模型上限约 {e.available} token。" if e.available else "模型上下文不足。")
+                        + "请调大模型上下文长度，或在导入时把该章拆成更小的文件。") from e
+                queue.extendleft(reversed(parts))
+                continue
+            except ChapterBreakMissingError as e:
+                # 第 4 层：小模型在长上下文里维持不住分隔符契约 → 同样降级拆批，
+                # 让每批章数更少、要吐的分隔符更少，而不是重发同样大小的请求碰运气。
+                parts = _split_batch_in_progress(
+                    progress, batch, reason="contract", detail=str(e)[:120], run_id=run_id)
+                async with state.progress_lock:
+                    atomic_write_json(progress_path, progress)
+                if not parts:
+                    raise  # 单章还失败：交给上层报错（此时拆无可拆）
+                queue.extendleft(reversed(parts))
+                continue
+
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
             logger.info(f"[phase3] batch {batch['batch_id']} 完成 文件={output_files}")
@@ -73,8 +125,7 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
             if gates.get("require_chapter_accept"):
                 await _wait_batch_accept(progress, progress_path, batch, output_path, run_id)
             # 铁律8：批次间保持串行间隔，避免连续请求触发云端限流（间隔可配置，缺省 2s）
-            pending_batches -= 1
-            if pending_batches > 0:
+            if queue:
                 await asyncio.sleep(getattr(req, "batch_interval_sec", 2.0))
     
     # 阶段 3-2：缝合（用缝合阶段的独立端点 client）
@@ -134,6 +185,7 @@ async def regen_single_chapter(req, output_path, chapter_id):
         name_map=getattr(req, "name_map", {}) or {},
         fix_list=getattr(req, "fix_list", []) or [],
         gates=gates,
+        n_chapters=1,   # 单章重生成：明确要求不输出分隔符
     )
     payload = {
         "model": ep["model"],
@@ -157,7 +209,7 @@ async def regen_single_chapter(req, output_path, chapter_id):
     return new_text
 
 
-async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_text, chars,
+async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_text,
                               progress, batch, run_id, ep=None):
     """v8.8 新增：将 '调用 + 按章拆分' 包成一个可重试单元。
     这样 ChapterBreakMissingError 由 call_with_retry 捕获并重试（而非在返回后丢失）。
@@ -182,19 +234,34 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
         name_map=getattr(req, "name_map", {}) or {},
         fix_list=progress.get('fix_list') or getattr(req, "fix_list", []) or [],
         gates=getattr(req, "refactor_gates", {}) or {},
+        n_chapters=len(chapter_ids),
     )
     payload = {
         "model": ep["model"], "messages": [{"role": "user", "content": prompt}],
         "temperature": req.temperatures.refactor,
-        "max_tokens": int(len(batch_content) / 1.5),
+        # 输出预留按 token 估（旧实现用 len/1.5，对中文低估约 50%，会写出偏小的
+        # max_tokens 让模型被迫截断，正文半截就返回 → 空章/契约失败）。
+        "max_tokens": output_token_reserve(estimate_tokens(batch_content)),
         "stream": True,
     }
     logger.info(f"[phase3] batch {batch['batch_id']} 开始 章节={chapter_ids}")
     sse_emit("batch_start", {"batch_id": batch['batch_id'], "chapter_ids": chapter_ids}, run_id)
-    
-    # call_with_retry 收到 ChapterBreakMissingError 会按 RetryableBusinessError 重试 1 次
-    result, usage, _ = await call_with_retry(client, ep["api_url"], payload, sse_emit, run_id)
-    chapter_texts = _split_refactored_by_chapters(result, chapter_ids)
+
+    # 「分隔符数量不符」要能真正重试，必须同时满足两点，原实现**两点都没做到**：
+    #   1. 契约校验放在 call_with_retry 的 validate 里。原先是在它返回**之后**才拆分，
+    #      ChapterBreakMissingError 进不了 except 分支 —— 一次错就是整批报废。
+    #   2. 重试必须带上错因（on_retry）。原先用完全相同的 payload 再调一次，
+    #      模型不知道自己多了 2 个分隔符，只是碰运气 —— 同一批 22:31 蒙对、22:55 又错。
+    _parsed: dict = {}
+
+    def _validate(text: str) -> None:
+        _parsed["chapters"] = _split_refactored_by_chapters(text, chapter_ids)
+
+    result, usage, _ = await call_with_retry(
+        client, ep["api_url"], payload, sse_emit, run_id,
+        on_retry=_break_feedback(len(chapter_ids)),
+        validate=_validate)
+    chapter_texts = _parsed["chapters"]
     
     output_files = []
     for cid, ctext in chapter_texts.items():
@@ -257,20 +324,59 @@ def _split_refactored_by_chapters(text: str, chapter_ids: list) -> dict:
             f"重构输出中以下章节为空：{blanks}。空章不应进入成品，请重试。")
     return {cid: aligned[i] for i, cid in enumerate(chapter_ids)}
 
+def _break_feedback(n_chapters: int):
+    """生成 on_retry 钩子：把「分隔符数量不符」的具体错因写回下一次请求。
+
+    没有它时重试是完全相同的 prompt，模型不知道自己多了 2 个分隔符，
+    只能碰运气 —— 同一批 22:31 蒙对、22:55 又错，10 分钟白跑。
+    """
+    need = max(0, n_chapters - 1)
+
+    def hook(payload: dict, exc: Exception) -> None:
+        got = None
+        m = re.search(r"实际\s*(\d+)\s*个", str(exc))
+        if m:
+            got = int(m.group(1))
+        if got is None:
+            tail = (f"上一��输出不符合格式要求：{str(exc)[:200]}\n"
+                    f"本批共 {n_chapters} 章，请只输出 {need} 个 ===CHAPTER_BREAK===。")
+        else:
+            delta = need - got
+            direction = "删除多余的" if delta < 0 else "补上缺少的"
+            tail = (f"你上一次的输出**不合格**：本批共 {n_chapters} 章，只需要 {need} 个 "
+                    f"`===CHAPTER_BREAK===`，你却输出了 {got} 个（多了 {-delta} 个）。\n"
+                    f"请重新完整输出一遍：{direction} {abs(delta)} 个分隔符；\n"
+                    f"特别注意原文里的「第N章」标题要**原样保留在正文里**，"
+                    f"不要额外用 ===CHAPTER_BREAK=== 重复标注。\n"
+                    f"除正文外不要输出任何其它内容。")
+        payload.setdefault("messages", []).append({"role": "user", "content": tail})
+        # 纠错轮稍微降一点温度，避免又陷入同一种错误模式
+        if "temperature" in payload:
+            payload["temperature"] = max(0.0, min(payload["temperature"], 0.5))
+        logger.info(f"[phase3] 注入分隔符纠正提示：{tail.splitlines()[0][:120]}")
+
+    return hook
+
+
 def _build_refactor_prompt(mode, blueprint, author_style, batch_content, *,
-                           forbidden_canon=(), name_map=None, fix_list=(), gates=None):
+                           forbidden_canon=(), name_map=None, fix_list=(), gates=None,
+                           n_chapters=1):
     """按重构档位选择提示词。缺省/未知 mode 一律回退 full_rewrite（原行为）。
     档位提示词构建后，若启用了任何「保护门」(lock_names/lock_plot/inject_forbidden)，
-    追加一段强制规则；全关时完全不加，旧行为不变。"""
+    追加一段强制规则；全关时完全不加，旧行为不变。
+
+    n_chapters：本批实际章数，必须传真实值 —— 分隔条数契约（_common_tail）依赖它。
+    """
+    n_chapters = max(1, int(n_chapters or 1))
     mode = mode or "full_rewrite"
     if mode == "fidelity":
-        prompt = _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates)
+        prompt = _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates, n_chapters)
     elif mode == "fix_gaps":
-        prompt = _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates)
+        prompt = _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates, n_chapters)
     elif mode == "reskin":
-        prompt = _prompt_reskin(blueprint, author_style, batch_content, name_map)
+        prompt = _prompt_reskin(blueprint, author_style, batch_content, name_map, n_chapters)
     else:
-        prompt = _prompt_full_rewrite(blueprint, author_style, batch_content)
+        prompt = _prompt_full_rewrite(blueprint, author_style, batch_content, n_chapters)
     gate_block = _render_gate_rules(gates, forbidden_canon)
     if gate_block:
         prompt += "\n\n【本次已启用的保护门（强制遵守）】\n" + gate_block
@@ -294,19 +400,30 @@ def _render_gate_rules(gates, forbidden_canon):
 
 
 # 统一的格式契约：Markdown 保留、标题行保留、===CHAPTER_BREAK=== 分隔、直接输出正文。
-_COMMON_TAIL = """4. 格式保留：严格保留原文的 Markdown 格式标记。保留原标题行。
-5. **章节分隔**：如果本批次包含多章，请在每章之间用 `===CHAPTER_BREAK===` 单独一行分隔，便于后续处理。
+#
+# 分隔条数必须**显式告知**：原文里本来就有「第N章」之类的章节标题，
+# 只说「每章之间分隔」时，模型常常在原标题处也插一个分隔符，
+# 结果 4 章输出成 6 段（见回归用例 test_marker_count_explicit_in_prompt）。
+def _common_tail(n_chapters: int) -> str:
+    if n_chapters <= 1:
+        return """4. 格式保留：严格保留原文的 Markdown 格式标记。保留原标题行。
+5. 本批次只有 1 章：**不要输出 `===CHAPTER_BREAK===`**，整段输出即为该章正文。
+6. 直接输出正文：绝对不要输出任何解释、说明或问候语。"""
+    return f"""4. 格式保留：严格保留原文的 Markdown 格式标记。保留原标题行。
+5. **章节分隔（关键）**：本批次共 **{n_chapters} 章**，因此必须且只能输出 **{n_chapters - 1} 个** `===CHAPTER_BREAK===`，写在相邻两章之间、各占一行。
+   - 原文中已有的「第N章」等章节标题请**原样保留在正文里**，不要用 `===CHAPTER_BREAK===` 代替它，也不要在它前面另加一个。
+   - 多一个或少一个都会导致整批返工，请先在心里数一遍再输出。
 6. 直接输出正文：绝对不要输出任何解释、说明或问候语。"""
 
 
-def _prompt_full_rewrite(blueprint, author_style, batch_content):
+def _prompt_full_rewrite(blueprint, author_style, batch_content, n_chapters):
     """原「全部重构」极端档：蓝图是方向不是宪法，允许推翻细节、改人名、整段重写。"""
     return f"""你是一位小说主笔。请严格按照用户提供的【全局设定与重构方向】，对【待处理正文】进行重构优化。
 要求：
 1. 保留剧情骨架：核心剧情、人物基础人设、世界观设定不得篡改。
 2. 修复内部断层：如果本批次章节内部存在逻辑跳跃，请合理补充过渡段落。
 3. 去AI味与优化文笔：用具体动作展示情绪，打破单调句式，让文字富有画面感。
-{_COMMON_TAIL}
+{_common_tail(n_chapters)}
 【全局设定与重构方向】
 {blueprint}
 
@@ -318,7 +435,7 @@ def _prompt_full_rewrite(blueprint, author_style, batch_content):
 """
 
 
-def _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates):
+def _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates, n_chapters):
     """保真润色档：锁定人名与事件骨架，仅润色表述，逐句贴近原意。"""
     forbid = _render_forbidden(forbidden_canon, gates)
     return f"""你是一位保真度优先的小说润色师。你的任务是在【不改变任何事实的前提下】优化文字。
@@ -327,7 +444,7 @@ def _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, ga
 1. **锁定人名、地名、专有名词与事件顺序**：一律不得改动、替换为其字面，原样保留。
 2. **锁定剧情骨架与逻辑走向**：不得增删情节、不得加入原文没有的关键事件。
 3. {forbid}4. 只做表述润色：优化句式、去重复、提升画面感和节奏，但每句的意思贴近原文。
-{_COMMON_TAIL}
+{_common_tail(n_chapters)}
 
 【全局设定（仅作一致性参照，不推翻）】
 {blueprint}
@@ -340,7 +457,7 @@ def _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, ga
 """
 
 
-def _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates):
+def _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates, n_chapters):
     """修断层档：锁定骨架与人名，最小改动补逻辑断层（默认修列出的断层，未列出不动）。"""
     forbid = _render_forbidden(forbidden_canon, gates)
     scope = ""
@@ -352,7 +469,7 @@ def _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fi
 1. **锁定人名、地名、专有名词与事件顺序**：原样保留，不得改动。
 2. **锁定剧情骨架**：不改动结构，仅在断层处做最小补充或调整。
 3. {forbid}{scope}4. 修断层以「平滑合理」为度：补过渡、消矛盾、接动机，不引入新支线。
-{_COMMON_TAIL}
+{_common_tail(n_chapters)}
 
 【全局设定（仅作一致性参照，不推翻）】
 {blueprint}
@@ -365,7 +482,7 @@ def _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fi
 """
 
 
-def _prompt_reskin(blueprint, author_style, batch_content, name_map):
+def _prompt_reskin(blueprint, author_style, batch_content, name_map, n_chapters):
     """换皮档：节拍锁定，按映射表统一替换人名/设定名。"""
     mapping = _render_name_map(name_map)
     return f"""你是一位既保留原有节拍、又把作品「换皮」的改写师。原始剧情节拍不变，仅统一更换人设/地名等外皮。
@@ -374,7 +491,7 @@ def _prompt_reskin(blueprint, author_style, batch_content, name_map):
 1. **保留原有剧情节拍与事件顺序**：起承转合、关键转折一一对应，不得增删主线。
 2. **按映射表替换名字/设定**：任一见到的旧名一律替换为对应新名，不得遗漏或自造其它。
 3. {mapping}4. 在换皮基础上顺滑文字，但不得改变人物关系与情节逻辑。
-{_COMMON_TAIL}
+{_common_tail(n_chapters)}
 
 【全局设定（用于理解框架，不推翻；实际命名以上方映射表为准）】
 {blueprint}

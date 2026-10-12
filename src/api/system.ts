@@ -48,6 +48,10 @@ export interface LlmCheckResult {
   elapsed_ms: number;
   reply?: string;
   model?: string;
+  /** 后端探测到的服务端真实上下文窗口（token）；探不到为 null */
+  context_limit?: number | null;
+  /** 探测来源：lmstudio / llama.cpp / ollama / openai / overflow */
+  context_source?: string | null;
 }
 
 async function call<T>(port: number, path: string, init?: RequestInit): Promise<T> {
@@ -103,4 +107,106 @@ export function checkLlm(port: number, payload: {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
+}
+
+export interface ContextProbeResult {
+  ok: boolean;
+  /** 探测到的真实窗口（token）；探不到为 null */
+  detected: number | null;
+  /** 探测来源：lmstudio / llama.cpp / ollama / openai / overflow */
+  source?: string | null;
+  configured?: number | null;
+  /** 配置值大于实测值时的可读提示，否则 null */
+  mismatch?: string | null;
+}
+
+// ---------- 任务历史 / 成品版本 ----------
+
+export interface HistoryItem {
+  output_path: string;
+  novel_name?: string | null;
+  input_path?: string | null;
+  input_mode?: string | null;
+  current_phase?: string | null;
+  total_chapters?: number;
+  batches_done?: number;
+  batches_total?: number;
+  finished?: boolean;
+  finished_at?: string | null;
+  updated_at?: string;
+  last_error?: string;
+  config_drift?: string[];
+  is_current?: boolean;
+  running?: boolean;
+}
+
+async function req<T>(port: number, path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`http://127.0.0.1:${port}${path}`, init);
+  const text = await res.text();
+  let body: any = null;
+  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  if (!res.ok) {
+    const d = body && typeof body === 'object' ? (body.detail ?? body) : body;
+    throw new Error(typeof d === 'string' ? d : JSON.stringify(d ?? `HTTP ${res.status}`));
+  }
+  return body as T;
+}
+
+export function fetchHistory(port: number) {
+  return req<{ items: HistoryItem[] }>(port, '/api/history');
+}
+
+export function forgetHistory(port: number, outputPath: string) {
+  return req<{ status: string }>(port, '/api/history/forget', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ output_path: outputPath }),
+  });
+}
+
+export interface VersionInfo {
+  id: string;
+  mtime: number;
+  files: number;
+  size: number;
+  names: string[];
+}
+
+export function fetchVersions(port: number, outputPath: string) {
+  const q = new URLSearchParams({ output_path: outputPath });
+  return req<{ versions: VersionInfo[] }>(port, `/api/versions?${q}`);
+}
+
+export function restoreVersion(port: number, outputPath: string, versionId: string) {
+  return req<{ restored: string; snapshot_before_restore: string | null }>(
+    port, '/api/versions/restore', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ output_path: outputPath, version_id: versionId }),
+  });
+}
+
+export function clearOutput(port: number, outputPath: string) {
+  return req<{ status: string; removed: string[] }>(port, '/api/output/clear', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ output_path: outputPath }),
+  });
+}
+
+export function inspectOutput(port: number, outputPath: string) {
+  const q = new URLSearchParams({ output_path: outputPath });
+  return req<any>(port, `/api/output/inspect?${q}`);
+}
+
+/** 探测服务端真实上下文窗口，并与用户配置值对比（仅自检，不影响能否启动）。 */
+export async function probeContext(port: number, apiUrl: string, model: string,
+                                   configured: number, apiKey = '') {
+  const q = new URLSearchParams({
+    api_url: apiUrl, model, api_key: apiKey, configured: String(configured),
+  });
+  const res = await fetch(`http://127.0.0.1:${port}/api/system/context_probe?${q}`);
+  const body = await res.json().catch(() => null);
+  if (!res.ok || !body) throw new Error(`上下文探测失败：HTTP ${res.status}`);
+  return body as ContextProbeResult;
 }

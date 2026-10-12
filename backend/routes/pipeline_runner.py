@@ -29,6 +29,7 @@ async def run_pipeline(req, run_id: str):
         # v8.8：run_start 不携带 total_chapters（phase0 前尚不知道），由 phase0_done 携带
         sse_emit("run_start", {"run_id": run_id, "input_mode": req.input_mode, "resumed": progress["resumed"]}, run_id)
         logger.info(f"[run_pipeline] progress phase={progress['current_phase']} resumed={progress['resumed']}")
+        _history_record(progress_path, progress)   # 任务历史：起跑即登记
 
         await phase0_split(req, progress, progress_path, run_id)
         if state.stop_requested: raise asyncio.CancelledError()
@@ -71,35 +72,35 @@ async def run_pipeline(req, run_id: str):
     except FatalAPIError as e:
         logger.error(f"[run_pipeline] FatalAPIError kind={e.kind} code={e.code} msg={e.message[:200]}")
         sse_emit("error", {"kind": e.kind, "code": str(e.code), "message": e.message}, run_id)
-        await log_error(progress_path, e)
+        await log_error(progress_path, e, progress)
     except EmptyContentError as e:
         logger.error(f"[run_pipeline] EmptyContentError msg={str(e)[:200]}")
         sse_emit("error", {"kind": "empty_content", "code": "empty", "message": str(e)}, run_id)
-        await log_error(progress_path, e)
+        await log_error(progress_path, e, progress)
     except RateLimitError as e:
         logger.error(f"[run_pipeline] 429 限流重试用尽 retry_after={e.retry_after}")
         sse_emit("error", {"kind": "rate_limit", "code": 429,
             "message": f"API 持续限流（429），请稍后再试或降低并发。"}, run_id)
-        await log_error(progress_path, e)
+        await log_error(progress_path, e, progress)
     except RetryableBusinessError as e:
         # v8.8 修正：重试后用尽的业务格式错误，保留进度以便下次恢复
         logger.error(f"[run_pipeline] RetryableBusinessError 重试用尽 msg={str(e)[:300]}")
         sse_emit("error", {"kind": "business", "code": "retry_exhausted", "message": str(e)[:500]}, run_id)
-        await log_error(progress_path, e)
+        await log_error(progress_path, e, progress)
     except state.GateReadError as e:
         # 闸门回读失败：进度仍停在闸门处、用户选择仍写在 progress.json 里，
         # 重新开始会原样恢复该弹窗。所以必须说清「可恢复」，而不是抛一句文件系统错误。
         logger.error(f"[run_pipeline] 闸门回读失败 run_id={run_id}: {e}")
         sse_emit("error", {"kind": "gate_read_failed", "code": "progress_unreadable",
                            "message": str(e)}, run_id)
-        await log_error(progress_path, e)
+        await log_error(progress_path, e, progress)
     except asyncio.CancelledError:
         logger.info(f"[run_pipeline] 已停止 run_id={run_id}")
         sse_emit("stopped", {"incomplete": True}, run_id)
     except Exception as e:
         logger.exception(f"[run_pipeline] 未捕获异常 run_id={run_id}")
         sse_emit("error", {"kind": "unknown", "code": "exception", "message": str(e)[:500]}, run_id)
-        await log_error(progress_path, e)
+        await log_error(progress_path, e, progress)
     finally:
         hb.cancel()
         # 只清理「自己」持有的全局状态。
@@ -121,13 +122,18 @@ async def run_pipeline(req, run_id: str):
                 async with state.progress_lock:
                     atomic_write_json(progress_path, progress)
                 logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
+                # 任务历史：终态（完成/失败/中止）刷新一次，保证历史列表显示最新批次进度
+                _history_record(progress_path, progress)
             except Exception:
                 logger.exception("[run_pipeline] finally 写 progress.json 失败")
 
 
 async def _heartbeat_loop(progress_path: Path, interval: float = 15.0):
-    """后台心跳：整个 run 期间（含 LLM 调用）刷新 last_heartbeat。
+    """后台心跳：整个 run 期间（含 LLM 调用）刷新 last_heartbeat + 任务历史。
     只改这一个键，不碰其它进度字段，避免与各阶段的写盘互相覆盖。
+
+    顺带把批次进度同步进历史注册表（复用已读到的 progress，不额外读盘）：
+    这样应用崩了/被关掉后，任务历史里仍能看到「上次跑到第几批」。
 
     间隔 15s + 紧凑写 + 不 fsync：progress.json 在缝合阶段可能因锚点内嵌全文而
     达到数十 MB，用 indent=2 + fsync 每 10s 全量重写会在事件循环上造成数十毫秒停顿，
@@ -142,49 +148,126 @@ async def _heartbeat_loop(progress_path: Path, interval: float = 15.0):
                 progress = json.loads(progress_path.read_text(encoding='utf-8'))
                 progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 atomic_write_json(progress_path, progress, pretty=False)
+                _history_record(progress_path, progress)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.warning(f"[heartbeat] 写入失败（忽略）: {e}")
 
+
+def _history_record(progress_path: Path, progress: dict) -> None:
+    """把当前进度同步进任务历史注册表（失败绝不影响流水线）。"""
+    try:
+        from routes.history import record_progress
+        record_progress(progress_path, progress)
+    except Exception as e:
+        logger.warning(f"[history] 记录失败（忽略）: {e}")
+
+def _config_drift(existing: dict, req) -> list[str]:
+    """续跑时配置是否与上次不同。返回人类可读的差异描述（空列表=一致）。
+
+    必须提示而不是静默沿用：前几批是用旧模型/旧窗口生成的，后几批用新配置，
+    会出现「同一本书前后风格/精度不一致」，而用户完全不知情。
+    """
+    old = (existing.get("api_config") or {})
+    diffs = []
+    for key, cur, label in (
+        ("model", req.model, "模型"),
+        ("api_url", req.api_url, "API 地址"),
+        ("context_window", req.context_window, "上下文窗口"),
+    ):
+        prev = old.get(key)
+        if prev is not None and str(prev) != str(cur):
+            diffs.append(f"{label}：{prev} → {cur}")
+    if existing.get("input_path") and req.input_path and \
+            str(existing["input_path"]) != str(req.input_path):
+        diffs.append(f"输入路径已变更（{existing['input_path']} → {req.input_path}）")
+    return diffs
+
+
 def _load_or_init_progress(req, run_id, progress_path):
-    """v8.8 新增：存在未完成 progress 则恢复，否则新建。"""
-    if progress_path.exists():
-        try:
-            existing = json.loads(progress_path.read_text(encoding='utf-8'))
-            if existing.get('current_phase') and existing.get('current_phase') != 'phase4':
-                # 恢复：更新 run_id（匹配本次 SSE），保持工作产物
-                existing['run_id'] = run_id
-                existing['pipeline_running'] = True
-                existing['resumed'] = True
-                logger.info(f"[run_pipeline] 恢复进度 phase={existing['current_phase']}")
-                return existing
-        except Exception:
-            pass
+    """存在未完成 progress 则恢复，否则新建。
+
+    **读失败绝不能当成"没有进度"**：原本 `except Exception: pass` 会让一次偶发读
+    失败（文件被占用 / 杀软扫描 / 崩溃半截文件）直接重建并覆盖用户的进度，
+    表现为"重开像什么都没保存"。现在读不了就明确报错并停下，交由用户处理。
+    """
+    from utils.progress_io import ProgressUnreadable, try_read_progress
+    try:
+        existing = try_read_progress(progress_path)
+    except ProgressUnreadable as e:
+        raise RuntimeError(str(e)) from e
+    if existing is not None:
+        if existing.get('current_phase') and existing.get('current_phase') != 'phase4':
+            # 恢复：更新 run_id（匹配本次 SSE），保持工作产物
+            existing['run_id'] = run_id
+            existing['pipeline_running'] = True
+            existing['resumed'] = True
+            drifts = _config_drift(existing, req)
+            if drifts:
+                # 记进 progress 供界面展示；不阻断（用户可能是有意换的）
+                existing.setdefault('config_drift', drifts)
+                logger.warning(f"[run_pipeline] 续跑配置与上次不一致：{drifts}")
+            logger.info(f"[run_pipeline] 恢复进度 phase={existing['current_phase']}")
+            return existing
     progress = init_progress(req, run_id)
     progress["resumed"] = False
     return progress
 
 async def wait_split_confirm(req, progress, progress_path, run_id):
-    """P0.3 可选拆书预览门：默认关闭（review_split=False）直接放行，保持旧行为。
-    开启时 phase0 后暂停，推送章节预览并等待用户确认后再进 phase1。"""
-    if not getattr(req, "review_split", False):
+    """拆书预览门。
+
+    触发条件（任一）：用户显式开启 review_split；或 phase0 的识别置信度不为高
+    （未识别到章节 / 用了 AI 兜底 / 章节长度极不均匀等）—— 这种事**必须**让用户
+    先看到拆分结果，否则错了要等整本书重跑完才发现。
+
+    在门内支持「按自定义标记重新拆分」：规则和 AI 都搞不定的创新排版，
+    用户可以粘贴真实的标题行，原地重拆并重新预览，直到确认。
+    """
+    det = progress.get('chapter_detection') or {}
+    if not (getattr(req, "review_split", False) or det.get("needs_review")):
         return
+
+    def _push_preview():
+        chapters = [
+            {k: c.get(k) for k in ("id", "filename", "title", "is_empty", "is_virtual")}
+            for c in progress.get('chapters', [])
+        ]
+        # 先 clear 再推送：闸门必须先「上膛」再让用户看到弹窗，否则用户在
+        # SSE→HTTP 往返的几毫秒内点确认，动作会被紧随的 clear() 抹掉，流水线永久卡死。
+        state.split_confirm.clear()
+        state.split_redo.clear()
+        sse_emit("split_ready", {"chapters": chapters, "detection": det}, run_id)
+
     progress['current_phase'] = 'phase0_confirm'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
-    chapters = [
-        {k: c.get(k) for k in ("id", "filename", "is_empty", "is_virtual")}
-        for c in progress['chapters']
-    ]
-    # 先 clear 再推送：闸门必须先「上膛」再让用户看到弹窗，否则用户在
-    # SSE→HTTP 往返的几毫秒内点确认，动作会被紧随的 clear() 抹掉，流水线永久卡死。
-    state.split_confirm.clear()
-    sse_emit("split_ready", {"chapters": chapters}, run_id)
-    logger.info(f"[P0.3] 拆书预览等待确认 run_id={run_id}")
-    while not state.split_confirm.is_set():
-        if state.stop_requested: raise asyncio.CancelledError()
-        await asyncio.sleep(1.0)
+    logger.info(f"[phase0] 拆书预览等待确认 run_id={run_id}（{det.get('reason') or det.get('mode')}）")
+
+    while True:
+        _push_preview()
+        while not state.split_confirm.is_set() and not state.split_redo.is_set():
+            if state.stop_requested: raise asyncio.CancelledError()
+            await asyncio.sleep(0.5)
+        if state.split_confirm.is_set():
+            break
+        # 用户要求按自定义标记重新拆分：原地重拆后重新预览（不退出本门）
+        markers = list(state.split_redo_markers or [])
+        req.chapter_markers = markers
+        try:
+            from core.splitter import resplit_single_file
+            await resplit_single_file(req, progress, progress_path, run_id)
+            det = progress.get('chapter_detection') or det
+            sse_emit("split_ready", {"chapters": [
+                {k: c.get(k) for k in ("id", "filename", "title", "is_empty", "is_virtual")}
+                for c in progress.get('chapters', [])], "detection": det, "redone": True}, run_id)
+            logger.info(f"[phase0] 已按自定义标记重拆：{len(progress.get('chapters', []))} 章")
+        except Exception as e:
+            # 重拆失败不终止整轮：报错后继续停在本门，让用户改标记再试
+            logger.warning(f"[phase0] 重新拆分失败: {str(e)[:200]}")
+            sse_emit("error", {"kind": "warning", "code": "split_redo_failed",
+                               "message": str(e)[:300]}, run_id)
+
     progress['current_phase'] = 'phase1'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
@@ -275,23 +358,32 @@ def init_progress(req, run_id):
         "pipeline_running": True, "last_heartbeat": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
-async def log_error(progress_path: Path, error):
-    """追加一条错误到 progress.json。
+async def log_error(progress_path: Path, error, progress: dict | None = None):
+    """追加一条错误到 progress.json（并同步到内存 progress）。
 
     必须与 _heartbeat_loop 共用 progress_lock：不加锁时会出现
     「心跳读到旧值 → log_error 读改写 → 心跳把旧值写回」把 error_logs 抹掉，
     刷新页面后就再也看不到失败原因。
+
+    **必须同时写内存 progress**：run_pipeline 的 finally 会拿内存 progress 整份覆盖
+    磁盘（写 pipeline_running/finished_at）。若只写磁盘，那条错误会被紧随其后的
+    覆盖抹掉 —— 用户只看到「失败了」却看不到原因，刷新后更是彻底消失。
     """
+    entry = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "kind": getattr(error, "kind", "unknown"),
+        "code": str(getattr(error, "code", "unknown")),
+        "message": str(error)[:500],
+    }
+    if progress is not None:
+        progress.setdefault("error_logs", []).append(entry)
+        progress["error_logs"] = progress["error_logs"][-100:]
     try:
         async with state.progress_lock:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
-            progress.setdefault("error_logs", []).append({
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "kind": getattr(error, "kind", "unknown"),
-                "code": str(getattr(error, "code", "unknown")),
-                "message": str(error)[:500],
-            })
-            progress["error_logs"] = progress["error_logs"][-100:]
-            atomic_write_json(progress_path, progress)
+            from utils.progress_io import read_progress
+            disk = read_progress(progress_path)
+            disk.setdefault("error_logs", []).append(entry)
+            disk["error_logs"] = disk["error_logs"][-100:]
+            atomic_write_json(progress_path, disk)
     except Exception:
         pass

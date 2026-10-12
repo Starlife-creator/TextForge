@@ -21,7 +21,7 @@ async def status(output_path: str | None = None):
         return {"pipeline_running": state.pipeline_running, "paused": paused,
                 "run_id": state.current_run_id, "has_progress": False}
     try:
-        progress = json.loads(progress_path.read_text(encoding='utf-8'))
+        progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))  # utf-8-sig: 容忍 BOM
     except (json.JSONDecodeError, OSError) as e:
         return {"pipeline_running": state.pipeline_running, "paused": paused,
                 "has_progress": True, "progress_error": f"progress.json 无法读取: {e}"}
@@ -41,6 +41,10 @@ async def status(output_path: str | None = None):
         "current_phase": progress.get("current_phase"),
         "novel_name": progress.get("novel_name"),
         "total_chapters": len(progress.get("chapters", [])),
+        # 拆章方式/置信度：界面据此提示「是否按预期拆分」，低置信时引导人工确认
+        "chapter_detection": progress.get("chapter_detection"),
+        # 续跑时配置与上次不一致（模型/API/上下文/输入路径），前端提示以免风格割裂
+        "config_drift": progress.get("config_drift") or [],
         "total_logic_chapters": len(logic_ids),
         "reconstructed_chapters": reconstructed,
         "resumed": progress.get("resumed", False),
@@ -108,7 +112,7 @@ def _build_resume(progress, target):
     if phase == "phase0_confirm":
         # 拆书预览：与 split_ready 推送的字段保持一致
         return {"key": "split",
-                "chapters": [{k: c.get(k) for k in ("id", "filename", "is_empty", "is_virtual")}
+                "chapters": [{k: c.get(k) for k in ("id", "filename", "title", "is_empty", "is_virtual")}
                              for c in progress.get("chapters", [])]}
     if phase == "phase1_fixreview":
         djson = progress.get("diagnose_json")
@@ -164,7 +168,7 @@ def _chapter_summary(progress, target) -> list:
         recon = (Path(target) / "02_workspace/reconstructed" / f"chapter_{out_id}.txt").exists()
         rows.append({
             "id": out_id,
-            "label": ch.get("filename") or str(out_id),
+            "label": ch.get("title") or ch.get("filename") or str(out_id),
             "status": "reconstructed" if recon else "pending",
         })
     return rows

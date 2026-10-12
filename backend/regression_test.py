@@ -304,12 +304,34 @@ big.parent.mkdir(parents=True, exist_ok=True)
 big.write_text("字" * 9000, encoding="utf-8")
 chs = [{"id": "1", "filename": "第1章.txt", "split_file": "split/1.txt"}]
 try:
-    b = _load_batches(chs, over_dir, batch_limit=4000)
+    b = _load_batches(chs, over_dir, body_token_limit=4000)
     check("超长章组放行而非硬失败（不误杀可用配置）", b == [["1"]], str(b))
 except RuntimeError as e:
     check("超长章组放行而非硬失败（不误杀可用配置）", False, str(e))
 _log = caplog_text()
 check("超长章组仍有告警", "超过单批上限" in _log, _log[:160])
+
+# ---------- 14b. token 预算：必须扣脚手架，且中文按 1 字≈1 token ----------
+from utils.tokens import estimate_tokens
+from core.budget import body_token_budget, output_token_reserve, blueprint_token_allowance
+
+_ctx = 16384
+_b = body_token_budget(_ctx, author_style="冷峻克制")
+check("正文预算为正且小于上下文", 0 < _b < _ctx, str(_b))
+# 关键回归：正文 + 脚手架 + 输出预留 不得越过上下文
+_scaffold = blueprint_token_allowance(_ctx) + 600 + estimate_tokens("冷峻克制")
+check("正文+脚手架+输出预留 ≤ 上下文",
+      _scaffold + _b + output_token_reserve(_b) <= _ctx,
+      f"scaffold={_scaffold} body={_b} out={output_token_reserve(_b)}")
+# 旧模型直接对「字号上限」发请求；这里验证：上下文越小，正文预算越小（自适应）
+check("上下文越小正文预算越小",
+      body_token_budget(8000) < body_token_budget(65536),
+      f"{body_token_budget(8000)} vs {body_token_budget(65536)}")
+# 已知蓝图时按实测扣减：蓝图越长，正文预算越小
+check("蓝图越长正文预算越小",
+      body_token_budget(_ctx, blueprint_text="蓝" * 4000) < body_token_budget(_ctx, blueprint_text="蓝" * 500))
+# 下限保护：极小上下文也不会算出 0/负数
+check("极小上下文仍有正预算", body_token_budget(100) >= 200, str(body_token_budget(100)))
 
 # ---------- 15. 日志 offset 语义 ----------
 # 注意：绝不能用 os.environ["APPDATA"] 定位日志路径 —— Windows 上它总是有值，
@@ -332,6 +354,538 @@ check("logs offset 越界不炸", beyond["lines"] == [] and beyond["offset"] == 
 
 for d in (tmp, _logdir):
     shutil.rmtree(d, ignore_errors=True)
+
+# ---------- 分隔符契约：提示词必须写明章数，且重试必须带纠正信息 ----------
+from core.refactor import _build_refactor_prompt, _common_tail, _break_feedback
+
+_p4 = _build_refactor_prompt("full_rewrite", "BP", "风格", "正文", n_chapters=4)
+check("提示词写明本批共 4 章", "共 **4 章**" in _p4, _p4[-400:])
+check("提示词写明需要 3 个分隔符", "**3 个**" in _p4, _p4[-400:])
+check("提示词要求保留原章节标题", "原样保留在正文里" in _p4)
+_p1 = _build_refactor_prompt("full_rewrite", "BP", "风格", "正文", n_chapters=1)
+check("单章提示词明确禁止输出分隔符", "不要输出 `===CHAPTER_BREAK===`" in _p1, _p1[-300:])
+for _m in ("fidelity", "fix_gaps", "reskin"):
+    _pk = _build_refactor_prompt(_m, "BP", "风格", "正文", n_chapters=5)
+    check(f"{_m} 档位也写明章数与分隔符数", "共 **5 章**" in _pk and "**4 个**" in _pk)
+
+_exc = ChapterBreakMissingError(
+    "重构输出 ===CHAPTER_BREAK=== 数量不符：需要 3 个，实际 5 个（切出 6 段，期望 4 段）。请重试。")
+_pl = {"model": "m", "temperature": 0.8,
+       "messages": [{"role": "user", "content": "原始提示词"}]}
+_break_feedback(4)(_pl, _exc)
+check("重试注入了纠正提示", len(_pl["messages"]) == 2, str(len(_pl["messages"])))
+_fb = _pl["messages"][-1]["content"]
+check("纠正提示指出需要的个数", "只需要 3 个" in _fb, _fb[:160])
+check("纠正提示指出多了几个", "多了 2 个" in _fb, _fb[:160])
+check("纠正提示给出方向（删除）", "删除多余" in _fb, _fb[:160])
+check("纠正提示提醒保留原标题", "原样保留在正文里" in _fb, _fb[:200])
+check("纠错轮降低了温度", _pl["temperature"] == 0.5, str(_pl["temperature"]))
+check("原始提示词未被破坏", _pl["messages"][0]["content"] == "原始提示词")
+
+_pl2 = {"model": "m", "temperature": 0.3, "messages": [{"role": "user", "content": "p"}]}
+_break_feedback(4)(_pl2, ChapterBreakMissingError("需要 3 个，实际 1 个"))
+check("补齐方向的纠正提示", "补上缺少的 2 个" in _pl2["messages"][-1]["content"],
+      _pl2["messages"][-1]["content"][:160])
+check("低温时纠错轮不再升高", _pl2["temperature"] == 0.3, str(_pl2["temperature"]))
+
+# validate 钩子必须真的把「解析」包进重试循环。
+# 历史缺陷：拆分发生在 call_with_retry **之后**，ChapterBreakMissingError
+# 进不了 except 分支 → 分隔符数量错一次就直接整批报废，从不重试。
+import core.api_client as AC
+
+_calls = {"n": 0}
+_real_stream = AC._stream_call
+
+
+async def _fake_stream(client, api_url, payload, sse_emit_fn, run_id):
+    _calls["n"] += 1
+    # 3 章 → 正常需 2 个分隔符。首次返回 3 个（中间多一段），第二次收敛为 2 个。
+    if _calls["n"] == 1:
+        return ("A\n\n===CHAPTER_BREAK===\n\nB\n\n===CHAPTER_BREAK===\n\n多出来的段\n\n===CHAPTER_BREAK===\n\nC",
+                {"total_tokens": 1})
+    return ("A\n\n===CHAPTER_BREAK===\n\nB\n\n===CHAPTER_BREAK===\n\nC", {"total_tokens": 1})
+
+
+AC._stream_call = _fake_stream
+_fired = []
+_pl3 = {"model": "m", "temperature": 0.8, "messages": [{"role": "user", "content": "p"}]}
+_res = asyncio.run(AC.call_with_retry(
+    None, "http://x", _pl3, None, "run",
+    on_retry=_break_feedback(2),
+    validate=lambda t: _split_refactored_by_chapters(t, ["a.txt", "b.txt", "c.txt"])))
+check("validate 失败会触发重试", _calls["n"] == 2, f"调用 {_calls['n']} 次")
+check("重试后拿到合规结果", _res[0] == "A\n\n===CHAPTER_BREAK===\n\nB\n\n===CHAPTER_BREAK===\n\nC", repr(_res[0][:60]))
+check("重试期间注入了纠正提示", len(_pl3["messages"]) == 2, str(len(_pl3["messages"])))
+
+# validate 连续失败 → 抛出契约错误，不静默放行
+_calls["n"] = 0
+
+
+async def _bad2(client, api_url, payload, sse_emit_fn, run_id):
+    _calls["n"] += 1
+    return "总共零个分隔符但硬塞了四段内容在这里", {"total_tokens": 1}
+
+
+AC._stream_call = _bad2
+try:
+    asyncio.run(AC.call_with_retry(
+        None, "http://x", {"messages": []}, None, "run",
+        validate=lambda t: _split_refactored_by_chapters(t, ["a.txt", "b.txt"])))
+    check("validate 持续失败时报错", False, "未抛异常")
+except ChapterBreakMissingError:
+    check("validate 持续失败时报错", True)
+check("契约错误最多重试 1 次后放弃", _calls["n"] == 2, f"调用 {_calls['n']} 次")
+
+AC._stream_call = _real_stream
+
+# ---------- 章节识别：9 种真实排版必须命中，正文提及不得误报 ----------
+from core.splitter import detect_chapters, CHAPTER_PATTERN
+
+_CN = ['一', '二', '三', '四']
+_detect_cases = {
+    "行首标准":        "\n".join(f"第{n}章 初入江湖" for n in _CN),
+    "全角空格缩进":    "\n".join(f"\u3000\u3000第{n}章 初入" for n in _CN),
+    "半角空格缩进":    "\n".join(f"  第{n}章 初入" for n in _CN),
+    "Tab 缩进":        "\n".join(f"\t第{n}章 初入" for n in _CN),
+    "全角数字":        "\n".join(f"第{n}章 初入" for n in ["\uff11", "\uff12", "\uff13", "\uff14"]),
+    "廿卅异体数字":    "\n".join(f"第{n}章 初入" for n in ["廿一", "廿二", "廿三", "廿四"]),
+    "标点同段分隔":    "".join(f"第{n}章初入江湖。" for n in _CN),
+    "引号「」":        "\n".join(f"\u300c第{n}章\u300d初入" for n in _CN),
+    "方头括号【】":    "\n".join(f"\u3010第{n}章\u3011初入" for n in _CN),
+    "全角括号（）":    "\n".join(f"\uff08第{n}章\uff09初入" for n in _CN),
+    "半角括号()":      "\n".join(f"(第{n}章)初入" for n in _CN),
+    "数字与单位夹空格": "\n".join(f"第 {n} 章 初入" for n in _CN),
+    "多空格":          "\n".join(f"第  {n}  章 初入" for n in _CN),
+    "无标题":          "\n".join(f"第{n}章" for n in _CN),
+    "===装饰线===":    "\n".join(f"===第{n}章===" for n in _CN),
+    "***装饰线***":    "\n".join(f"***第{n}章***" for n in _CN),
+    "### 井号标题":    "\n".join(f"### 第{n}章" for n in _CN),
+    "──破折线──":     "\n".join(f"\u2500\u2500第{n}章\u2500\u2500" for n in _CN),
+    "破折号分隔":      "\n".join(f"第{n}章——初入" for n in _CN),
+    "无分隔紧接":      "\n".join(f"第{n}章初入" for n in _CN),
+    "回卷篇折多单位":  "\n".join(f"第{n}{u} 初入" for n, u in zip(_CN, ["回", "卷", "篇", "折"])),
+    "英文 Chapter":    "\n".join(f"Chapter {i} Title" for i in range(1, 5)),
+}
+for _name, _text in _detect_cases.items():
+    _ms, _mode = detect_chapters(_text)
+    check(f"章节识别·{_name}（{_mode}）", len(_ms) == 4, f"命中 {len(_ms)} 个")
+
+# 分卷同号：第一卷/第二卷 下各有一个「第一章」——**不能**被去重折叠（会在丢章）
+_vol = ("第一卷 风起\n第一章 初入\n第二章 再入\n"
+        "第二卷 云涌\n第一章 归来\n第二章 重逢\n")
+_ms, _mode = detect_chapters(_vol)
+check("分卷同号不折叠（6 章）", len(_ms) == 6 and _mode == "cjk-line",
+      f"{len(_ms)} mode={_mode}")
+# 分卷+章号写在同一行：「第1卷 第1章」整体算一个标题
+_vol2 = "\n".join(f"第{v}卷 第{c}章 初入" for v, c in [("一", "一"), ("一", "二"), ("二", "一"), ("二", "二")])
+check("同行分卷+章号识别为 4 章", len(detect_chapters(_vol2)[0]) == 4,
+      str(len(detect_chapters(_vol2)[0])))
+
+# 正文里提及「第X章」不得被当成标题（行首优先）
+_noise_cases = [
+    "他翻开第一章，读到第三页便睡着了。",
+    "本书分为第一卷与第二卷两部分内容。",
+    "所谓的第三节运动会已经过去了。",
+    "这是第一章节拍子，并非章节标题。",
+    "章节一共三十七节，每节三千字左右。",
+    "我见过第二章 写的这段话，但这不是标题。",
+    "他们聊起第五回 合区的旧事。",
+    "按第二卷 的设定，这里应当有转折。",
+]
+for _t in _noise_cases:
+    _ms, _ = detect_chapters(_t)
+    check(f"正文提及不误报：{_t[:14]}…", len(_ms) == 0, f"误报 {len(_ms)} 个")
+
+# 行中提及 + 行首真标题混排：只能认出真标题
+_mixed = ("他翻开第一章，读到第三页便睡着了。\n"
+          "第一章 初入江湖\n正文……\n"
+          "他又想起第二章 的伏笔。\n"
+          "第二章 再入风尘\n正文……\n")
+_ms, _mode = detect_chapters(_mixed)
+check("正文提及与真标题混排只认真标题", len(_ms) == 2 and _mode.endswith("-line"),
+      f"命中 {len(_ms)} mode={_mode}")
+
+# 宽松模式（整本无换行）仍按文本去重：同一行重复的「第X章」提及只算一次
+_loose = "第一章初入江湖。第二章初入江湖。第三章初入江湖。"
+check("无换行时按文本去重", len(detect_chapters(_loose)[0]) == 3,
+      str(len(detect_chapters(_loose)[0])))
+
+# 识别不出时返回 none，调用方据此显式告警（不再静默兜底）
+_ms, _mode = detect_chapters("这是一段没有任何章节标题的连续文本，只有正文内容。")
+check("无标题文本返回 none", _ms == [] and _mode == "none", _mode)
+
+# ---------- 特殊章节名（无编号）也要能单独识别 ----------
+_special = {
+    "编号+尾声+番外": ("第一章 初\n正文\n第二章 再\n正文\n尾声\n正文\n番外一\n正文\n番外二\n正文\n", 5),
+    "楔子+编号+尾声": ("楔子\n正文\n第一章 初\n正文\n尾声\n正文\n", 3),
+    "纯特殊名":       ("楔子\n正文\n正文\n尾声\n正文\n", 2),
+}
+for _name, (_t, _exp) in _special.items():
+    _ms, _mode = detect_chapters(_t)
+    check(f"特殊章节名·{_name}", len(_ms) == _exp and _mode.endswith("-line"),
+          f"命中 {len(_ms)}/{_exp} mode={_mode}")
+# 「序幕布」这类含特殊名的普通词不得被当标题
+check("含特殊名的普通词不误报", len(detect_chapters("序幕布在舞台上缓缓拉开。\n")[0]) == 0,
+      str(len(detect_chapters("序幕布在舞台上缓缓拉开。\n")[0])))
+
+# ---------- AI 辅助拆章：候选行 / 置信度 / 锚点切割 / 人工标记 ----------
+from core.chapter_ai import (extract_candidate_lines, assess_confidence,
+                             split_by_line_anchors, split_by_markers)
+
+_ai_book = ("楔子\n楔子正文，交代背景。\n\n"
+            "风起于青萍之末\n这一章没有编号。\n正文继续。\n\n"
+            "第二章 兵临城下\n正文内容。\n\n"
+            "尾声\n一切归于平静。\n")
+_cands = extract_candidate_lines(_ai_book)
+_cand_texts = [s for _, s in _cands]
+check("候选行包含无编号标题", "风起于青萍之末" in _cand_texts, str(_cand_texts))
+check("候选行包含编号/特殊名", "楔子" in _cand_texts and "尾声" in _cand_texts, str(_cand_texts))
+check("候选行排除长正文", all(len(s) <= 48 for s in _cand_texts), str(_cand_texts))
+
+# 置信度：无标题 / 长度极不均匀 → low；正常 → high
+_ms0, _ = detect_chapters("只有正文，没有标题。")
+check("无标题→低置信", assess_confidence("只有正文，没有标题。", _ms0, "none")["level"] == "low")
+_long = "第一章 初\n" + "字" * 30000 + "\n第二章 再\n短\n"
+_msL, _mL = detect_chapters(_long)
+check("章节长度极不均匀→低置信", assess_confidence(_long, _msL, _mL)["level"] == "low",
+      assess_confidence(_long, _msL, _mL)["reason"])
+_normal = "\n".join("第%s章 %s" % (n, "字" * 3000) for n in "一二三四")
+_msN, _mN = detect_chapters(_normal)
+check("正常书→高置信", assess_confidence(_normal, _msN, _mN)["level"] == "high")
+# 编号回退（正文误命中）→ 低置信
+_back = "第一章 初\n" + "字" * 300 + "\n第五章 跳\n" + "字" * 300 + "\n第三章 回\n" + "字" * 300 + "\n"
+_msB, _mB = detect_chapters(_back)
+check("编号非单调→低置信", assess_confidence(_back, _msB, _mB)["level"] == "low",
+      assess_confidence(_back, _msB, _mB)["reason"])
+
+# 锚点切割：首个锚点之前的正文归入「序章」，一字不丢
+_segs = split_by_line_anchors(_ai_book, [1, 4, 8, 11])
+check("锚点切割含序章+3章", len(_segs) == 4, str([t for t, _ in _segs]))
+check("锚点切割不丢正文",
+      all(k in "".join(b for _, b in _segs) for k in ("楔子正文", "风起于青萍之末", "兵临城下", "一切归于平静")),
+      str([t for t, _ in _segs]))
+# 越界/非法行号被忽略，不崩
+check("非法锚点被忽略", split_by_line_anchors(_ai_book, [0, 99999]) == [],
+      str(split_by_line_anchors(_ai_book, [0, 99999])))
+
+# 人工标记：精确匹配（不能用前缀，否则「楔子正文…」会被误当章起点）
+_mseg = split_by_markers(_ai_book, ["楔子", "第二章 兵临城下", "尾声"])
+check("人工标记精确匹配切出 3 段", len(_mseg) == 3, str([t for t, _ in _mseg]))
+check("人工标记不因前缀误切",
+      all("楔子正文" not in t for t, _ in _mseg), str([t for t, _ in _mseg]))
+check("人工标记为空返回空", split_by_markers(_ai_book, []) == [])
+
+# ---------- 输出目录管理：inspect / clear（白名单，绝不误删用户文件）----------
+from routes.output import output_inspect, output_clear, ARTIFACTS
+
+state.pipeline_running = False
+_od = Path(tempfile.mkdtemp(prefix="tf_out_"))
+for _n in ("01_summaries", "02_workspace", "03_final", "_diagnostics", "_versions", "_backup"):
+    (_od / _n).mkdir()
+(_od / "progress.json").write_text(json.dumps({
+    "current_phase": "phase3-1", "novel_name": "测试书",
+    "chapters": [1, 2, 3],
+    "batches": [{"status": "phase3_done"}, {"status": "phase1_done"}],
+    "error_logs": [{"kind": "api_error", "code": "500", "message": "boom-injected"}],
+}, ensure_ascii=False), encoding="utf-8")
+(_od / "Story_Bible.md").write_text("bp", encoding="utf-8")
+(_od / "我的私人笔记.txt").write_text("千万别删我", encoding="utf-8")  # 用户放在同目录的文件
+
+_info = asyncio.run(output_inspect(str(_od)))
+check("inspect 识别为可续跑", _info["resumable"] is True, str(_info))
+check("inspect 报告章节与批次进度",
+      _info["total_chapters"] == 3 and _info["batches_done"] == 1 and _info["batches_total"] == 2,
+      str(_info))
+check("inspect 带出失败原因",
+      bool(_info["error_logs"]) and "boom-injected" in _info["error_logs"][-1]["message"],
+      str(_info["error_logs"]))
+
+_res = asyncio.run(output_clear({"output_path": str(_od)}))
+check("clear 删除自身全部产物", set(ARTIFACTS).issubset(set(_res["removed"])), str(_res))
+check("clear 绝不误删用户的无关文件", (_od / "我的私人笔记.txt").exists(), "用户文件被误删")
+check("clear 后不再可续跑", asyncio.run(output_inspect(str(_od)))["resumable"] is False)
+# 清空不存在的目录不报错
+check("clear 空目录安全",
+      asyncio.run(output_clear({"output_path": str(_od / "nope")}))["status"] == "nothing")
+# 危险目录必须被拒绝（文件系统根 / 主目录 / 桌面）
+from fastapi import HTTPException as _HTTPExc
+for _name, _danger in (("文件系统根", Path(Path.home().anchor)),
+                       ("用户主目录", Path.home())):
+    try:
+        asyncio.run(output_clear({"output_path": str(_danger)}))
+        check(f"clear 拒绝危险目录：{_name}", False, "未拒绝")
+    except _HTTPExc:
+        check(f"clear 拒绝危险目录：{_name}", True)
+# 运行中不可清空
+state.pipeline_running = True
+try:
+    asyncio.run(output_clear({"output_path": str(_od)}))
+    check("运行中拒绝清空", False, "未拒绝")
+except _HTTPExc:
+    check("运行中拒绝清空", True)
+state.pipeline_running = False
+shutil.rmtree(_od, ignore_errors=True)
+
+# 续跑配置漂移检测 ----------
+from routes.pipeline_runner import _config_drift
+
+class _Req:
+    def __init__(s, **kw): s.__dict__.update(kw)
+
+_base = {"api_config": {"model": "m1", "api_url": "http://a/v1/chat/completions",
+                        "context_window": 8000},
+         "input_path": "/in/a.txt"}
+check("配置一致时无漂移", _config_drift(_base, _Req(model="m1", api_url="http://a/v1/chat/completions",
+                                                context_window=8000, input_path="/in/a.txt")) == [])
+_d1 = _config_drift(_base, _Req(model="m2", api_url="http://a/v1/chat/completions",
+                                context_window=8000, input_path="/in/a.txt"))
+check("换模型被检出", len(_d1) == 1 and "模型" in _d1[0], str(_d1))
+_d2 = _config_drift(_base, _Req(model="m1", api_url="http://a/v1/chat/completions",
+                                context_window=32768, input_path="/in/a.txt"))
+check("换上下文窗口被检出", len(_d2) == 1 and "上下文" in _d2[0], str(_d2))
+_d3 = _config_drift(_base, _Req(model="m1", api_url="http://a/v1/chat/completions",
+                                context_window=8000, input_path="/in/b.txt"))
+check("换输入路径被检出", len(_d3) == 1 and "输入" in _d3[0], str(_d3))
+_d4 = _config_drift(_base, _Req(model="m9", api_url="http://b/v1/chat/completions",
+                                context_window=32768, input_path="/in/b.txt"))
+check("多项漂移全部检出", len(_d4) == 4, str(_d4))
+
+# ---------- 重新拆分必须清掉按旧章节绑定的下游产物 ----------
+# 场景：跑了一半（有批次/重构稿/缝合锚点）→ 用户在预览门改用自定义标记重拆。
+# 若不清，下游会拿着旧章节 id 去改新章节文件（缝合错位）。
+import core.splitter as _sp
+from core.splitter import resplit_single_file
+
+class _FakeReq:
+    input_mode = "single_file"; input_format = "txt"
+    def __init__(s, inp, outp):
+        s.input_path = inp; s.output_path = outp
+        s.context_window = 8000; s.chapter_markers = ["◆ 甲 ◆", "◆ 乙 ◆"]
+        s.ai_split = False; s.author_style = ""; s.refactor_mode = "full_rewrite"
+
+_rd = Path(tempfile.mkdtemp(prefix="tf_rs_"))
+(_rd / "in").mkdir(); (_rd / "out").mkdir()
+_src = _rd / "in" / "book.txt"
+_pad = "正文内容，需要足够长以免被判为空章。" * 4
+_src.write_text("开场白。" + _pad + "\n\n◆ 甲 ◆\n" + _pad + "\n\n◆ 乙 ◆\n" + _pad + "\n", encoding="utf-8")
+_out = _rd / "out"
+# 造出「上一次跑到一半」的遗留产物
+(_out / "02_workspace" / "reconstructed").mkdir(parents=True)
+(_out / "02_workspace" / "reconstructed" / "chapter_99.txt").write_text("旧章", encoding="utf-8")
+(_out / "02_workspace" / "snapshots" / "drafts").mkdir(parents=True)
+(_out / "01_summaries").mkdir(parents=True)
+(_out / "01_summaries" / "batch_01.txt").write_text("旧摘要", encoding="utf-8")
+(_out / "03_final").mkdir(parents=True)
+(_out / "03_final" / "成品.docx").write_text("旧成品", encoding="utf-8")
+_prog = {"chapters": [{"id": "99"}], "batches": [{"batch_id": 1, "chapter_ids": ["99"], "status": "phase3_done"}],
+         "completed_files": ["x"], "processed_batches": [1], "cross_batch_virtual": [{"a": 1}],
+         "stitch_anchors": [{"b": 2}], "stitch_virtual_done": ["9"], "stitch_batch_done": ["k"],
+         "virtual_chapter_map": [], "current_phase": "phase0_confirm"}
+_pp = _rd / "out" / "progress.json"
+_pp.write_text(json.dumps(_prog, ensure_ascii=False), encoding="utf-8")
+
+asyncio.run(resplit_single_file(_FakeReq(str(_src), str(_out)), _prog, _pp, "run-test"))
+_pr2 = json.loads(_pp.read_text(encoding="utf-8"))
+check("重拆后章节数正确", len(_prog["chapters"]) == 3, str(len(_prog["chapters"])))
+check("重拆作废旧批次", _prog["batches"] == [], str(_prog["batches"]))
+check("重拆作废已完成文件记录", _prog["completed_files"] == [] and _prog["processed_batches"] == [])
+check("重拆作废缝合锚点/游标",
+      _prog["stitch_anchors"] == [] and _prog["stitch_virtual_done"] == [] and _prog["stitch_batch_done"] == [])
+check("重拆清掉旧重构稿（避免缝合改错文件）",
+      not (_out / "02_workspace" / "reconstructed" / "chapter_99.txt").exists(),
+      "旧 chapter_99.txt 仍在")
+check("重拆清掉旧摘要/快照",
+      not (_out / "01_summaries" / "batch_01.txt").exists()
+      and not (_out / "02_workspace" / "snapshots" / "drafts").exists())
+check("重拆保留上一版成品（03_final 不动）", (_out / "03_final" / "成品.docx").exists())
+shutil.rmtree(_rd, ignore_errors=True)
+
+# ---------- progress.json 读取：BOM 容忍 + 读失败绝不静默重建 ----------
+from utils.progress_io import read_progress, try_read_progress, ProgressUnreadable
+
+_bd = Path(tempfile.mkdtemp(prefix="tf_bom_"))
+_ok = '{"current_phase": "phase3-1", "chapters": [1,2]}'
+(_bd / "plain.json").write_text(_ok, encoding="utf-8")
+(_bd / "bom.json").write_text(_ok, encoding="utf-8-sig")
+(_bd / "broken.json").write_text("{not json", encoding="utf-8")
+check("读取无 BOM 正常", read_progress(_bd / "plain.json")["current_phase"] == "phase3-1")
+check("读取带 BOM 正常（utf-8-sig）", read_progress(_bd / "bom.json")["current_phase"] == "phase3-1")
+check("文件不存在返回 None", try_read_progress(_bd / "none.json") is None)
+try:
+    try_read_progress(_bd / "broken.json")
+    check("损坏文件抛错而非返回空", False, "未抛错")
+except ProgressUnreadable:
+    check("损坏文件抛错而非返回空", True)
+
+# _load_or_init_progress：读失败必须停下，绝不能覆盖用户进度
+from routes.pipeline_runner import _load_or_init_progress as _loadp
+_od2 = Path(tempfile.mkdtemp(prefix="tf_ld_"))
+(_od2 / "progress.json").write_text("{corrupt", encoding="utf-8")
+_before = (_od2 / "progress.json").read_text(encoding="utf-8")
+class _Rq:
+    input_mode = "single_file"; input_path = "x"; output_path = str(_od2)
+    context_window = 8000; model = "m"; api_url = "http://a/v1/chat/completions"
+try:
+    _loadp(_Rq(), "rid", _od2 / "progress.json")
+    check("读失败时拒绝启动（不覆盖进度）", False, "竟然继续了")
+except RuntimeError as e:
+    check("读失败时拒绝启动（不覆盖进度）", "progress.json" in str(e), str(e)[:100])
+check("读失败后原文件未被覆盖", (_od2 / "progress.json").read_text(encoding="utf-8") == _before)
+shutil.rmtree(_bd, ignore_errors=True); shutil.rmtree(_od2, ignore_errors=True)
+
+# ---------- 成品版本：快照 / 列举 / 恢复 / 路径穿越防护 ----------
+from core.versions import snapshot as _snap, list_versions as _lv, restore as _rs
+
+_vd = Path(tempfile.mkdtemp(prefix="tf_ver_"))
+(_vd / "03_final").mkdir()
+(_vd / "03_final" / "book.txt").write_text("v1", encoding="utf-8")
+_v1 = _snap(_vd, "我的书")
+check("成品快照成功", bool(_v1) and (_vd / "_versions" / _v1).is_dir(), str(_v1))
+(_vd / "03_final" / "book.txt").write_text("v2", encoding="utf-8")
+check("空目录不产生快照", _snap(Path(tempfile.mkdtemp()) / "none", "x") is None)
+_v2 = _snap(_vd, "我的书")
+_vl = _lv(_vd)
+check("版本列表按时间倒序", len(_vl) == 2 and _vl[0]["id"] >= _vl[1]["id"], str([v["id"] for v in _vl]))
+_rs(_vd, _v1)
+check("恢复到指定版本", (_vd / "03_final" / "book.txt").read_text(encoding="utf-8") == "v1",
+      (_vd / "03_final" / "book.txt").read_text(encoding="utf-8")[:20])
+check("恢复前先给当前版本留快照（可再回退）", len(_lv(_vd)) == 3, str(len(_lv(_vd))))
+for _bad in ("../../etc", "a/b", "..", ""):
+    try:
+        _rs(_vd, _bad)
+        check(f"拒绝非法版本号 {_bad!r}", False, "被接受")
+    except (ValueError, FileNotFoundError):
+        check(f"拒绝非法版本号 {_bad!r}", True)
+shutil.rmtree(_vd, ignore_errors=True)
+
+# ---------- 任务历史注册表 ----------
+import routes.history as _H
+_real_appdata = os.environ.get("APPDATA")
+_hist_dir = tempfile.mkdtemp(prefix="tf_hreg_")
+os.environ["APPDATA"] = _hist_dir          # 绝不污染开发者真实 %APPDATA%
+try:
+    _H.upsert(r"C:\books\a", {"novel_name": "书A", "current_phase": "phase3-1",
+                              "total_chapters": 10, "batches_done": 3, "batches_total": 4,
+                              "last_error": "炸了"})
+    _H.upsert(r"C:\books\b", {"novel_name": "书B", "finished": True, "current_phase": "phase4"})
+    _items = _H._load()["entries"]
+    check("历史按输出路径登记两条", len(_items) == 2, str(list(_items)))
+    _a = _items[os.path.normcase(os.path.abspath(r"C:\books\a"))]
+    check("历史记录批次进度", _a and _a["batches_done"] == 3 and _a["batches_total"] == 4, str(_a))
+    check("历史记录失败原因", _a and _a.get("last_error") == "炸了", str(_a))
+    # 同一路径再次 upsert 是更新而非新增
+    _H.upsert(r"C:\books\a", {"batches_done": 4, "clear_error": True})
+    _items2 = _H._load()["entries"]
+    _a2 = _items2[os.path.normcase(os.path.abspath(r"C:\books\a"))]
+    check("重复登记为更新不新增", len(_items2) == 2 and _a2["batches_done"] == 4, str(len(_items2)))
+    check("clear_error 清掉旧失败原因", "last_error" not in _a2, str(_a2.get("last_error")))
+finally:
+    if _real_appdata is not None:
+        os.environ["APPDATA"] = _real_appdata
+    shutil.rmtree(_hist_dir, ignore_errors=True)
+
+# ---------- 续跑配置漂移检测 ----------
+
+# ---------- token 估算：CJK 启发式 ----------
+from utils.tokens import estimate_tokens, estimate_messages_tokens
+
+check("空串估算为 0", estimate_tokens("") == 0)
+check("纯中文 1 字≈1 token", estimate_tokens("中文测试") == 4, str(estimate_tokens("中文测试")))
+# 100 个汉字 ≈ 100 token
+_zh100 = "汉" * 100
+check("100 汉字估算≈100", 90 <= estimate_tokens(_zh100) <= 110, str(estimate_tokens(_zh100)))
+# 100 个 ASCII 字母 ≈ 25 token
+_en = "a" * 100
+check("100 英文字母估算≈25", 20 <= estimate_tokens(_en) <= 30, str(estimate_tokens(_en)))
+# 关键回归：中文必须显著高于旧模型（旧模型 1.5 字/token，会低估中文字符）
+check("中文估算不低于字数（旧模型会低估）", estimate_tokens(_zh100) >= 100, str(estimate_tokens(_zh100)))
+_msg = estimate_messages_tokens([{"role": "user", "content": "你好世界"}])
+check("messages 估算含模板开销", _msg >= estimate_tokens("你好世界"), str(_msg))
+
+# ---------- 上下文溢出识别：跨厂商报错文案 ----------
+from core.api_client import parse_context_overflow
+
+_ov_cases = {
+    "LM Studio": ("request (16038 tokens) exceeds the available context size (8448 tokens)", 16038, 8448),
+    "OpenAI":    ("This model's maximum context length is 4096 tokens. However, you requested 5000", 5000, 4096),
+    "Anthropic": ("prompt is too long: 250000 tokens > 200000 maximum", 250000, 200000),
+    "vLLM":      ("This model's maximum context length is 8192 tokens. However, you requested 16038", 16038, 8192),
+    "中文网关":  ("请求上下文超出模型上限 8192", None, 8192),
+}
+for _name, (_txt, _req, _avail) in _ov_cases.items():
+    _r = parse_context_overflow(_txt)
+    check(f"溢出识别·{_name}", _r is not None and _r[1] == _avail, str(_r))
+
+# 非溢出错误不得误判（误判会导致毫无意义的拆批）
+for _name, _txt in {
+    "无效模型": "model gpt-foo not found",
+    "鉴权失败": "Incorrect API key provided",
+    "参数错误": "max_tokens must be positive",
+    "流式字段": "unknown parameter stream_options",
+}.items():
+    check(f"非溢出不误判·{_name}", parse_context_overflow(_txt) is None,
+          str(parse_context_overflow(_txt)))
+
+# ---------- 拆批：对半拆、虚拟章不拆散、拆不动返回 None ----------
+from core.batching import split_batch_in_progress, chapter_groups
+
+def _mk_progress(chapter_ids):
+    chs = [{"id": c, "split_file": f"split/{c}.txt"} for c in chapter_ids]
+    return {"chapters": chs, "batches": [
+        {"batch_id": 1, "chapter_ids": list(chapter_ids), "status": "phase1_done", "output_files": []}]}
+
+_pg = _mk_progress(["1", "2", "3", "4"])
+_pb = _pg["batches"][0]
+_new = split_batch_in_progress(_pg, _pb, reason="overflow", detail="x")
+check("拆批返回两个新批次", _new is not None and len(_new) == 2, str(_new))
+check("拆批后 batches 数变为 2", len(_pg["batches"]) == 2, str(len(_pg["batches"])))
+check("首批 2 章、次批 2 章",
+      len(_new[0]["chapter_ids"]) == 2 and len(_new[1]["chapter_ids"]) == 2,
+      str([b["chapter_ids"] for b in _new]))
+check("拆批记录了自适应上限", _pg.get("adaptive_max_chapters") == 2, str(_pg.get("adaptive_max_chapters")))
+check("原批次已被替换（batch_id=1 不复存在）",
+      all(b["batch_id"] != 1 for b in _pg["batches"]), str([b["batch_id"] for b in _pg["batches"]]))
+
+# 虚拟章（同 original_id）必须留在同一侧，否则缝合还原不回整章
+_vpg = {
+    "chapters": [
+        {"id": "1", "split_file": "split/1.txt"},
+        {"id": "2_0", "split_file": "split/2_0.txt", "is_virtual": True, "original_id": "2"},
+        {"id": "2_1", "split_file": "split/2_1.txt", "is_virtual": True, "original_id": "2"},
+        {"id": "3", "split_file": "split/3.txt"},
+    ],
+    "batches": [{"batch_id": 1, "chapter_ids": ["1", "2_0", "2_1", "3"],
+                 "status": "phase1_done", "output_files": []}],
+}
+_vnew = split_batch_in_progress(_vpg, _vpg["batches"][0], reason="contract")
+_sides = [set(b["chapter_ids"]) for b in _vnew]
+check("虚拟章对不拆散（2_0/2_1 在同一批）",
+      any({"2_0", "2_1"} <= s for s in _sides), str(_sides))
+check("分组函数把虚拟章聚成一组",
+      chapter_groups(_vpg["chapters"], ["1", "2_0", "2_1", "3"]) == [["1"], ["2_0", "2_1"], ["3"]],
+      str(chapter_groups(_vpg["chapters"], ["1", "2_0", "2_1", "3"])))
+
+# 只剩一个不可拆分组 → 返回 None（调用方据此报错而非死循环）
+_sp = _mk_progress(["1"])
+check("单章批次拆不动返回 None",
+      split_batch_in_progress(_sp, _sp["batches"][0], reason="overflow") is None)
+
+# ---------- 上下文窗口探测：URL 归一 + 深度取值 ----------
+from core.context_probe import base_url, _dig
+
+check("base_url 去掉 /v1/chat/completions",
+      base_url("http://127.0.0.1:1234/v1/chat/completions") == "http://127.0.0.1:1234",
+      base_url("http://127.0.0.1:1234/v1/chat/completions"))
+check("base_url 保留端口与 scheme",
+      base_url("https://api.x.com/v1/chat/completions") == "https://api.x.com")
+check("_dig 取 llama.cpp n_ctx",
+      _dig({"default_generation_settings": {"n_ctx": 8192}}) == 8192)
+check("_dig 取 LM Studio max_context_length",
+      _dig({"data": [{"id": "m", "max_context_length": 4096}]}) == 4096)
+check("_dig 取 Ollama model_info",
+      _dig({"model_info": {"llama.context_length": 32768}}) == 32768)
+check("_dig 忽略过小值（噪声）", _dig({"max_tokens": 8}) is None, str(_dig({"max_tokens": 8})))
+
 print()
 if _FAILS:
     print(f"=== {len(_FAILS)} FAILED: {_FAILS}")

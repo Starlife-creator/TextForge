@@ -51,5 +51,12 @@ class StartRequest(BaseModel):
     chapter_snapshots: bool = False
     # P0.3 可选拆书预览门：默认 False（phase0 后直接进 phase1，保持旧行为）
     review_split: bool = False
+    # P0.5 拆章增强：
+    #   ai_split：规则识别置信度低时，允许调用 LLM 从候选行里挑章节边界（默认开）。
+    #     只有低置信才触发，正常小说零额外调用。
+    #   chapter_markers：用户自定义的章节标题行（精确匹配），优先级最高，
+    #     用于规则与 AI 都搞不定的「创新排版」——这是最终兜底手段。
+    ai_split: bool = True
+    chapter_markers: List[str] = Field(default_factory=list)
     # P4.1 分阶段模型：值可为模型名 str，或 dict{model, api_url?, api_key?}（A2 多服务商）
     models: Dict[str, Union[str, Dict[str, str]]] = Field(default_factory=dict)

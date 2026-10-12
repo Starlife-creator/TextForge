@@ -23,10 +23,12 @@ const props = defineProps<{
   apiKey: string;
   proxy: string;
   sslVerify: boolean;
+  contextWindow: number;
 }>();
 const emit = defineEmits<{
   (e: 'close'): void;
   (e: 'apply-model', v: { model: string; apiUrl: string; apiKey: string; proxy: string; sslVerify: boolean }): void;
+  (e: 'apply-context', v: number): void;
   (e: 'reconnect'): void;
 }>();
 
@@ -235,6 +237,18 @@ async function runLlmCheck() {
       proxy: mProxy.value, ssl_verify: mSslVerify.value,
     });
   });
+}
+
+/** 探测到的窗口比用户填的小 —— 这是最容易踩的坑：程序按大窗口切批，模型实际放不下。 */
+const ctxTooLarge = computed(() =>
+  !!llmCheck.value?.ok && !!llmCheck.value.context_limit
+  && props.contextWindow > (llmCheck.value.context_limit as number));
+
+function applyDetectedContext() {
+  const n = llmCheck.value?.context_limit;
+  if (!n) return;
+  emit('apply-context', n);
+  say('ok', `已把「上下文」改为实测值 ${n}`);
 }
 
 function applyModel() {
@@ -455,6 +469,15 @@ onUnmounted(() => {
         <p v-if="llmCheck" class="hint" :class="llmCheck.ok ? 'ok' : 'err'">
           <template v-if="llmCheck.ok">连通正常 · {{ llmCheck.elapsed_ms }}ms · 回包「{{ llmCheck.reply }}」</template>
           <template v-else>失败 · {{ llmCheck.error }}</template>
+        </p>
+        <p v-if="llmCheck?.ok && llmCheck.context_limit" class="hint" :class="ctxTooLarge ? 'err' : 'ok'">
+          实测模型上下文：<b>{{ llmCheck.context_limit }}</b> token
+          <template v-if="llmCheck.context_source">（来源 {{ llmCheck.context_source }}）</template>
+          <template v-if="ctxTooLarge">
+            · 你设置的是 {{ contextWindow }}，比实测大 —— 程序会按实测自动缩小批次，
+            但建议直接改成实测值以获得更准确的批次划分。
+            <button class="ghost" @click="applyDetectedContext">套用 {{ llmCheck.context_limit }}</button>
+          </template>
         </p>
       </div>
 

@@ -10,6 +10,8 @@ pause_event.set()
 blueprint_confirmed = asyncio.Event()      # 蓝图确认
 split_confirm = asyncio.Event()            # P0.3 拆书预览确认（仅内存，不落盘）
 split_confirm.set()
+split_redo = asyncio.Event()               # P0.5 拆书预览里「按自定义标记重新拆分」
+split_redo_markers: list = []              # 随 split_redo 一起传的标记清单
 fix_review_confirm = asyncio.Event()       # fix_gaps 断层勾选确认（仅内存，不落盘）
 fix_review_confirm.set()
 accept_confirm = asyncio.Event()           # 逐章验收确认（仅内存，不落盘）

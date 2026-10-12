@@ -14,6 +14,7 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+BREAK_MARK = "===CHAPTER_BREAK==="
 BACKEND = Path(__file__).parent
 PY = str(BACKEND / "venv" / "Scripts" / "python.exe")
 if sys.platform.startswith("win"):          # CI 上由 CI 环境提供解释器路径
@@ -36,8 +37,13 @@ def post(url, obj=None, method="POST", timeout=120):
     data = json.dumps(obj).encode() if obj is not None else None
     req = urllib.request.Request(url, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read() or b"{}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        # 带上响应体：422 之类的校验错误只有 body 才说得清是哪个字段
+        detail = e.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"{method} {url} → HTTP {e.code}: {detail}") from e
 
 
 def get(url, timeout=30):
@@ -97,6 +103,25 @@ def wait_idle(port, timeout=30):
     return False
 
 
+def start_run(payload, tries=40):
+    """发起一次运行，遇到 409（上一轮尚未完全释放）就重试。
+
+    多场景连跑时，done 事件到达与后端 pipeline_running 复位之间存在毫秒级窗口，
+    固定 sleep 会偶发 409 让整轮全 FAIL —— 轮询重试比 sleep 稳。
+    """
+    last = None
+    for _ in range(tries):
+        try:
+            return post(f"{B}/api/start", payload)
+        except RuntimeError as e:
+            last = e
+            if "409" in str(e):
+                time.sleep(0.5)
+                continue
+            raise
+    raise RuntimeError(f"start 反复 409：{last}")
+
+
 def gate_driver(port, events, seen, enabled=True):
     """消费事件流并自动确认所有人工闸门。
     流水线的几个门是**无限等待**的（while not Event），不驱动就只能停在原地 ——
@@ -106,15 +131,19 @@ def gate_driver(port, events, seen, enabled=True):
     while time.time() - t0 < 300:
         while idx < len(events):
             ev, data = events[idx]; idx += 1
-            if ev in seen:
-                continue
-            seen.add(ev)
-            if not enabled:
-                continue
             try:
                 d = json.loads(data)
             except json.JSONDecodeError:
                 d = {}
+            # 去重键：验收门是**每批一次**的，必须按 batch_id 区分，否则多批次时
+            # 第二个 accept_ready 会被当成重复事件跳过，流水线永远停在验收门。
+            # 其余闸门每轮只出现一次，按事件名去重即可（同时挡住 SSE 重放的重复投递）。
+            key = (ev, d.get("batch_id")) if ev == "accept_ready" else ev
+            if key in seen:
+                continue
+            seen.add(key)
+            if not enabled:
+                continue
             run_id = d.get("run_id")
             try:
                 if ev == "split_ready":
@@ -191,9 +220,22 @@ api = subprocess.Popen([PY, "-m", "uvicorn", "app:app", "--host", "127.0.0.1",
                        cwd=str(BACKEND), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 tmp = Path(tempfile.mkdtemp(prefix="tf_e2e_"))
 try:
-    time.sleep(6)
     B = f"http://127.0.0.1:{API_PORT}"
     L = f"http://127.0.0.1:{LLM_PORT}"
+    # 等两个服务就绪：固定 sleep 在慢机器/端口 TIME_WAIT 时会不够，
+    # 导致健康检查连接被拒（整轮全 FAIL）。改成轮询重试。
+    _up = False
+    for _ in range(60):
+        try:
+            get(f"{B}/api/health", timeout=3)
+            get(f"{L}/v1/models", timeout=3)
+            _up = True
+            break
+        except Exception:
+            time.sleep(0.5)
+    if not _up:
+        err = api.stderr.read().decode("utf-8", "replace") if api.stderr else ""
+        raise RuntimeError(f"后端/ mock 未就绪。api stderr:\n{err[-1500:]}")
     print("mock / health:", get(f"{L}/v1/models")["data"][0]["id"], "|", get(f"{B}/api/health")["status"])
 
     # ---------- 准备输入 ----------
@@ -398,6 +440,323 @@ try:
         dd = _D(str(douts[0]))
         check("docx 成品保留原章节段落结构", len(dd.paragraphs) >= 3,
               f"段落数={len(dd.paragraphs)}")
+
+    # ---------- 场景三：模型多打分隔符，验证重试能自我纠正 ----------
+    # 对应用户实际遇到的报错「需要 3 个，实际 5 个」。
+    # 注入前重试也是**完全相同的 prompt**，模型无从收敛；修复后 on_retry
+    # 把错因喂回去，第二次应当正确收敛。
+    print("\n--- 场景三：分隔符数量不符 → 重试纠正 ---")
+    put(f"{L}/", {"fail": {"phase": None, "times": 0, "status": 500, "body": "", "extra_breaks": 1}})
+    put(f"{L}/", {"reset": True, "log_clear": True})
+    e3in = tmp / "in3"; make_novel(e3in, chapters=4)
+    o3 = tmp / "out3"
+    ev3, th3 = sse_events(API_PORT, 240, stop_on="done")
+    r3 = post(f"{B}/api/start", dict(body, input_path=str(e3in), output_path=str(o3),
+                                      novel_name="分隔符纠正", refactor_gates={},
+                                      compare_output=False, chapter_snapshots=False))
+    seen3 = set()
+    threading.Thread(target=gate_driver, args=(API_PORT, ev3, seen3), daemon=True).start()
+    ok3 = wait_done(ev3, th3)[0]
+    st3 = put(f"{L}/", {})["stats"]
+    for _e in put(f"{L}/", {})["log"]:
+        if _e["phase"] == "refactor":
+            print(f"    mock 重构调用: 消息数={_e['n_msgs']}（1=首发，2=带纠正的重试） 已收到纠正提示={_e['has_fix']}")
+    if not ok3:
+        errs3 = [d for e, d in ev3 if e == "error"]
+        print("  错误:", errs3[-1][:200] if errs3 else [e for e, _ in ev3][-6:])
+    check("多打分隔符时流水线仍能跑完（重试自我纠正）", ok3, str(st3))
+    # 4 章 → 正常需要 3 次调用（1 次错 + 1 次纠正成功）；若重试是盲的就会更多或直接失败
+    check("模型被调用了不止一次（说明确实发生了重试）", st3["refactor"] >= 2, str(st3))
+    o3c = sorted((o3 / "02_workspace" / "reconstructed").glob("chapter_*.txt")) if (o3 / "02_workspace" / "reconstructed").is_dir() else []
+    check("4 章全部产出且逐章独立", len(o3c) == 4, str([p.name for p in o3c]))
+    if o3c:
+        marks = []
+        for p in o3c:
+            t = p.read_text(encoding="utf-8", errors="replace")
+            marks.append(sum(1 for i in range(1, 5) if f"【重构第{i}段·其一】" in t))
+        check("纠正后每章恰好一段（无错位/无重复）", all(n == 1 for n in marks), str(marks))
+        check("纠正后成品不含分隔符残留",
+              all(BREAK_MARK not in p.read_text(encoding="utf-8", errors="replace") for p in o3c))
+    put(f"{L}/", {"fail": {"phase": None, "times": 0, "status": 500, "body": "", "extra_breaks": 0}})
+
+    # ---------- 场景四：上下文超限 → 自动拆批跑完 ----------
+    # 对应用户真实报错：程序以为放得下（context_window 填得大），本地模型其实只有
+    # 8448。要求：不许整轮报废，必须自动对半拆批直到放得下。
+    print("\n--- 场景四：上下文超限 → 自动拆批 ---")
+    put(f"{L}/", {"fail": {"phase": None, "times": 0, "status": 500, "body": "", "extra_breaks": 0}})
+    # 让 mock 只接受 ≤2 章的请求，而应用以为窗口很大（context_window=32768 → 一批全塞）
+    put(f"{L}/", {"reset": True, "log_clear": True, "ctx_limit": {"max_chapters": 2}})
+    e4in = tmp / "in4"; make_novel(e4in, chapters=6)
+    o4 = tmp / "out4"
+    ev4, th4 = sse_events(API_PORT, 300, stop_on="done")
+    r4 = post(f"{B}/api/start", dict(body, input_path=str(e4in), output_path=str(o4),
+                                      context_window=32768, novel_name="上下文超限自愈",
+                                      refactor_gates={}, compare_output=False,
+                                      chapter_snapshots=False))
+    threading.Thread(target=gate_driver, args=(API_PORT, ev4, set()), daemon=True).start()
+    ok4 = wait_done(ev4, th4)[0]
+    st4 = put(f"{L}/", {})["stats"]
+    splits = [d for e, d in ev4 if e == "batch_split"]
+    if not ok4:
+        errs4 = [d for e, d in ev4 if e == "error"]
+        print("  错误:", errs4[-1][:220] if errs4 else [e for e, _ in ev4][-8:])
+    print(f"    超限次数={st4.get('ctx_overflow', 0)} 自动拆批次数={len(splits)}")
+    check("上下文超限时流水线仍能跑完（自动拆批自愈）", ok4, str(st4))
+    check("确实发生了自动拆批", len(splits) >= 1, str(len(splits)))
+    check("服务端确实拒绝过超限请求", st4.get("ctx_overflow", 0) >= 1, str(st4.get("ctx_overflow")))
+    o4c = sorted((o4 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
+    check("拆批后 6 章全部产出", len(o4c) == 6, str([p.name for p in o4c]))
+    # 拆批事件必须带可读原因与批次号（前端要展示给用户）
+    if splits:
+        _d = json.loads(splits[0])
+        check("拆批事件含原因与新批次号",
+              _d.get("reason") == "overflow" and _d.get("new_batches"),
+              str(_d)[:160])
+    put(f"{L}/", {"reset": True, "ctx_limit": {"max_chapters": 0}})
+
+    # ---------- 场景五：单文件章节识别 + 上下文窗口探测 ----------
+    # 一个缩进风格、带序章、混入正文提及「第X章」的单文件，必须精确拆出 4 章 + 序章，
+    # 且正文提及不得被误判成章节。
+    print("\n--- 场景五：单文件章节识别（缩进/序章/正文提及）---")
+    e5in = tmp / "in5"; e5in.mkdir(parents=True, exist_ok=True)
+    single = e5in / "single_input.txt"
+    _pad = "填充正文内容，确保每章都超过空章阈值五十个字，避免被判为空章。" * 3
+    single.write_text(
+        "前言：这是一段序章内容，交代世界观背景，长度足够，不应被丢弃。" + _pad + "\n\n"
+        "　　第一章 初入江湖\n正文甲。他翻开第一章，读到第三页便睡着了。" + _pad + "\n\n"
+        "  第二章 再入风尘\n正文乙。他又想起第二章 的伏笔。" + _pad + "\n\n"
+        "\t第三章 三入人间\n正文丙。" + _pad + "\n\n"
+        "第四章 四入庙堂\n正文丁。" + _pad + "\n",
+        encoding="utf-8")
+    e5in = tmp / "in5"; o5 = tmp / "out5"
+    wait_idle(B)                       # 等场景四完全释放，避免 409 静默吞掉启动
+    ev5, th5 = sse_events(API_PORT, 240, stop_on="done")
+    r5 = post(f"{B}/api/start", dict(body, input_mode="single_file", input_path=str(single),
+                                      output_path=str(o5), novel_name="单文件识别",
+                                      refactor_gates={}, compare_output=False,
+                                      chapter_snapshots=False))
+    print("    场景五 run_id:", r5.get("run_id", "?")[:8], "start status:", r5.get("status"))
+    threading.Thread(target=gate_driver, args=(API_PORT, ev5, set()), daemon=True).start()
+    ok5 = wait_done(ev5, th5)[0]
+    if not ok5:
+        print("    场景五 事件:", [e for e, _ in ev5])
+        try:
+            print("    场景五 status:", get(f"{B}/api/status"))
+        except Exception as _e:
+            print("    场景五 status 取用失败:", _e)
+    check("单文件输入也能跑完", ok5)
+    # 章节数写入 progress：序章 + 4 章 = 5
+    st5 = get(f"{B}/api/status")
+    check("单文件拆出「序章 + 4 章」", st5.get("total_chapters") == 5,
+          f"total_chapters={st5.get('total_chapters')}")
+    o5s = sorted((o5 / "02_workspace" / "split").glob("*.txt"))
+    check("拆分文件数为 5（含序章）", len(o5s) == 5, str([p.name for p in o5s]))
+    # 正文提及「第一章」「第二章」不得各自多切一章
+    joined = "".join(p.read_text(encoding="utf-8", errors="replace") for p in o5s)
+    check("序章正文未被丢弃", "这是一段序章内容" in joined)
+
+    # 上下文窗口探测：mock 上报 4096，应用配置 32768 → 必须提示「填大了」
+    PROBE_N = 4096
+    put(f"{L}/", {"context_report": {"n_ctx": PROBE_N}})
+    probe = get(f"{B}/api/system/context_probe?api_url={L}/v1/chat/completions"
+                f"&model=mock-model&configured=32768")
+    check("探测到服务端真实上下文窗口", probe.get("detected") == PROBE_N, str(probe))
+    check("配置大于实测时给出提示", bool(probe.get("mismatch")), str(probe)[:160])
+
+    # ---------- 场景六：无编号标题 → AI 辅助拆章 ----------
+    # 一本书全用「纯标题行」分章（没有任何「第X章」），规则必然识别不出。
+    # 期望：置信度低 → AI 只在候选行里挑边界 → 仍需人工确认后才继续。
+    print("\n--- 场景六：无编号标题 → AI 拆章 ---")
+    e6in = tmp / "in6"; e6in.mkdir(parents=True, exist_ok=True)
+    _p6 = "正文内容，需要足够长以免被判为空章。" * 4
+    (e6in / "ai_book.txt").write_text(
+        "前言部分，交代背景。" + _p6 + "\n\n"
+        "风起于青萍之末\n" + _p6 + "\n\n"
+        "山雨欲来\n" + _p6 + "\n\n"
+        "剑指长安\n" + _p6 + "\n",
+        encoding="utf-8")
+    o6 = tmp / "out6"
+    ev6, th6 = sse_events(API_PORT, 240, stop_on="done")
+    start_run(dict(body, input_mode="single_file", input_path=str(e6in / "ai_book.txt"),
+                   output_path=str(o6), novel_name="AI拆章", refactor_gates={},
+                   compare_output=False, chapter_snapshots=False))
+    threading.Thread(target=gate_driver, args=(API_PORT, ev6, set()), daemon=True).start()
+    ok6 = wait_done(ev6, th6)[0]
+    st6 = get(f"{B}/api/status")
+    # SSE 订阅可能在「新 run 起始的毫秒级窗口」漏掉终态事件；以磁盘状态兜底判定，
+    # 否则会偶发把已完成的任务判成失败（假阴性）。
+    if not ok6 and not st6.get("pipeline_running") and (o6 / "03_final").is_dir():
+        ok6 = True
+    if not ok6:
+        errs6 = [d for e, d in ev6 if e == "error"]
+        print("  错误:", errs6[-1][:240] if errs6 else [e for e, _ in ev6][-8:])
+    det6 = st6.get("chapter_detection") or {}
+    check("无编号标题的书也能拆章并跑完", ok6, f"total={st6.get('total_chapters')}")
+    check("确实走了 AI 拆章（记录在 chapter_detection）", det6.get("mode") == "ai", str(det6))
+    check("AI 拆出「序章 + 3 章」", st6.get("total_chapters") == 4,
+          f"total_chapters={st6.get('total_chapters')}")
+    o6s = sorted((o6 / "02_workspace" / "split").glob("*.txt"))
+    joined6 = "".join(p.read_text(encoding="utf-8", errors="replace") for p in o6s)
+    check("AI 拆章后正文一字未丢",
+          "前言部分" in joined6 and "风起于青萍之末" in joined6 and "剑指长安" in joined6)
+
+    # ---------- 场景七：规则与 AI 都搞不定 → 人工自定义标记重拆 ----------
+    # 用「◆ 壹 ◆」这类创新排版，且关掉 AI（ai_split=False），只剩人工兜底。
+    print("\n--- 场景七：自定义章节标记重拆 ---")
+    e7in = tmp / "in7"; e7in.mkdir(parents=True, exist_ok=True)
+    _p7 = "正文内容，需要足够长以免被判为空章。" * 4
+    (e7in / "odd_book.txt").write_text(
+        "开场白。" + _p7 + "\n\n"
+        "◆ 壹 ◆\n" + _p7 + "\n\n"
+        "◆ 贰 ◆\n" + _p7 + "\n",
+        encoding="utf-8")
+    o7 = tmp / "out7"
+    ev7, th7 = sse_events(API_PORT, 240, stop_on="done")
+    start_run(dict(body, input_mode="single_file", input_path=str(e7in / "odd_book.txt"),
+                   output_path=str(o7), novel_name="人工重拆", refactor_gates={},
+                   ai_split=False, compare_output=False, chapter_snapshots=False))
+
+    def _wait_phase(phase, timeout=120):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                st = get(f"{B}/api/status")
+            except Exception:
+                time.sleep(0.3); continue
+            if st.get("current_phase") == phase:
+                return st
+            time.sleep(0.3)
+        return None
+
+    st7 = _wait_phase("phase0_confirm")
+    check("创新排版自动停在拆书预览门等待人工", st7 is not None,
+          str((_wait_phase("phase0_confirm", 1) or {}).get("current_phase")))
+    rid7 = (st7 or {}).get("run_id")
+    r7 = post(f"{B}/api/split/redo", {"run_id": rid7, "markers": ["◆ 壹 ◆", "◆ 贰 ◆"]})
+    check("提交自定义章节标记被接受", r7.get("status") == "redoing", str(r7))
+    # 重拆在流水线线程内异步执行，轮询等待生效
+    ok_redo = False
+    for _ in range(150):
+        st = get(f"{B}/api/status")
+        det = st.get("chapter_detection") or {}
+        if det.get("mode") == "markers" and st.get("total_chapters") == 3:
+            ok_redo = True
+            break
+        time.sleep(0.3)
+    check("按标记重拆生效（序章 + 2 章）", ok_redo,
+          str(get(f"{B}/api/status").get("chapter_detection")))
+    # 之后让流水线继续跑完；后续闸门交由普通驱动处理（split_ready 已在上面手动处理）
+    threading.Thread(target=gate_driver, args=(API_PORT, ev7, {"split_ready"},),
+                     daemon=True).start()
+    post(f"{B}/api/split/confirm", {"run_id": rid7})
+    ok7 = wait_done(ev7, th7)[0]
+    if not ok7:
+        errs7 = [d for e, d in ev7 if e == "error"]
+        print("  错误:", errs7[-1][:240] if errs7 else [e for e, _ in ev7][-8:])
+    st7f = get(f"{B}/api/status")
+    check("自定义标记重拆后能跑完", ok7, f"total={st7f.get('total_chapters')}")
+    check("最终为「序章 + 2 章」", st7f.get("total_chapters") == 3,
+          f"total_chapters={st7f.get('total_chapters')}")
+    o7s = sorted((o7 / "02_workspace" / "split").glob("*.txt"))
+    joined7 = "".join(p.read_text(encoding="utf-8", errors="replace") for p in o7s)
+    check("重拆后正文完整", "开场白" in joined7 and "◆ 壹 ◆" in joined7 and "◆ 贰 ◆" in joined7)
+
+    # ---------- 场景八：中途断裂 → 重跑必须断点续跑（不重做已完成批次）----------
+    # 对应用户真实痛点：跑完第一批后因错误断裂，重开却发现前面的成果没了。
+    # 这里构造「第一批成功、第二批 500 失败」的现场，再原样重跑，断言：
+    #   1) 重跑识别为 resumed
+    #   2) 已完成的批次**不再调用模型**（refactor 调用数 == 剩余批次数）
+    #   3) 第一批的成品文件仍在，最终整本跑完
+    print("\n--- 场景八：中途失败 → 断点续跑 ---")
+    e8in = tmp / "in8"; make_novel(e8in, chapters=6)
+    o8 = tmp / "out8"
+    put(f"{L}/", {"reset": True, "log_clear": True,
+                  "fail": {"phase": "refactor", "times": 1, "status": 500,
+                           "body": "injected-fail", "skip": 1, "extra_breaks": 0},
+                  "ctx_limit": {"max_chapters": 0}})
+    ev8, th8 = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
+                   novel_name="断点续跑", refactor_gates={}, compare_output=False,
+                   chapter_snapshots=False))
+    threading.Thread(target=gate_driver, args=(API_PORT, ev8, set()), daemon=True).start()
+    # 第一次应当失败。以 progress.json 为准轮询（不依赖可能漏事件的 SSE）：
+    # error_logs 出现且 pipeline_running 已复位即视为「已中断」。
+    prog8 = {}
+    for _ in range(240):
+        try:
+            prog8 = json.loads((o8 / "progress.json").read_text(encoding="utf-8"))
+        except Exception:
+            time.sleep(0.5); continue
+        if prog8.get("error_logs") and not prog8.get("pipeline_running"):
+            break
+        time.sleep(0.5)
+    st8a = put(f"{L}/", {})["stats"]
+    done8 = [b for b in prog8.get("batches", []) if b.get("status") == "phase3_done"]
+    recon8a = sorted((o8 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
+    check("第一批成功后因错误中断", bool(prog8.get("error_logs")),
+          f"error_logs={len(prog8.get('error_logs') or [])}")
+    check("中断时第一批已标记完成且有成品", len(done8) >= 1 and len(recon8a) >= 1,
+          f"done={len(done8)} files={len(recon8a)}")
+    check("中断时进度停在 phase3", (prog8.get("current_phase") or "").startswith("phase3"),
+          str(prog8.get("current_phase")))
+    saved_names = {p.name for p in recon8a}
+
+    # 第二次：清掉故障，原样重跑同一输出目录
+    put(f"{L}/", {"reset": True, "log_clear": True,
+                  "fail": {"phase": None, "times": 0, "status": 500, "body": "", "skip": 0},
+                  "ctx_limit": {"max_chapters": 0}})
+    ev8b, th8b = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
+                   novel_name="断点续跑", refactor_gates={}, compare_output=False,
+                   chapter_snapshots=False))
+    threading.Thread(target=gate_driver, args=(API_PORT, ev8b, set()), daemon=True).start()
+    ok8 = wait_done(ev8b, th8b)[0]
+    st8b = put(f"{L}/", {})["stats"]
+    prog8b = json.loads((o8 / "progress.json").read_text(encoding="utf-8"))
+    check("重跑被识别为断点续跑", prog8b.get("resumed") is True, str(prog8b.get("resumed")))
+    check("续跑没有再重做已完成批次（refactor 调用数仅为剩余批次）",
+          st8b.get("refactor", 99) <= 3, str(st8b))
+    # 第一批成品必须在续跑后仍在（内容完整）。
+    # 注意：不能断言字节完全不变 —— 缝合阶段本来就会改写**批次边界章**的尾/首，
+    # 那是流水线的正常行为，不是「重做」。用「文件仍在且正文标记未丢」来证明未丢内容。
+    after = {p.name: p.read_text(encoding="utf-8", errors="replace")
+             for p in (o8 / "02_workspace" / "reconstructed").glob("chapter_*.txt")}
+    check("中断前已生成的成品在续跑后仍完整保留",
+          all(n in after and after[n].strip() and "【重构" in after[n] for n in saved_names),
+          f"before={sorted(saved_names)} after={sorted(after)}")
+    check("续跑后整本跑完", ok8 and (o8 / "03_final").is_dir(), str([e for e, _ in ev8b][-3:]))
+    final8 = list((o8 / "03_final").glob("*")) if (o8 / "03_final").is_dir() else []
+    check("续跑后有完整成品", len(final8) >= 1, str([p.name for p in final8]))
+
+    # 输出目录管理端点（GUI 用）：HTTP 层验证
+    from urllib.parse import quote
+    insp = get(f"{B}/api/output/inspect?output_path={quote(str(o8))}")
+    check("输出检查端点报告已完成的成品", insp.get("exists") and insp.get("finished"), str(insp)[:200])
+    # 清空一个一次性目录：只删自身产物，用户文件保留
+    clr_dir = tmp / "clr"; (clr_dir / "02_workspace").mkdir(parents=True)
+    (clr_dir / "progress.json").write_text("{}", encoding="utf-8")
+    (clr_dir / "我的笔记.txt").write_text("保留我", encoding="utf-8")
+    clr = post(f"{B}/api/output/clear", {"output_path": str(clr_dir)})
+    check("清空端点只删自身产物",
+          "02_workspace" in (clr.get("removed") or []) and (clr_dir / "我的笔记.txt").exists(),
+          str(clr))
+    # 任务历史：刚跑完的这本书应出现在列表里，且标记为已完成
+    hist = get(f"{B}/api/history")
+    _h8 = next((h for h in (hist.get("items") or []) if h.get("output_path") == str(o8)), None)
+    check("任务历史记录本次任务", _h8 is not None, str([h.get("output_path") for h in (hist.get("items") or [])])[:200])
+    if _h8:
+        check("历史标记为已完成", _h8.get("finished") is True, str(_h8)[:160])
+        check("历史含批次进度", _h8.get("batches_total", 0) >= 1, str(_h8.get("batches_done")))
+    # 成品版本：再跑一次同一目录，覆盖前应快照出上一版
+    ev8c, th8c = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
+                   novel_name="断点续跑", refactor_gates={}, compare_output=False,
+                   chapter_snapshots=False))
+    threading.Thread(target=gate_driver, args=(API_PORT, ev8c, set()), daemon=True).start()
+    wait_done(ev8c, th8c)
+    vers = get(f"{B}/api/versions?output_path={quote(str(o8))}")
+    check("重跑前自动快照上一版成品", len(vers.get("versions") or []) >= 1,
+          str([v.get("id") for v in (vers.get("versions") or [])]))
 
 finally:
     for p in (llm, api):

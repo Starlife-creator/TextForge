@@ -1,4 +1,4 @@
-import asyncio, json, time, logging, httpx, os
+import asyncio, json, re, time, logging, httpx, os
 from urllib.parse import urlparse
 
 logger = logging.getLogger("textforge")
@@ -121,16 +121,103 @@ class RetryableBusinessError(Exception):
     """模型输出不符合契约，需要重试的业务异常基类。"""
     pass
 
-async def call_with_retry(client, api_url, payload, sse_emit_fn, run_id, max_retries=3):
+
+class ContextOverflowError(Exception):
+    """请求超出模型/服务端的上下文窗口。
+
+    单独一类（而不是混进 FatalAPIError）的原因：**重试同样的请求毫无意义** ——
+    必须把批次拆小再发。所以它必须能被上层识别并触发「拆批」，而不是被当成
+    网络抖动盲重试，更不能被当成致命错误直接终止整轮。
+    """
+
+    def __init__(self, requested: int | None, available: int | None, raw: str):
+        self.requested = requested
+        self.available = available
+        self.raw = raw
+        detail = ""
+        if requested and available:
+            detail = f"（请求 {requested} token，模型上限 {available} token）"
+        elif available:
+            detail = f"（模型上限 {available} token）"
+        super().__init__(f"上下文超限{detail}：{raw[:200]}")
+
+
+# 认「上下文超限」的语义关键词。必须同时命中「上下文/token」与「超限」两组词，
+# 否则会把无效模型名之类的 400 误判成超限，进而做出毫无意义的拆批。
+_CTX_TOPIC = ("context", "token", "prompt length", "input length", "上下文", "最大长度")
+_CTX_OVER = ("exceed", "too long", "too large", "maximum", "max ", "limit",
+             "out of range", "greater than", "超过", "超出", "过长")
+
+# 从各家报错里扒出「模型上限」数字。顺序即优先级。
+_AVAIL_PATTERNS = (
+    re.compile(r'exceeds?\s+the\s+available\s+context\s+size[^\d]{0,20}(\d+)', re.I),
+    re.compile(r'maximum\s+context\s+length\s+is[^\d]{0,20}(\d+)', re.I),
+    re.compile(r'>\s*(\d+)\s*maximum', re.I),
+    re.compile(r'exceeds?\s+the\s+maximum\s+(?:number\s+of\s+)?(?:tokens?|length)[^\d]{0,30}(\d+)', re.I),
+    re.compile(r'context\s+(?:length|window|size)[^\d]{0,20}(\d+)', re.I),
+    re.compile(r'max(?:imum)?\s+(?:context|tokens?|length)[^\d]{0,20}(\d+)', re.I),
+    re.compile(r'(?:上限|最大)[^\d]{0,12}(\d+)', re.I),
+)
+# 请求侧 token 数（用于日志/提示，非必需）
+_REQ_PATTERNS = (
+    re.compile(r'request[^\d]{0,12}(\d+)\s*tokens?', re.I),
+    re.compile(r'(\d+)\s*tokens?\s*>', re.I),
+    re.compile(r'输入[^\d]{0,8}(\d+)', re.I),
+)
+
+
+def parse_context_overflow(text: str) -> tuple[int | None, int | None] | None:
+    """判断一段错误文本是否为「上下文超限」，并尽力解析 (requested, available)。
+
+    返回 None 表示**不是**超限错误（调用方应走原有错误路径）。
+    这套规则是跨厂商的：LM Studio/llama.cpp、OpenAI、Anthropic、Gemini、vLLM、
+    Ollama 的同类报错文案都能覆盖，而不是只认某一家。
+    """
+    if not text:
+        return None
+    low = text.lower()
+    if not any(k in low for k in _CTX_TOPIC):
+        return None
+    if not any(k in low for k in _CTX_OVER):
+        return None
+    avail = None
+    for p in _AVAIL_PATTERNS:
+        m = p.search(text)
+        if m:
+            avail = int(m.group(1))
+            break
+    req = None
+    for p in _REQ_PATTERNS:
+        m = p.search(text)
+        if m:
+            req = int(m.group(1))
+            break
+    return req, avail
+
+
+async def call_with_retry(client, api_url, payload, sse_emit_fn, run_id, max_retries=3,
+                         on_retry=None, validate=None):
     """带分策略重试的 API 调用（P0.4）：
     - RetryableBusinessError（缺分隔符等契约错误）：重试 1 次给模型修正机会
     - EmptyContentError（空响应）：按全部次数重试（分开处理）
     - RateLimitError（429）：按 Retry-After / 退避重试
-    - 网络错误：指数退避重试"""
+    - 网络错误：指数退避重试
+
+    on_retry(payload, exc) -> None：业务契约错误重试前的钩子，用来**改写 payload**
+    把「上一次错在哪」喂回模型。没有它时重试是完全相同的请求，模型无从纠正，
+    只能靠采样随机性碰运气（实测同一批一次过、一次不过，整批耗时白扔）。
+
+    validate(result) -> None：结果校验器，抛 RetryableBusinessError 即可触发重试。
+    **业务契约校验必须放在这里**，而不是在 call_with_retry 返回之后再做 ——
+    后者抛出的异常根本进不了 except 分支，重试形同虚设
+    （历史上「===CHAPTER_BREAK=== 数量不符」就是这么一直不重试的）。
+    """
     last_exc = None
     for attempt in range(max_retries):
         try:
             result, usage = await _stream_call(client, api_url, payload, sse_emit_fn, run_id)
+            if validate is not None:
+                validate(result)
             return result, usage, attempt
         except RateLimitError as e:
             delay = (e.retry_after or 0) or (2 * (attempt + 1))
@@ -146,11 +233,16 @@ async def call_with_retry(client, api_url, payload, sse_emit_fn, run_id, max_ret
             last_exc = e
             await asyncio.sleep(2 * (attempt + 1))
         except RetryableBusinessError as e:
-            # 业务格式错误：只重试 1 次
+            # 业务格式错误：只重试 1 次，且带上纠正提示
             logger.warning(f"[api] 业务格式错误 attempt={attempt+1}: {str(e)[:200]}")
             if attempt >= 1:
                 raise
             last_exc = e
+            if on_retry is not None:
+                try:
+                    on_retry(payload, e)
+                except Exception as hook_err:
+                    logger.warning(f"[api] on_retry 钩子异常（忽略）: {hook_err}")
             await asyncio.sleep(2)
         except (httpx.HTTPError, httpx.TimeoutException) as e:
             logger.warning(f"[api] 网络错误 attempt={attempt+1}: {str(e)[:200]}")
@@ -183,6 +275,15 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
             if resp.status_code == 400:
                 body = await resp.aread()
                 text = body.decode('utf-8', errors='replace')
+                # 上下文超限：单独成类，交给上层「拆批重试」。重发同样的请求必然再失败，
+                # 所以绝不能当作可重试的临时错误，也不能当作致命错误终止整轮。
+                ov = parse_context_overflow(text)
+                if ov is not None:
+                    logger.warning(f"[api] 上下文超限: {text[:200]}")
+                    # 被动学习真实窗口：对不暴露窗口的云端 API，这是唯一来源
+                    from core.context_probe import observe_overflow
+                    observe_overflow(api_url, req_payload.get("model", ""), ov[1])
+                    raise ContextOverflowError(ov[0], ov[1], text)
                 # 仅当错误确实与 stream_options 相关才降级
                 if "stream_options" in text.lower():
                     clean = {k: v for k, v in req_payload.items() if k != "stream_options"}
@@ -201,8 +302,15 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
                 await resp.aread()
                 raise RateLimitError(retry_after)
             elif resp.status_code != 200:
-                raise FatalAPIError("api_error", resp.status_code,
-                    (await resp.aread()).decode('utf-8', errors='replace')[:500])
+                _body = (await resp.aread()).decode('utf-8', errors='replace')
+                # 413/422 也常被用来表达上下文超限（如某些网关），一并识别
+                ov = parse_context_overflow(_body)
+                if ov is not None:
+                    logger.warning(f"[api] 上下文超限({resp.status_code}): {_body[:200]}")
+                    from core.context_probe import observe_overflow
+                    observe_overflow(api_url, req_payload.get("model", ""), ov[1])
+                    raise ContextOverflowError(ov[0], ov[1], _body)
+                raise FatalAPIError("api_error", resp.status_code, _body[:500])
             async for line in resp.aiter_lines():
                 chunk = _process_sse_line(line, full_text, usage)
                 if chunk:

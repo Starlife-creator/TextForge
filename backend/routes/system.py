@@ -259,5 +259,44 @@ async def system_llm_check(payload: dict = Body(...)):
     except (json.JSONDecodeError, KeyError, IndexError, AttributeError):
         text = resp.text[:200]
     logger.info(f"[system] 模型连通性检查 ok model={model}")
+    # 顺带探测真实上下文窗口（探不到不影响连通性结论，绝不阻塞）
+    ctx = await _detect_context(api_url, model, api_key, proxy, ssl_verify)
     return {"ok": True, "elapsed_ms": round((time.time() - t0) * 1000),
-            "reply": text[:120], "model": model_echo}
+            "reply": text[:120], "model": model_echo,
+            "context_limit": ctx["limit"], "context_source": ctx["source"]}
+
+
+async def _detect_context(api_url, model, api_key, proxy, ssl_verify):
+    """真实上下文窗口：先主动探测各厂商端点，再回退到「超限报错里学到」的值。"""
+    from core.context_probe import probe_context_limit, observed_limit
+    try:
+        probe = await probe_context_limit(api_url, model, api_key=api_key or "",
+                                          ssl_verify=bool(ssl_verify), proxy=proxy)
+    except Exception as e:                       # 探测永远不该影响主流程
+        logger.warning(f"[system] 上下文探测异常（忽略）: {e}")
+        probe = None
+    if probe:
+        return {"limit": probe["limit"], "source": probe["source"]}
+    learned = observed_limit(api_url, model)
+    return {"limit": learned, "source": "overflow" if learned else None}
+
+
+@router.get("/api/system/context_probe")
+async def system_context_probe(api_url: str = Query(...), model: str = Query(""),
+                               api_key: str = Query(""), configured: int = Query(0)):
+    """探测真实上下文窗口，并与用户配置值对比，给出是否「填大了」的结论。
+
+    仅做自检与提示，绝不阻止用户开始任务 —— 探测失败时如实返回 detected=None。
+    """
+    if not api_url.strip():
+        raise HTTPException(422, "缺少 api_url")
+    ctx = await _detect_context(api_url.strip(), model.strip(), api_key.strip(),
+                                None, True)
+    detected, source = ctx["limit"], ctx["source"]
+    mismatch = None
+    if detected and configured and configured > detected:
+        mismatch = (f"你设置的上文 {configured} 大于服务端实际窗口 {detected}"
+                    f"（来源：{source}）。程序会按实测值自动缩小批次，"
+                    f"但建议把「上下文」改成 {detected} 以获得更准确的批次划分。")
+    return {"ok": True, "detected": detected, "source": source,
+            "configured": configured or None, "mismatch": mismatch}
