@@ -784,6 +784,43 @@ finally:
         os.environ["APPDATA"] = _real_appdata
     shutil.rmtree(_hist_dir, ignore_errors=True)
 
+# ---------- 优雅退出钩子（/api/shutdown） ----------
+# 这条路由必须在**随 app 注册的路由表**里，而不是 main.py 的 __main__ 块里：
+# 写在那里的版本只在冻结 exe 里存在，源码运行与单测都看不到，重建一旦遗漏就
+# 静默 404 —— 表现为关窗后残留孤儿进程，几乎无法定位。
+from fastapi.testclient import TestClient as _TC
+from app import app as _app
+
+# 关窗清理依赖这个端点：PyInstaller onefile 是父子双进程，外壳 child.kill() 只杀得掉
+# 父引导进程，子进程会变孤儿常驻约 70MB 内存且 %TEMP%\_MEI 永不删除。
+# 因此必须由后端自己退出（/api/system/shutdown），让引导进程有机会清理临时目录。
+#
+# 断言**完整路径**：这条路由带 /api/system 前缀，路径写错（比如写成 /api/shutdown）
+# 就是 404，表现为「关窗后残留孤儿进程」，根因完全看不出来。
+_spec = _app.openapi()["paths"]
+check("注册了 /api/system/shutdown（供外壳让后端优雅退出）",
+      "/api/system/shutdown" in _spec,
+      str([p for p in _spec if "shutdown" in p]))
+with _TC(_app) as _c:
+    # 流水线未运行时可直接停机
+    _r = _c.post("/api/system/shutdown")
+    check("POST /api/system/shutdown 返回 stopping",
+          _r.status_code == 200 and _r.json().get("status") == "stopping",
+          f"{_r.status_code} {_r.text[:80]}")
+    check("GET /api/system/shutdown 返回 405（确认命中本路由而非兜底 404）",
+          _c.get("/api/system/shutdown").status_code == 405,
+          str(_c.get("/api/system/shutdown").status_code))
+    # 流水线运行中必须拒绝，避免静默打断正在跑的批次
+    _running = state.pipeline_running
+    state.pipeline_running = True
+    _busy = _c.post("/api/system/shutdown")
+    check("流水线运行中拒绝停机（防静默打断批次）",
+          _busy.status_code == 409, f"{_busy.status_code} {_busy.text[:60]}")
+    _forced = _c.post("/api/system/shutdown", json={"force": True})
+    check("force=true 可在运行中强制停机",
+          _forced.status_code == 200, f"{_forced.status_code} {_forced.text[:60]}")
+    state.pipeline_running = _running
+
 # ---------- 便携包数据目录（TEXTFORGE_DATA_DIR） ----------
 import utils.appdir as _AD
 _real_data_dir = os.environ.get(_AD.ENV_KEY)
