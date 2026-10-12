@@ -4,7 +4,8 @@
 不记得当时选了哪个输出目录 —— 于是看到「没保存」就以为白跑了。这里用一份
 集中注册表把「输出路径 → 上次状态」串起来，并让界面能一键续跑/打开/清空。
 
-存储：%APPDATA%/TextForge/runs.json（小型元数据，不含进度正文）。
+存储：数据目录/runs.json（小型元数据，不含进度正文）。便携包下数据目录即
+exe 旁的 data/ 子目录，随包移动；安装版回退 %APPDATA%/TextForge/runs.json。
 **刻意不扫盘、不读 progress.json 来列历史**：progress.json 在缝合阶段可能达数十 MB
 （锚点内嵌全文），每次列历史都去读一遍会直接卡住界面。元数据由流水线在关键节点
 （心跳/起止/错误）主动 upsert 进来。
@@ -19,6 +20,7 @@ from pathlib import Path
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from routes import state
+from utils.appdir import ensure_data_dir
 from utils.atomic import atomic_write_json
 
 logger = logging.getLogger("textforge")
@@ -29,10 +31,7 @@ _TRIM_CHARS = 200
 
 
 def _registry_path() -> Path:
-    base = os.environ.get("APPDATA")
-    root = Path(base) / "TextForge" if base else Path.home() / ".textforge"
-    root.mkdir(parents=True, exist_ok=True)
-    return root / "runs.json"
+    return ensure_data_dir() / "runs.json"
 
 
 def _load() -> dict:

@@ -30,3 +30,18 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+
+# Rust / Tauri 构建产物
+src-tauri/target/
+src-tauri/binaries/
+
+# 便携包本地组装暂存区
+.portable-stage/
+
+backend/*.spec
+
+
+# 本地组装的便携包（构建产物，不入库）
+/TextForge/
+/TextForge_*_portable_x64.zip
+/SHA256SUMS.txt

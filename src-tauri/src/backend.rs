@@ -34,20 +34,35 @@ pub struct BackendInfo {
     debug: bool,
     /// port.json 路径
     port_file: String,
-    /// 数据目录 %APPDATA%\TextForge
+    /// 数据目录：便携包为 exe 旁 data/，安装版为 %APPDATA%\TextForge
     app_dir: String,
-    /// %APPDATA%\TextForge\logs\backend.log
+    /// 数据目录下的 logs/backend.log
     log_path: String,
     log_exists: bool,
 }
 
-pub fn port_file_path() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok()
-        .map(|p| PathBuf::from(p).join("TextForge").join("port.json"))
+pub fn data_dir() -> Option<PathBuf> {
+    // 单一数据源：外壳先解析出数据目录，再通过 TEXTFORGE_DATA_DIR 注入给 sidecar。
+    // 后端（utils/appdir.py）只认这个环境变量，认不到才退回 %APPDATA%\TextForge。
+    // 这样两边**不可能**算出不同路径 —— 原先两侧各自拼 %APPDATA%\TextForge，
+    // 一旦不一致，前端就永远读不到 port.json。
+    //
+    // 优先级：外部显式指定 > exe 旁的 data/（便携包，随包移动）> %APPDATA%（安装版）。
+    if let Ok(p) = std::env::var("TEXTFORGE_DATA_DIR") {
+        if !p.is_empty() {
+            return Some(PathBuf::from(p));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            return Some(dir.join("data"));
+        }
+    }
+    std::env::var("APPDATA").ok().map(|p| PathBuf::from(p).join("TextForge"))
 }
 
-pub fn app_dir() -> Option<PathBuf> {
-    std::env::var("APPDATA").ok().map(|p| PathBuf::from(p).join("TextForge"))
+pub fn port_file_path() -> Option<PathBuf> {
+    data_dir().map(|d| d.join("port.json"))
 }
 
 pub fn get_port_from_json() -> u16 {
@@ -80,7 +95,13 @@ fn probe_port(port: u16) -> bool {
 pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
     let sidecar = app.shell().sidecar("backend")
         .map_err(|e| format!("sidecar 创建失败: {}", e))?;
-    let (mut rx, child) = sidecar.spawn()
+    let mut cmd = sidecar;
+    // 把解析好的数据目录交给后端，避免两侧各算一套路径。
+    if let Some(dir) = data_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        cmd = cmd.env("TEXTFORGE_DATA_DIR", dir);
+    }
+    let (mut rx, child) = cmd.spawn()
         .map_err(|e| format!("sidecar 启动失败: {}", e))?;
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
@@ -118,7 +139,7 @@ pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
 #[tauri::command]
 pub fn get_backend_port() -> PortResult {
     if cfg!(debug_assertions) { return PortResult::DevMode(8000); }
-    let Some(path) = port_file_path() else { return PortResult::Error("APPDATA 缺失".into()); };
+    let Some(path) = port_file_path() else { return PortResult::Error("无法确定数据目录".into()); };
     if !path.exists() { return PortResult::NotReady; }
     match std::fs::read_to_string(&path) {
         Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
@@ -142,7 +163,7 @@ pub async fn backend_info(state: tauri::State<'_, BackendProcess>) -> Result<Bac
     let reachable = tokio::task::spawn_blocking(move || probe_port(port))
         .await
         .unwrap_or(false);
-    let dir = app_dir();
+    let dir = data_dir();
     let log_path = dir.as_ref().map(|d| d.join("logs").join("backend.log"));
     let log_exists = log_path.as_ref().map(|p| p.exists()).unwrap_or(false);
     Ok(BackendInfo {

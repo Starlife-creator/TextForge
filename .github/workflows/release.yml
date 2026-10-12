@@ -1,14 +1,14 @@
 name: release
 
-# 触发：推送 v 开头 tag（如 v0.1.0）自动构建并发布 GitHub Release；
-# 也可在 Actions 页面手动运行（workflow_dispatch）。
+# 触发：推送 v 开头的 tag（如 v0.5.0）自动构建并发布 GitHub Release
+# 也可 Actions 页面手动运行（workflow_dispatch）
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
-# 需要写权限：tauri-action 要用 GITHUB_TOKEN 创建 Release 并上传安装包
+# 需要写权限：上传便携包到 Release
 permissions:
   contents: write
 
@@ -37,12 +37,22 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements.txt
 
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
       - name: 前端依赖安装
         run: npm ci
 
-      # 先构建 sidecar 后端（PyInstaller --onefile 单 exe），再交予 Tauri 打包。
+      # 构建 sidecar（PyInstaller onefile exe）。
       # 参数与 backend/build_sidecar.bat 保持一致（均已移除已精简的 natsort/PyYAML）。
-      - name: 构建 sidecar 后端（PyInstaller onefile）
+      #
+      # 注意：此前发布的是 NSIS 安装包，被 Defender 以 Trojan:Win32/Wacatac.B!ml
+      # 误报拦截（`!ml` = 机器学习泛化判定，非病毒特征码）。实测把 sidecar
+      # 单独拿出来扫是干净的，元凶是 NSIS 安装壳把 25MB 高熵载荷再包一层。
+      # 因此改为发布**免安装便携 zip**：无安装壳、无注册表、无 Program Files 写入。
+      - name: 构建 sidecar 后端
         shell: bash
         run: |
           cd backend
@@ -62,22 +72,59 @@ jobs:
           mkdir -p ../src-tauri/binaries
           cp dist/backend.exe ../src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
 
-      # 前端构建在 tauri build 前自动执行（beforeBuildCommand: npm run build），
-      # 完成后将 -setup.exe 上传到 GitHub Release，tag 即版本号。
-      # 注意：无代码签名证书，产物为未签名安装包，首次运行会触发 SmartScreen 提示。
-      - name: Tauri 打包并发布
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: .
-          tagName: ${{ github.ref_name }}
-          releaseName: TextForge ${{ github.ref_name }}
-          releaseBody: |
-            文炼工坊 TextForge 自动发布
-            - tag: ${{ github.ref_name }}
-            - 触发：${{ github.event_name }}
-            - 说明：未签名安装包，首次运行若见 SmartScreen 提示请点“更多信息→仍要运行”。
-          releaseDraft: false
-          prerelease: false
-          args: --target x86_64-pc-windows-msvc
+      # bundle.active=false → 只出裸二进制，不生成 NSIS/MSI 安装壳。
+      # 运行时 Tauri 按 <exe同级>/backend.exe 定位 sidecar（见 tauri-plugin-shell
+      # 的 relative_command_path），所以便携目录只需平铺两个 exe。
+      - name: 构建便携版（不生成安装包）
+        run: npx tauri build --config src-tauri/tauri.portable.json --target x86_64-pc-windows-msvc
+
+      - name: 组装便携目录并打包 zip
+        shell: pwsh
+        run: |
+          $rel = 'src-tauri\target\x86_64-pc-windows-msvc\release'
+          $stage = 'TextForge'
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "$rel\textforge.exe" $stage
+          Copy-Item "$rel\backend.exe" $stage
+          Copy-Item 'docs\使用说明.txt' $stage
+          $ver = (Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
+          $zip = "TextForge_${ver}_portable_x64.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$stage\*" -DestinationPath $zip -CompressionLevel Optimal
+          Write-Host "生成 $zip ($([math]::Round((Get-Item $zip).Length/1MB,1)) MB)"
+          Get-FileHash $zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $zip" } | Out-File -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+
+      - name: 上传便携包到 Release
+        shell: pwsh
+        run: |
+          $ver = (Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
+          $body = @"
+          文炼工坊 TextForge $ver —— **免安装便携版**
+
+          - 下载 `TextForge_${ver}_portable_x64.zip`，**解压**后双击 `textforge.exe`
+          - 不需要安装、不需要管理员权限、不写注册表
+          - 整个文件夹可随意搬移；删除文件夹即彻底卸载，不留残余
+          - 用 SHA256SUMS.txt 校验下载完整性：`certutil -hashfile 文件名 SHA256`
+
+          ## 为什么是便携版
+          之前的 NSIS 安装包会被 Windows Defender 误报拦截
+          （`Trojan:Win32/Wacatac.B!ml`，`!ml` 表示机器学习泛化判定而非病毒特征码）。
+          实测 PyInstaller 后端单独扫描是干净的，元凶是安装壳。
+          改为便携版后彻底去掉安装壳。
+
+          ## 仍可能提示未知发布者
+          本项目未购买商业代码签名证书，因此没有数字签名。
+          若 Defender 仍误报，请在「病毒和威胁防护 → 保护历史记录」中恢复，
+          并把解压后的文件夹加入排除项。
+
+          ## 小说成品在哪
+          不在本文件夹里 —— 成品路径由你在界面中自行选择。
+          "@
+          gh release create "${{ github.ref_name }}" `
+            "TextForge_${ver}_portable_x64.zip" `
+            "SHA256SUMS.txt" `
+            --title "TextForge $ver（免安装便携版）" `
+            --body $body `
+            --repo "${{ github.repository }}"

@@ -9,17 +9,35 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Body, Query
 import httpx
 from routes import state
+from utils.appdir import data_dir
 import logging
 
 router = APIRouter()
 logger = logging.getLogger("textforge")
 
-APP_DIR = Path(os.environ.get("APPDATA", ".")) / "TextForge"
-LOG_DIR = APP_DIR / "logs"
-LOG_PATH = LOG_DIR / "backend.log"
-PORT_FILE = APP_DIR / "port.json"
 START_TIME = time.time()
 VERSION = "8.8"
+
+
+def _app_paths() -> dict:
+    """数据目录下的固定布局。走 appdir，与日志/历史/端口文件同源。"""
+    d = data_dir()
+    log_dir = d / "logs"
+    return {"APP_DIR": d, "LOG_DIR": log_dir,
+            "LOG_PATH": log_dir / "backend.log", "PORT_FILE": d / "port.json"}
+
+
+def __getattr__(name):
+    """按需解析 APP_DIR/LOG_DIR/LOG_PATH/PORT_FILE（PEP 562）。
+
+    不做成 import 期常量：logging_setup 是在调用时才解析目录的，若这里提前
+    定死，两边会在测试改 APPDATA 或便携包注入 TEXTFORGE_DATA_DIR 时**算出
+    不同路径**，界面显示的日志路径就会指向一个永远不存在的文件。
+    """
+    paths = _app_paths()
+    if name in paths:
+        return paths[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _port() -> int:

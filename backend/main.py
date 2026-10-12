@@ -23,8 +23,10 @@ if __name__ == "__main__":
     sock.listen(128)
     
     from utils.atomic import atomic_write_json
-    PORT_FILE = Path(os.environ["APPDATA"]) / "TextForge" / "port.json"
-    PORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    from utils.appdir import ensure_data_dir
+    # 端口文件必须和 Rust 外壳读的是**同一个**路径，否则前端永远等不到端口。
+    # 两边都经由 appdir 解析（便携包 = exe 旁 data/，否则 %APPDATA%）。
+    PORT_FILE = ensure_data_dir() / "port.json"
     if PORT_FILE.exists():
         PORT_FILE.unlink()
     atomic_write_json(PORT_FILE, {"port": port, "timestamp": time.time(), "pid": os.getpid()})

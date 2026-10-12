@@ -784,6 +784,43 @@ finally:
         os.environ["APPDATA"] = _real_appdata
     shutil.rmtree(_hist_dir, ignore_errors=True)
 
+# ---------- 便携包数据目录（TEXTFORGE_DATA_DIR） ----------
+import utils.appdir as _AD
+_real_data_dir = os.environ.get(_AD.ENV_KEY)
+_portable = tempfile.mkdtemp(prefix="tf_portable_")
+try:
+    os.environ[_AD.ENV_KEY] = str(Path(_portable) / "data")
+    check("TEXTFORGE_DATA_DIR 覆盖数据目录",
+          _AD.data_dir() == Path(_portable) / "data", str(_AD.data_dir()))
+    # 必须**按调用时**解析：测试要在运行期换值，模块级缓存会把结果钉死
+    _second = Path(_portable) / "data2"
+    os.environ[_AD.ENV_KEY] = str(_second)
+    check("数据目录按调用重新解析（非 import 期缓存）",
+          _AD.data_dir() == _second, str(_AD.data_dir()))
+    check("ensure_data_dir 会建目录",
+          _AD.ensure_data_dir().is_dir(), str(_AD.ensure_data_dir()))
+    # 便携包核心不变量：历史 / 日志 / 端口文件必须落在**同一个**目录树下。
+    # 三者各算一套路径时，界面会指向一个永远不存在的日志文件、前端等不到端口。
+    # 上面日志用例给 S.LOG_PATH 赋过值；模块属性一旦存在就优先于 __getattr__，
+    # 必须清掉才能验到「按 appdir 解析」的真实行为。
+    for _n in ("APP_DIR", "LOG_DIR", "LOG_PATH", "PORT_FILE"):
+        S.__dict__.pop(_n, None)
+    check("历史注册表随包迁移",
+          _H._registry_path() == _second / "runs.json", str(_H._registry_path()))
+    check("日志路径随包迁移",
+          S.LOG_PATH == _second / "logs" / "backend.log", str(S.LOG_PATH))
+    check("端口文件随包迁移",
+          S.PORT_FILE == _second / "port.json", str(S.PORT_FILE))
+    del os.environ[_AD.ENV_KEY]
+    check("未注入时退回 %APPDATA%（安装版行为不变）",
+          _AD.data_dir() == Path(_REAL_APPDATA) / "TextForge", str(_AD.data_dir()))
+finally:
+    if _real_data_dir is not None:
+        os.environ[_AD.ENV_KEY] = _real_data_dir
+    else:
+        os.environ.pop(_AD.ENV_KEY, None)
+    shutil.rmtree(_portable, ignore_errors=True)
+
 # ---------- 续跑配置漂移检测 ----------
 
 # ---------- token 估算：CJK 启发式 ----------

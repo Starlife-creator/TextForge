@@ -1,10 +1,12 @@
-import logging, queue, os
-from pathlib import Path
+import logging, queue
 from logging.handlers import RotatingFileHandler, QueueHandler, QueueListener
+from utils.appdir import ensure_data_dir
 from utils.redact import SensitiveFilter
 
 def setup_logging():
-    log_dir = Path(os.environ["APPDATA"]) / "TextForge" / "logs"
+    # 数据目录统一走 appdir：便携包下日志落在 exe 旁的 data/logs，
+    # 整个文件夹拷走即带走日志（原先固定 %APPDATA%，便携包拷走后日志留原地）。
+    log_dir = ensure_data_dir() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "backend.log"
     logger = logging.getLogger("textforge")
