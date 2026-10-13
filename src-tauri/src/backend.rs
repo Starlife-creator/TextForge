@@ -281,11 +281,20 @@ async fn graceful_shutdown(port: u16) {
     };
     let _ = client
         .post(format!("http://127.0.0.1:{port}/api/system/shutdown"))
+        .header(TOKEN_HEADER, auth_token())
         .json(&serde_json::json!({ "force": true }))
         .send()
         .await;
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// 外壳 -> 后端的 HTTP 调用**必须**带调用方 token。
+///
+/// 后端在 release 下会对所有接口（/api/health 除外）校验 X-TextForge-Token。
+/// 漏带的后果很隐蔽：不带 token 时关窗的优雅退出请求会被 401 静默拒绝，
+/// 于是流程退化到强杀分支，孤儿进程与 %TEMP%\_MEI 残留又回来了 ——
+/// 而端到端测试是直接起 python、不经外壳，**根本覆盖不到这条路径**。
+pub const TOKEN_HEADER: &str = "X-TextForge-Token";
 
 #[tauri::command]
 pub async fn restart_backend(app: AppHandle, state: tauri::State<'_, BackendProcess>) -> Result<(), String> {
@@ -380,5 +389,14 @@ mod tests {
     fn kill_tree_tolerates_dead_pid() {
         // reap_orphan_backend 会对过期 PID 调用它，必须容错
         kill_tree(0x7FFF_FF00);
+    }
+
+    #[test]
+    fn token_header_name_matches_backend_constant() {
+        // 两端各写了一份头名常量。一旦拼错，release 下外壳的关窗请求会被 401
+        // 静默拒绝 -> 优雅退出退化成强杀 -> 孤儿进程与 _MEI 残留回归，
+        // 而端到端测试直接起 python、根本覆盖不到这条路径。
+        assert_eq!(TOKEN_HEADER, "X-TextForge-Token");
+        assert!(!auth_token().is_empty());
     }
 }

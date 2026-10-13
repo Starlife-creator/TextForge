@@ -1,7 +1,8 @@
 mod backend;
 use backend::{
-    BackendProcess, backend_info, get_backend_port, get_backend_token, get_port_from_json,
-    kill_tree, port_file_path, reap_orphan_backend, restart_backend, spawn_backend,
+    auth_token, BackendProcess, TOKEN_HEADER, backend_info, get_backend_port, get_backend_token,
+    get_port_from_json, kill_tree, port_file_path, reap_orphan_backend, restart_backend,
+    spawn_backend,
 };
 use std::sync::Mutex;
 use tauri::Manager;
@@ -43,11 +44,16 @@ pub fn run() {
                         .build().unwrap();
                     if port > 0 {
                         // 先停流水线，再让它整个服务退出。
-                        let _ = client.post(format!("http://127.0.0.1:{}/api/stop", port)).send().await;
+                        // 必须带 token：后端 release 下会校验 X-TextForge-Token，
+                        // 漏带会让这两个请求被 401 静默拒绝，优雅退出退化成强杀，
+                        // 孤儿进程与 %TEMP%\_MEI 残留又会回来。
+                        let _ = client.post(format!("http://127.0.0.1:{}/api/stop", port))
+                            .header(TOKEN_HEADER, auth_token()).send().await;
                         // 复用既有的 /api/system/shutdown（设置面板「停止后端」同一个端点），
                         // 不新增重复路由。让后端自己 os._exit，PyInstaller 引导进程
                         // 随之退出并清掉 %TEMP%\_MEIxxx。
-                        let _ = client.post(format!("http://127.0.0.1:{}/api/system/shutdown", port)).send().await;
+                        let _ = client.post(format!("http://127.0.0.1:{}/api/system/shutdown", port))
+                            .header(TOKEN_HEADER, auth_token()).send().await;
 
                         // **轮询**等后端真的下线，而不是固定 sleep。
                         // 只有优雅退出（uvicorn should_exit → 子进程退出 → PyInstaller
