@@ -1,3 +1,4 @@
+import { apiFetch } from './client';
 /** 后端 /api/system/* 的前端封装（对应 backend/routes/system.py） */
 
 export interface SystemInfo {
@@ -55,7 +56,7 @@ export interface LlmCheckResult {
 }
 
 async function call<T>(port: number, path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, init);
+  const res = await apiFetch(`http://127.0.0.1:${port}${path}`, init);
   const text = await res.text();
   let body: any = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
@@ -93,7 +94,7 @@ export function shutdownBackend(port: number, force: boolean) {
 
 export async function fetchModels(port: number, apiUrl: string, apiKey = '') {
   const q = new URLSearchParams({ api_url: apiUrl, api_key: apiKey });
-  const res = await fetch(`http://127.0.0.1:${port}/api/system/models?${q}`);
+  const res = await apiFetch(`http://127.0.0.1:${port}/api/system/models?${q}`);
   const body = await res.json().catch(() => null);
   if (!res.ok || !body) throw new Error(`模型探测失败：HTTP ${res.status}`);
   return body as ModelListResult;
@@ -141,7 +142,7 @@ export interface HistoryItem {
 }
 
 async function req<T>(port: number, path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, init);
+  const res = await apiFetch(`http://127.0.0.1:${port}${path}`, init);
   const text = await res.text();
   let body: any = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
@@ -205,7 +206,7 @@ export async function probeContext(port: number, apiUrl: string, model: string,
   const q = new URLSearchParams({
     api_url: apiUrl, model, api_key: apiKey, configured: String(configured),
   });
-  const res = await fetch(`http://127.0.0.1:${port}/api/system/context_probe?${q}`);
+  const res = await apiFetch(`http://127.0.0.1:${port}/api/system/context_probe?${q}`);
   const body = await res.json().catch(() => null);
   if (!res.ok || !body) throw new Error(`上下文探测失败：HTTP ${res.status}`);
   return body as ContextProbeResult;

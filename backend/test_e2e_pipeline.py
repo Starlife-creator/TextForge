@@ -58,6 +58,9 @@ def put(url, obj, timeout=30):
         return json.loads(r.read() or b"{}")
 
 
+_ALL_EVENTS = []   # 全局闸门驱动消费的事件队列
+
+
 def sse_events(port, seconds, stop_on=None):
     """后台订阅事件流，返回收集到的事件列表。"""
     import threading
@@ -79,7 +82,11 @@ def sse_events(port, seconds, stop_on=None):
                         ev = re.search(r"^event:\s*(\S+)", blk, re.M)
                         da = re.search(r"^data:\s*(.*)$", blk, re.M)
                         if ev and da:
-                            out.append((ev.group(1), da.group(1).strip()))
+                            _pair = (ev.group(1), da.group(1).strip())
+                            out.append(_pair)
+                            # 同时喂给全局闸门驱动：每个场景各开一条订阅，
+                            # 驱动是全局唯一的，必须能看到所有场景的闸门事件。
+                            _ALL_EVENTS.append(_pair)
                             if stop_on and ev.group(1) == stop_on:
                                 return
         except Exception:
@@ -103,20 +110,104 @@ def wait_idle(port, timeout=30):
     return False
 
 
-def start_run(payload, events=None, gate_seen=None, tries=120):
+class GateControl:
+    """全局闸门控制状态（单线程访问，无需加锁）。"""
+
+    def __init__(self):
+        self.enabled = True          # 总开关
+        self.suppress = ()           # 本轮不自动确认的闸门名（场景七用）
+        self.seen = set()            # 去重键
+        self.run = None              # 当前轮次的 run_id
+
+
+_GATE = GateControl()
+_CUR_RUN = {"id": None, "t": 0.0}
+
+
+def _cur_run(port):
+    """当前正在跑的 run_id（缓存 1 秒，避免每个事件都打一次 HTTP）。"""
+    t = time.time()
+    if t - _CUR_RUN["t"] < 1.0:
+        return _CUR_RUN["id"]
+    try:
+        rid = get(f"http://127.0.0.1:{port}/api/status", timeout=5).get("run_id")
+    except Exception:
+        rid = _CUR_RUN["id"]
+    _CUR_RUN.update({"id": rid, "t": t})
+    return rid
+
+
+def gate_driver(port, events, enabled=True):
+    """唯一的闸门驱动：像真实用户一样把所有人工闸门点掉。
+
+    两条信号并行，任意一条先到就确认，天然免疫漏事件：
+      A. 事件流：闸门事件正是在闸门弹出瞬间发出的，时序最准。
+         但 SSE 的 payload 里没有 run_id，因此 run_id 一律现取当前 run ——
+         本驱动全局只有一个，同一时刻只可能有一个 run 在跑，不存在串台。
+      B. /api/status 轮询：兜底「订阅刚建立、闸门事件被漏掉」的情况。
+         注意它的 current_phase 来自定期落盘的 progress.json，**在闸门处会滞后**，
+         因此不能只靠它判断蓝图门。
+
+    run_id 变化即视为进入新一轮，清空去重状态 —— 否则上一轮记下的闸门会把这一轮挡掉。
+    """
+    idx = 0
+    t0 = time.time()
+    _resume_ev = {"split": "split_ready", "fix": "fix_ready",
+                  "accept": "accept_ready", "qc": "qc_failed"}
+    gates = set(_resume_ev.values()) | {"blueprint_ready"}
+    while time.time() - t0 < 900:
+        # ---- A. 事件流 ----
+        while idx < len(events):
+            ev, data = events[idx]; idx += 1
+            if ev not in gates:
+                continue
+            try:
+                d = json.loads(data) if isinstance(data, (str, bytes)) else data
+                if not isinstance(d, dict):
+                    d = {}
+            except Exception:
+                d = {}
+            if ev in _GATE.suppress:
+                continue
+            key = (ev, d.get("batch_id")) if ev == "accept_ready" else ev
+            if key in _GATE.seen:
+                continue
+            _GATE.seen.add(key)
+            if enabled and _GATE.enabled:
+                _drive_gate(port, ev, {**d, "run_id": _cur_run(port)})
+
+        # ---- B. 状态轮询兜底 ----
+        if enabled and _GATE.enabled:
+            try:
+                st = get(f"http://127.0.0.1:{port}/api/status", timeout=5)
+                cur = st.get("run_id")
+                if cur != _GATE.run:
+                    _GATE.run = cur
+                    _GATE.seen = set()
+                r = st.get("resume")
+                if isinstance(r, dict) and r.get("key"):
+                    ev = _resume_ev.get(r["key"])
+                    key = (ev, r.get("batch_id")) if ev == "accept_ready" else ev
+                    if ev and ev not in _GATE.suppress and key not in _GATE.seen:
+                        _GATE.seen.add(key)
+                        _drive_gate(port, ev, {**r, "run_id": cur})
+                elif st.get("current_phase") == "phase2_waiting" and st.get("blueprint"):
+                    if "blueprint_ready" not in _GATE.suppress \
+                            and "blueprint_ready" not in _GATE.seen:
+                        _GATE.seen.add("blueprint_ready")
+                        _drive_gate(port, "blueprint_ready",
+                                    {"blueprint": st["blueprint"], "run_id": cur})
+            except Exception as e:
+                print(f"    [gate] 状态轮询异常（忽略）: {type(e).__name__} {e}")
+        time.sleep(0.2)
+
+
+def start_run(payload, tries=120):
     """发起一次运行，遇到 409（上一轮尚未完全释放）就重试。
 
-    多场景连跑时，done 事件到达与后端 pipeline_running 复位之间存在窗口，
-    固定 sleep 会偶发 409 让整轮全 FAIL —— 轮询重试比 sleep 稳。
+    闸门驱动是全局的，这里不再逐场景起线程 —— 多个驱动会互相确认对方的闸门。
     tries×0.5s=60s：慢速 CI runner 上一次 finalize 落盘可能就要好几秒。
-
-    传入 events 即**先起闸门驱动再发 run**。闸门是无界 while 等待，若驱动
-    晚于 run 就位，run 足够快时会在无人看管下卡死在第一个闸门上（慢速 CI
-    上真实复现为 phase2_waiting 假死到超时，后续场景全 409）。
     """
-    if events is not None:
-        seen = gate_seen if isinstance(gate_seen, set) else set()
-        threading.Thread(target=gate_driver, args=(API_PORT, events, seen), daemon=True).start()
     last = None
     for _ in range(tries):
         try:
@@ -131,95 +222,40 @@ def start_run(payload, events=None, gate_seen=None, tries=120):
 
 
 def _drive_gate(port, ev, d):
-    """按事件类型提交对应闸门确认。异常只打印不抛出（闸门已被别处确认时属正常）。"""
+    """按事件类型提交对应闸门确认。异常只打印不抛出（闸门已被别处确认时属正常）。
+
+    刻意**不带 run_id**：_check_run_id 只在「传了且不匹配」时才拒绝，而
+    /api/status 的 run_id 在 run 起始的接管窗口内会滞后于 pipeline 的真实 run，
+    带着滞后的 id 去确认会被 409 静默吞掉，流水线就永远卡在闸门上（实测复现）。
+    后端同一时刻只可能有一个 run，交给它用 state.current_run_id 判定即可。
+    """
     try:
-        run_id = d.get("run_id")
         if ev == "split_ready":
-            post(f"http://127.0.0.1:{port}/api/split/confirm", {"run_id": run_id})
+            post(f"http://127.0.0.1:{port}/api/split/confirm", {})
             print("    [gate] 已确认拆书")
         elif ev == "blueprint_ready":
             bp = d.get("blueprint") or ""
             if len(bp) < 100:
-                bp = (bp + "\n（补充说明：保持人物弧光完整，补充过渡。）") * 4
-            post(f"http://127.0.0.1:{port}/api/blueprint/confirm",
-                 {"run_id": run_id, "blueprint": bp[:4000], "user_edited": False})
+                bp = "（测试桩：蓝图正文过短时补齐，确认接口要求 >=100 字）" + bp
+            post(f"http://127.0.0.1:{port}/api/blueprint/confirm", {"blueprint": bp})
             print("    [gate] 已确认蓝图")
         elif ev == "fix_ready":
             post(f"http://127.0.0.1:{port}/api/fix/confirm",
-                 {"run_id": run_id, "fix_list": [g.get("id") for g in d.get("gaps", [])]})
-            print("    [gate] 已确认断层")
+                 {"action": "accept", "gaps": []})
+            print("    [gate] 已确认诊断")
         elif ev == "accept_ready":
-            post(f"http://127.0.0.1:{port}/api/accept", {"run_id": run_id})
+            # 端点是 /api/accept（不是 /api/accept/confirm）；批次取自 progress.json
+            # 的 accept_pending_batch，因此无需在此处传 batch_id。
+            post(f"http://127.0.0.1:{port}/api/accept", {})
             print(f"    [gate] 已验收批次 {d.get('batch_id')}")
         elif ev == "qc_failed":
-            post(f"http://127.0.0.1:{port}/api/export/force", {"run_id": run_id})
+            post(f"http://127.0.0.1:{port}/api/export/force", {})
             print("    [gate] 已强制导出")
     except Exception as e:
         # 闸门已推进（409）说明已被确认过，属正常；其余仅记录不中断驱动线程
         if "409" in str(e):
             return
         print(f"    [gate] {ev} 确认异常（忽略）: {type(e).__name__} {e}")
-
-
-def gate_driver(port, events, seen, enabled=True):
-    """消费事件流并自动确认所有人工闸门。
-
-    流水线的几个门是**无限等待**的（while not Event），不驱动就只能停在原地 ——
-    这本身是正确行为，测试必须像真实用户那样点确认。
-
-    除事件流外还轮询 `/api/status` 的 `resume` 字段兜底 —— 这正是真实前端的做法
-    （见 App.vue fetchStatus 的 resume 分支）。新 run 起始的毫秒级窗口内，
-    SSE 订阅可能还没改绑到该 run 而漏掉闸门事件；光靠事件流会让流水线在闸门上
-    无限等待，后续场景全部 409 —— 慢速 CI runner 上真实发生过。
-    """
-    idx = 0
-    t0 = time.time()
-    _resume_ev = {"split": "split_ready", "fix": "fix_ready",
-                  "accept": "accept_ready", "qc": "qc_failed"}
-    while time.time() - t0 < 300:
-        try:
-            while idx < len(events):
-                ev, data = events[idx]; idx += 1
-                # 事件体未必是 JSON 对象（可能是数组/标量/None）。这里必须全包：
-                # 驱动线程一旦抛异常死掉，后面所有闸门都没人确认，流水线会**静默**
-                # 卡死在 phase2_waiting 上直到超时 —— 表现为「事件收到了却没确认」。
-                try:
-                    d = json.loads(data) if isinstance(data, (str, bytes)) else data
-                    if not isinstance(d, dict):
-                        d = {}
-                except Exception:
-                    d = {}
-                # 去重键：验收门是**每批一次**的，必须按 batch_id 区分，否则多批次时
-                # 第二个 accept_ready 会被当成重复事件跳过，流水线永远停在验收门。
-                # 其余闸门每轮只出现一次，按事件名去重即可（同时挡住 SSE 重放的重复投递）。
-                key = (ev, d.get("batch_id")) if ev == "accept_ready" else ev
-                if key in seen:
-                    continue
-                seen.add(key)
-                if enabled:
-                    _drive_gate(port, ev, d)
-        except Exception as e:
-            print(f"    [gate] 事件处理异常（忽略）: {type(e).__name__} {e}")
-        # 状态轮询兜底：补上事件流可能漏掉的闸门。**完全对齐真实前端的恢复路径**
-        # （App.vue fetchStatus）：闸门类走 s.resume.key，蓝图门走 s.blueprint。
-        # 缺了这一段，漏掉事件的闸门会让流水线无限等待，后续场景全 409。
-        if enabled:
-            try:
-                st = get(f"http://127.0.0.1:{port}/api/status")
-                r = st.get("resume")
-                if isinstance(r, dict) and r.get("key"):
-                    ev = _resume_ev.get(r["key"])
-                    if ev and ev not in seen:
-                        seen.add(ev)
-                        _drive_gate(port, ev, {**r, "run_id": r.get("run_id")})
-                elif st.get("current_phase") == "phase2_waiting" and st.get("blueprint") \
-                        and "blueprint_ready" not in seen:
-                    seen.add("blueprint_ready")
-                    _drive_gate(port, "blueprint_ready",
-                                {"blueprint": st["blueprint"], "run_id": st.get("run_id")})
-            except Exception as e:
-                print(f"    [gate] 状态轮询异常（忽略）: {type(e).__name__} {e}")
-        time.sleep(0.3)
 
 
 def make_novel(path: Path, chapters: int, paras: int = 3):
@@ -297,7 +333,11 @@ try:
     if not _up:
         err = api.stderr.read().decode("utf-8", "replace") if api.stderr else ""
         raise RuntimeError(f"后端/ mock 未就绪。api stderr:\n{err[-1500:]}")
+    # 所有场景共用同一个事件队列（_ALL_EVENTS），全局驱动据此按闸门事件行动
     print("mock / health:", get(f"{L}/v1/models")["data"][0]["id"], "|", get(f"{B}/api/health")["status"])
+    # 全局唯一的闸门驱动：像真实用户那样把所有人工闸门都点掉。
+    threading.Thread(target=gate_driver, args=(API_PORT, _ALL_EVENTS),
+                     daemon=True).start()
 
     # ---------- 准备输入 ----------
     inp = tmp / "in"; outd = tmp / "out"
@@ -321,9 +361,6 @@ try:
         "temperatures": {"diagnose": 0.3, "blueprint": 0.5, "refactor": 0.8, "stitch": 0.6},
         "batch_interval_sec": 0, "models": {},
     }
-    seen = set()
-    driver = threading.Thread(target=gate_driver, args=(API_PORT, events, seen), daemon=True)
-    driver.start()
     r = post(f"{B}/api/start", body)
     print("start ->", r["status"], r["run_id"][:8])
     check("/api/start 返回 run_id", bool(r.get("run_id")))
@@ -464,8 +501,6 @@ try:
     b2 = dict(body, input_path=str(dinp), output_path=str(doutd), input_format="docx",
               novel_name="docx测试", refactor_gates={}, compare_output=False,
               chapter_snapshots=False)
-    seen2 = set()
-    threading.Thread(target=gate_driver, args=(API_PORT, ev2, seen2), daemon=True).start()
     r2 = post(f"{B}/api/start", b2)
     print(f"  第二次 start -> {r2['status']}（刻意在上一轮 done 后立即发起）")
     ok2, snap2 = wait_done(ev2, th2, api_port=API_PORT)
@@ -510,8 +545,6 @@ try:
     e3in = tmp / "in3"; make_novel(e3in, chapters=4)
     o3 = tmp / "out3"
     ev3, th3 = sse_events(API_PORT, 240, stop_on="done")
-    seen3 = set()
-    threading.Thread(target=gate_driver, args=(API_PORT, ev3, seen3), daemon=True).start()
     r3 = post(f"{B}/api/start", dict(body, input_path=str(e3in), output_path=str(o3),
                                       novel_name="分隔符纠正", refactor_gates={},
                                       compare_output=False, chapter_snapshots=False))
@@ -548,7 +581,6 @@ try:
     e4in = tmp / "in4"; make_novel(e4in, chapters=6)
     o4 = tmp / "out4"
     ev4, th4 = sse_events(API_PORT, 300, stop_on="done")
-    threading.Thread(target=gate_driver, args=(API_PORT, ev4, set()), daemon=True).start()
     r4 = post(f"{B}/api/start", dict(body, input_path=str(e4in), output_path=str(o4),
                                       context_window=32768, novel_name="上下文超限自愈",
                                       refactor_gates={}, compare_output=False,
@@ -590,7 +622,6 @@ try:
     e5in = tmp / "in5"; o5 = tmp / "out5"
     wait_idle(B)                       # 等场景四完全释放，避免 409 静默吞掉启动
     ev5, th5 = sse_events(API_PORT, 240, stop_on="done")
-    threading.Thread(target=gate_driver, args=(API_PORT, ev5, set()), daemon=True).start()
     r5 = post(f"{B}/api/start", dict(body, input_mode="single_file", input_path=str(single),
                                       output_path=str(o5), novel_name="单文件识别",
                                       refactor_gates={}, compare_output=False,
@@ -638,7 +669,7 @@ try:
     ev6, th6 = sse_events(API_PORT, 240, stop_on="done")
     start_run(dict(body, input_mode="single_file", input_path=str(e6in / "ai_book.txt"),
                    output_path=str(o6), novel_name="AI拆章", refactor_gates={},
-                   compare_output=False, chapter_snapshots=False), events=ev6)
+                   compare_output=False, chapter_snapshots=False))
     ok6 = wait_done(ev6, th6, api_port=API_PORT)[0]
     st6 = get(f"{B}/api/status")
     # SSE 订阅可能在「新 run 起始的毫秒级窗口」漏掉终态事件；以磁盘状态兜底判定，
@@ -670,11 +701,13 @@ try:
         encoding="utf-8")
     o7 = tmp / "out7"
     ev7, th7 = sse_events(API_PORT, 240, stop_on="done")
-    seen7 = {"split_ready"}  # 拆书门由本场景手动确认
+    # 拆书门由本场景手动处理（先按自定义标记重拆，再确认）。
+    # 必须**在 run 起之前**就抑制：若全局驱动抢先确认了拆书预览，
+    # 流水线会直接冲进 phase1，重拆断言必然失败。
+    _GATE.suppress = {"split_ready"}
     start_run(dict(body, input_mode="single_file", input_path=str(e7in / "odd_book.txt"),
                    output_path=str(o7), novel_name="人工重拆", refactor_gates={},
-                   ai_split=False, compare_output=False, chapter_snapshots=False),
-              events=ev7, gate_seen=seen7)
+                   ai_split=False, compare_output=False, chapter_snapshots=False))
 
     def _wait_phase(phase, timeout=120):
         t0 = time.time()
@@ -705,8 +738,9 @@ try:
         time.sleep(0.3)
     check("按标记重拆生效（序章 + 2 章）", ok_redo,
           str(get(f"{B}/api/status").get("chapter_detection")))
-    # 之后让流水线继续跑完（驱动已在 start_run 前就位；split_ready 由上面手动处理）
+    # 手动确认拆书后解除抑制，后续闸门交回全局驱动
     post(f"{B}/api/split/confirm", {"run_id": rid7})
+    _GATE.suppress = set()
     ok7 = wait_done(ev7, th7, api_port=API_PORT)[0]
     if not ok7:
         errs7 = [d for e, d in ev7 if e == "error"]
@@ -735,7 +769,7 @@ try:
     ev8, th8 = sse_events(API_PORT, 300, stop_on="done")
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
                    novel_name="断点续跑", refactor_gates={}, compare_output=False,
-                   chapter_snapshots=False), events=ev8)
+                   chapter_snapshots=False))
     # 第一次应当失败。以 progress.json 为准轮询（不依赖可能漏事件的 SSE）：
     # error_logs 出现且 pipeline_running 已复位即视为「已中断」。
     prog8 = {}
@@ -765,7 +799,7 @@ try:
     ev8b, th8b = sse_events(API_PORT, 300, stop_on="done")
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
                    novel_name="断点续跑", refactor_gates={}, compare_output=False,
-                   chapter_snapshots=False), events=ev8b)
+                   chapter_snapshots=False))
     ok8 = wait_done(ev8b, th8b, api_port=API_PORT)[0]
     st8b = put(f"{L}/", {})["stats"]
     prog8b = json.loads((o8 / "progress.json").read_text(encoding="utf-8"))
@@ -807,7 +841,7 @@ try:
     ev8c, th8c = sse_events(API_PORT, 300, stop_on="done")
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
                    novel_name="断点续跑", refactor_gates={}, compare_output=False,
-                   chapter_snapshots=False), events=ev8c)
+                   chapter_snapshots=False))
     ok8c = wait_done(ev8c, th8c, api_port=API_PORT)[0]
     check("第三次重跑确实跑完（版本快照的前提）", ok8c, str([e for e, _ in ev8c][-4:]))
     # 成品版本：再跑一次同一目录，覆盖前应快照出上一版。

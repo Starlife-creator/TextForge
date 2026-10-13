@@ -21,6 +21,15 @@ reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-feature
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# v4 UUID 作为本地 API 的调用方 token（CSPRNG，够长且无弱随机源依赖）
+uuid = { version = "1", features = ["v4"] }
+
+# 孤儿进程看门狗要用 OpenProcess 探测 PID 存活；不引整个 winapi，只取这两个模块。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
 
 [profile.release]
 codegen-units = 1

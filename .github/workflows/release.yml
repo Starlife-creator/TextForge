@@ -42,6 +42,13 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      # Rust 依赖缓存。缺这一段时每次发布都要从零重编全部 crate，约 8 分半；
+      # build-check 里有缓存而 release 里没有，属于纯浪费。
+      - name: Rust 依赖缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
       - name: 前端依赖安装
         run: npm ci
 

@@ -1,6 +1,7 @@
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
 use serde::Serialize;
 use tauri::AppHandle;
@@ -8,6 +9,23 @@ use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 
 pub struct BackendProcess(pub Mutex<Option<CommandChild>>);
+
+/// 后端 API 的调用方 token，仅存在于进程内存 + sidecar 环境变量，**从不落盘**。
+///
+/// 落盘等于公开：任何本地进程都读得到 data\port.json。放在这里只能由同进程的
+/// 前端经 Tauri IPC 取到，别的本地进程和浏览器里的网页都拿不到。
+static AUTH_TOKEN: OnceLock<String> = OnceLock::new();
+
+/// 生成并返回本次运行的 token（幂等）。
+pub fn auth_token() -> &'static str {
+    AUTH_TOKEN.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// 供前端取 token 的 Tauri 命令。走 IPC，不经过网络。
+#[tauri::command]
+pub fn get_backend_token() -> String {
+    auth_token().to_string()
+}
 
 #[derive(Serialize)]
 #[serde(tag = "status", content = "data")]
@@ -83,6 +101,73 @@ fn get_pid_from_json() -> u32 {
         .unwrap_or(0)
 }
 
+/// PID 是否还活着。用 OpenProcess 而非 tasklist 探测 —— 不 fork 子进程，且快。
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        const STILL_ACTIVE: u32 = 259;
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            let _ = CloseHandle(h);
+            ok && code == STILL_ACTIVE
+        }
+    }
+    #[cfg(not(windows))]
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// 清理上一轮遗留的孤儿后端。
+///
+/// 为什么需要：正常关窗走 /api/system/shutdown 优雅退出（见 lib.rs），但如果外壳
+/// **崩溃**或被任务管理器强杀，那条路径不会执行，backend 会带着 40MB 的 %TEMP%\_MEI
+/// 目录一直驻留。启动时兜底收掉，避免反复崩溃后累积多个孤儿。
+///
+/// 只在端口文件里的 PID 仍存活且**端口探不通**时才动手 —— 宁可漏杀也不能误杀
+/// 另一个正在使用的实例。
+pub fn reap_orphan_backend() {
+    let pid = get_pid_from_json();
+    if pid == 0 || !pid_alive(pid) {
+        return;
+    }
+    let port = get_port_from_json();
+    if port > 0 && probe_port(port) {
+        return; // 还活着且服务可达 —— 是别人的实例，不碰
+    }
+    eprintln!("[backend] 清理上一轮遗留的孤儿进程 pid={pid}");
+    kill_tree(pid);
+    if let Some(p) = port_file_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// 按进程树结束进程（仅 Windows）。
+///
+/// child.kill() 只对 Tauri 直接拉起的那个进程生效；PyInstaller onefile 还会再拉起
+/// 一个跑 Python 的子进程，于是子进程变孤儿继续运行。taskkill /T 连后代一起收掉。
+/// 失败静默忽略 —— 这只是 /api/shutdown 之后的兜底路径。
+pub fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
+}
+
 /// TCP 探测：端口文件存在 ≠ 进程活着。用它把「有 port.json 但连不上」区分出来。
 fn probe_port(port: u16) -> bool {
     if port == 0 {
@@ -101,6 +186,9 @@ pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
         let _ = std::fs::create_dir_all(&dir);
         cmd = cmd.env("TEXTFORGE_DATA_DIR", dir);
     }
+    // 注入调用方 token：后端所有接口（/api/health 除外）都会校验 X-TextForge-Token，
+    // 挡住「任何本地进程读 port.json 就能调 /api/start 读写任意路径」这一攻击面。
+    cmd = cmd.env("TEXTFORGE_TOKEN", auth_token());
     let (mut rx, child) = cmd.spawn()
         .map_err(|e| format!("sidecar 启动失败: {}", e))?;
     tauri::async_runtime::spawn(async move {
@@ -220,5 +308,77 @@ pub async fn restart_backend(app: AppHandle, state: tauri::State<'_, BackendProc
             Ok(())
         }
         Err(e) => Err(format!("重启失败: {}，请手动重启应用", e)),
+    }
+}
+// ---------------------------------------------------------------------------
+// 单元测试
+//
+// 这层此前 0 覆盖，却承载着进程生命周期、端口发现、数据目录解析 —— 开发时在这里
+// 连续踩了三个坑（孤儿进程、_MEI 临时目录残留、kill 顺序），全靠手工点窗口复现。
+// 下面把纯逻辑钉死；涉及真实进程的部分留给集成测试。
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_token_is_idempotent_and_strong() {
+        let a = auth_token();
+        let b = auth_token();
+        assert_eq!(a, b, "token must be generated only once; otherwise the value                             injected into the sidecar differs from what the UI reads");
+        assert_eq!(a.len(), 36, "UUID v4 text form is always 36 chars");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+    }
+
+    #[test]
+    fn auth_token_is_never_written_to_disk() {
+        // 防回归：token 一旦进了 port.json，任何本地进程都读得到，鉴权形同虚设。
+        let t = auth_token().to_string();
+        if let Some(pf) = port_file_path() {
+            if let Ok(content) = std::fs::read_to_string(&pf) {
+                assert!(!content.contains(&t), "token must never appear in port.json");
+            }
+        }
+    }
+
+    #[test]
+    fn port_file_lives_under_data_dir() {
+        let expected = std::env::current_exe().unwrap().parent().unwrap()
+            .join("data").join("port.json");
+        assert_eq!(port_file_path(), Some(expected),
+                   "port.json must sit next to the data dir so Rust and Python agree");
+    }
+
+    #[test]
+    fn pid_zero_is_not_alive() {
+        assert!(!pid_alive(0), "PID 0 is not a valid process");
+    }
+
+    #[test]
+    fn own_pid_is_alive() {
+        assert!(pid_alive(std::process::id()), "the running test process must be alive");
+    }
+
+    #[test]
+    fn nonexistent_pid_is_dead() {
+        assert!(!pid_alive(0x7FFF_FF00), "an unused high PID must report dead");
+    }
+
+    #[test]
+    fn probe_port_zero_fails() {
+        assert!(!probe_port(0), "port 0 is meaningless and must fail fast");
+    }
+
+    #[test]
+    fn missing_port_file_yields_zero_without_panic() {
+        // 启动早期 port.json 还不存在是常态，绝不能 panic
+        let _ = get_port_from_json();
+        let _ = get_pid_from_json();
+    }
+
+    #[test]
+    fn kill_tree_tolerates_dead_pid() {
+        // reap_orphan_backend 会对过期 PID 调用它，必须容错
+        kill_tree(0x7FFF_FF00);
     }
 }

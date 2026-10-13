@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes import state
+from utils.auth import TokenAuthMiddleware
 from utils.logging_setup import setup_logging
 import asyncio
 
@@ -39,6 +40,11 @@ app.add_middleware(
     ],
     allow_methods=["*"], allow_headers=["*"], allow_credentials=False,
 )
+
+# 本地 API 调用方鉴权。放在 CORS **之后**注册，使其在请求链上更靠外层，
+# 无效请求不会被 CORS 处理逻辑白跑一遍。TEXTFORGE_TOKEN 未设置时自动放行
+# （开发/测试模式），生产由外壳注入。
+app.add_middleware(TokenAuthMiddleware)
 
 app.include_router(health_router)
 app.include_router(start_router)

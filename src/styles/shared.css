@@ -1,0 +1,115 @@
+/**
+ * 弹窗与列表共用的样式（**非 scoped**）。
+ *
+ * 为什么单独抽成全局文件：App.vue 的样式是 <style scoped>，带作用域属性，
+ * **不会作用到子组件内部元素**（只作用于子组件的根节点）。一旦把任务历史、
+ * 成品版本等弹窗拆成独立组件，这些类名就会全部失效 —— 而失效表现是
+ * 「弹窗能开但完全没样式」，很容易被误判成组件没拆对。
+ *
+ * 这里改成全局引入一次，App.vue 与所有弹窗组件共用同一份定义。
+ */
+
+/* ---------- 弹窗外壳 ---------- */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  background: #fff;
+  border-radius: 10px;
+  padding: 20px 22px;
+  width: min(680px, 92vw);
+  max-height: 84vh;
+  overflow: auto;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+.modal h3 { margin: 0 0 6px; font-size: 16px; }
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+.modal-actions button { margin-left: 0; }
+.hint { color: #6b7280; font-size: 12px; margin: 4px 0; }
+.mono { font-family: Consolas, monospace; word-break: break-all; }
+
+/* ---------- 徽章 ---------- */
+.badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  background: #e5e7eb;
+  color: #374151;
+}
+.badge.ok { background: #dcfce7; color: #166534; }
+.badge.err2 { background: #fee2e2; color: #991b1b; }
+.badge.paused { background: #fef3c7; color: #92400e; }
+.badge.running { background: #dbeafe; color: #1d4ed8; }
+
+/* ---------- 列表行 ---------- */
+.sum-list { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.split-row {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.log-empty {
+  color: #9ca3af;
+  font-size: 13px;
+  padding: 18px 0;
+  text-align: center;
+}
+
+/* ---------- 任务历史 ---------- */
+.hist-toolbar {
+  display: flex;
+  gap: 8px;
+  margin: 10px 0 4px;
+}
+.hist-toolbar input { flex: 1; }
+.hist-row { display: flex; justify-content: space-between; gap: 12px; }
+.hist-main { flex: 1; min-width: 0; }
+.hist-title {
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.hist-ago { color: #9ca3af; font-size: 11px; font-weight: normal; }
+.hist-bar {
+  height: 6px;
+  background: #e5e7eb;
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 6px 0;
+}
+.hist-bar-fill {
+  height: 100%;
+  background: #3b82f6;
+  transition: width 0.2s;
+}
+.hist-bar-fill.done { background: #22c55e; }
+.hist-bar-fill.bad { background: #ef4444; }
+.hist-actions { display: flex; flex-direction: column; gap: 6px; }
+.open-btn {
+  padding: 4px 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  background: #fff;
+  cursor: pointer;
+}
+.open-btn.ghost, button.ghost {
+  background: transparent;
+}
+.out-status {
+  font-size: 12px;
+  margin-top: 4px;
+}
+.out-status.err { color: #b91c1c; }

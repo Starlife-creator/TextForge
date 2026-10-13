@@ -784,6 +784,55 @@ finally:
         os.environ["APPDATA"] = _real_appdata
     shutil.rmtree(_hist_dir, ignore_errors=True)
 
+# ---------- 本地 API 调用方鉴权 ----------
+# 后端绑 127.0.0.1 随机端口，但读一下 port.json 就能调接口：
+# /api/start 能指定任意读写路径，/api/system/open 能 os.startfile 任意路径。
+# 外壳用 CSPRNG 生成 token 注入 sidecar（从不落盘），请求必须带 X-TextForge-Token。
+import utils.auth as _AUTH
+from fastapi.testclient import TestClient as _TC2
+from app import app as _app2
+
+_real_tok = os.environ.get(_AUTH.ENV_KEY)
+try:
+    # 1) 未注入 = 开发/测试模式，必须放行（否则所有测试都会被 401 拦死）
+    os.environ.pop(_AUTH.ENV_KEY, None)
+    check("未配置 token 时鉴权不启用", _AUTH.is_enforced() is False, "")
+    with _TC2(_app2) as _c:
+        check("未配置 token 时正常放行", _c.get("/api/health").status_code == 200,
+              str(_c.get("/api/health").status_code))
+
+    # 2) 注入后必须校验
+    os.environ[_AUTH.ENV_KEY] = "s3cret-token-for-test"
+    check("配置 token 后鉴权启用", _AUTH.is_enforced() is True, "")
+    check("比对逻辑：正确 token 通过", _AUTH.check({_AUTH.HEADER: "s3cret-token-for-test"}))
+    check("比对逻辑：头名大小写不敏感（HTTP 头本身不区分大小写）",
+          _AUTH.check({"x-textforge-token": "s3cret-token-for-test"}), "")
+    check("比对逻辑：错误 token 拒绝", not _AUTH.check({_AUTH.HEADER: "wrong"}))
+    check("比对逻辑：缺 token 拒绝", not _AUTH.check({}))
+    check("比对逻辑：空 token 拒绝", not _AUTH.check({_AUTH.HEADER: ""}))
+    # 前缀相同但整体不同 —— 必须拒绝（防 startswith 式实现漏判）
+    check("比对逻辑：token 前缀不得通过", not _AUTH.check({_AUTH.HEADER: "s3cret"}), "")
+
+    with _TC2(_app2) as _c:
+        check("无 token 访问业务接口返回 401",
+              _c.get("/api/status").status_code == 401,
+              str(_c.get("/api/status").status_code))
+        check("错误 token 返回 401",
+              _c.get("/api/status", headers={_AUTH.HEADER: "nope"}).status_code == 401, "")
+        check("/api/health 豁免鉴权（供探活）",
+              _c.get("/api/health").status_code == 200, "")
+        check("带正确 token 放行",
+              _c.get("/api/status", headers={_AUTH.HEADER: "s3cret-token-for-test"}).status_code
+              == 200, "")
+        # 写操作才是真正的攻击面，必须同样受保护
+        check("无 token 的写操作被拒（POST /api/stop）",
+              _c.post("/api/stop", json={}).status_code == 401, "")
+finally:
+    if _real_tok is None:
+        os.environ.pop(_AUTH.ENV_KEY, None)
+    else:
+        os.environ[_AUTH.ENV_KEY] = _real_tok
+
 # ---------- 优雅退出钩子（/api/shutdown） ----------
 # 这条路由必须在**随 app 注册的路由表**里，而不是 main.py 的 __main__ 块里：
 # 写在那里的版本只在冻结 exe 里存在，源码运行与单测都看不到，重建一旦遗漏就

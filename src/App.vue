@@ -5,6 +5,7 @@ import { isTauri } from '@tauri-apps/api/core';
 import { waitForPort } from './api/backend';
 import { connectSSE, disconnectSSE, type SSEHandlers } from './api/sse';
 import SettingsModal from './components/SettingsModal.vue';
+import { apiFetch, initAuth } from './api/client';
 import {
   fetchHistory, forgetHistory, fetchVersions, restoreVersion,
   type HistoryItem, type VersionInfo,
@@ -299,9 +300,12 @@ onMounted(async () => {
   void connectBackend();
 });
 
-/** 建立后端连接：拿端口 → 接 SSE → 拉状态 → 起轮询。失败也让用户能进设置面板自救。 */
+/** 建立后端连接：取令牌 → 拿端口 → 接 SSE → 拉状态 → 起轮询。失败也让用户能进设置面板自救。 */
 async function connectBackend() {
   try {
+    // 必须最先取：后端 release 模式要求每个请求带 X-TextForge-Token，
+    // 晚于第一个 fetch 获取就会全部 401（表现为界面一片空白）。
+    await initAuth();
     port.value = await waitForPort();
     connectSSE(port.value, sseHandlers);
     // 页面刷新/SSE 晚连接时，从后端恢复 UI 状态（暂停态、待确认蓝图、用量等）
@@ -377,6 +381,12 @@ const histQuery = ref('');
 const histSort = ref<'recent' | 'name' | 'progress'>('recent');
 const histBusy = ref(false);
 
+/** 未完成且可续跑的数量，用于「任务历史」按钮上的角标提醒。
+ *  刻意放在 App.vue 而非 HistoryModal：这里统计的是**全部**未完成条目，
+ *  与弹窗内按搜索词过滤后的列表无关。 */
+const historyPendingCount = computed(() =>
+  historyItems.value.filter((h) => !h.finished && !h.running && h.current_phase).length);
+
 async function refreshHistory() {
   if (!port.value || histBusy.value) return;
   histBusy.value = true;
@@ -385,62 +395,6 @@ async function refreshHistory() {
   finally { histBusy.value = false; }
 }
 
-/** 过滤 + 排序后的可见列表。搜索同时匹配书名与输出/输入路径。 */
-const historyView = computed(() => {
-  const q = histQuery.value.trim().toLowerCase();
-  let list = historyItems.value.filter((h) => {
-    if (!q) return true;
-    return [h.novel_name, h.output_path, h.input_path]
-      .some((v) => (v || '').toLowerCase().includes(q));
-  });
-  const byUpdated = (a: HistoryItem, b: HistoryItem) =>
-    (b.updated_at || '').localeCompare(a.updated_at || '');
-  if (histSort.value === 'recent') list = [...list].sort(byUpdated);
-  else if (histSort.value === 'name') {
-    list = [...list].sort((a, b) =>
-      (a.novel_name || a.output_path || '').localeCompare(b.novel_name || b.output_path || ''));
-  } else {
-    // 进度低（未完成）的排前面：它们才是用户回来要续跑的
-    list = [...list].sort((a, b) => {
-      const pa = a.batches_total ? (a.batches_done || 0) / a.batches_total : (a.finished ? 1 : 0);
-      const pb = b.batches_total ? (b.batches_done || 0) / b.batches_total : (b.finished ? 1 : 0);
-      return pa - pb || byUpdated(a, b);
-    });
-  }
-  return list;
-});
-
-/** 未完成且可续跑的数量，用于按钮上的角标提醒 */
-const historyPendingCount = computed(() =>
-  historyItems.value.filter((h) => !h.finished && !h.running && h.current_phase).length);
-
-function historyState(h: HistoryItem): { text: string; cls: string } {
-  if (h.running) return { text: '运行中', cls: 'badge running' };
-  if (h.finished) return { text: '已完成', cls: 'badge ok' };
-  if (h.last_error) return { text: '出错中断', cls: 'badge err2' };
-  if (h.current_phase && h.current_phase !== 'phase0') return { text: '未完成·可续跑', cls: 'badge paused' };
-  return { text: '未开始', cls: '' };
-}
-
-/** 批次进度百分比（无批次信息时按完成与否给 0/100） */
-function historyPct(h: HistoryItem): number {
-  if (h.finished) return 100;
-  if (!h.batches_total) return 0;
-  return Math.min(100, Math.round(((h.batches_done || 0) / h.batches_total) * 100));
-}
-
-/** 相对时间：比 ISO 串友好得多（"3 分钟前" vs "2026-10-12T04:56:33Z"） */
-function historyAgo(iso?: string | null): string {
-  if (!iso) return '';
-  const t = Date.parse(iso);
-  if (Number.isNaN(t)) return iso;
-  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
-  if (s < 60) return '刚刚';
-  if (s < 3600) return `${Math.floor(s / 60)} 分钟前`;
-  if (s < 86400) return `${Math.floor(s / 3600)} 小时前`;
-  if (s < 86400 * 30) return `${Math.floor(s / 86400)} 天前`;
-  return iso.slice(0, 10);
-}
 
 async function clearAllHistory() {
   if (!port.value) return;
@@ -453,7 +407,7 @@ async function clearAllHistory() {
 }
 /** 裸请求（供不需要强类型的清空操作使用） */
 async function req0(path: string) {
-  const res = await fetch(`${apiBase()}${path}`, {
+  const res = await apiFetch(`${apiBase()}${path}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -505,16 +459,11 @@ async function doRestore(v: VersionInfo) {
   } catch (e: any) { topError.value = `恢复失败：${e.message}`; }
   finally { versionBusy.value = false; }
 }
-function fmtSize(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
-}
 
 async function refreshOutInfo() {
   if (!port.value || !outputPath.value) { outInfo.value = null; return; }
   try {
-    const res = await fetch(`${apiBase()}/api/output/inspect?output_path=${encodeURIComponent(outputPath.value)}`);
+    const res = await apiFetch(`${apiBase()}/api/output/inspect?output_path=${encodeURIComponent(outputPath.value)}`);
     outInfo.value = res.ok ? await res.json() : null;
   } catch { outInfo.value = null; }
 }
@@ -523,7 +472,7 @@ async function clearOutputDir() {
   if (!window.confirm('确定清空输出目录里的 TextForge 产物吗？\n（只删 01_summaries / 02_workspace / 03_final / _diagnostics / Story_Bible.md / progress.json，不影响你的其它文件）')) return;
   clearingOutput.value = true;
   try {
-    const res = await fetch(`${apiBase()}/api/output/clear`, {
+    const res = await apiFetch(`${apiBase()}/api/output/clear`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ output_path: outputPath.value }),
     });
@@ -543,7 +492,7 @@ async function fetchStatus(): Promise<boolean> {
   if (!port.value) return false;
   try {
     const q = outputPath.value ? `?output_path=${encodeURIComponent(outputPath.value)}` : '';
-    const res = await fetch(`http://127.0.0.1:${port.value}/api/status${q}`);
+    const res = await apiFetch(`http://127.0.0.1:${port.value}/api/status${q}`);
     if (!res.ok) return false;
     const s = await res.json();
     isPaused.value = !!s.paused;
@@ -852,7 +801,7 @@ async function startPipeline() {
     models: buildModels(),
   };
   try {
-    const res = await fetch(`${apiBase()}/api/start`, {
+    const res = await apiFetch(`${apiBase()}/api/start`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -887,7 +836,7 @@ async function confirmSplit() {
   if (confirmingSplit.value) return; // 防重复点击：Enter 键和鼠标都会触发
   confirmingSplit.value = true;
   try {
-    const res = await fetch(`${apiBase()}/api/split/confirm`, {
+    const res = await apiFetch(`${apiBase()}/api/split/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
@@ -912,7 +861,7 @@ async function redoSplit() {
   if (!markers.length) { topError.value = '请至少填写一个章节标题行（每行一个，需与原文完全一致）'; return; }
   redoingSplit.value = true;
   try {
-    const res = await fetch(`${apiBase()}/api/split/redo`, {
+    const res = await apiFetch(`${apiBase()}/api/split/redo`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value, markers }),
@@ -951,7 +900,7 @@ async function confirmFix() {
   confirmingFix.value = true;
   try {
     const descriptions = selectedGapDescriptions();
-    const res = await fetch(`${apiBase()}/api/fix/confirm`, {
+    const res = await apiFetch(`${apiBase()}/api/fix/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value, fix_list: descriptions }),
@@ -972,7 +921,7 @@ async function confirmAccept() {
   if (confirmingAccept.value) return; // 防重复点击
   confirmingAccept.value = true;
   try {
-    const res = await fetch(`${apiBase()}/api/accept`, {
+    const res = await apiFetch(`${apiBase()}/api/accept`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
@@ -993,7 +942,7 @@ async function regenChapter(c: any) {
   if (regenerating.value.has(c.id)) return; // 防重复
   regenerating.value.add(c.id);
   try {
-    const res = await fetch(`${apiBase()}/api/regen_chapter`, {
+    const res = await apiFetch(`${apiBase()}/api/regen_chapter`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value, chapter_id: c.id }),
@@ -1021,7 +970,7 @@ async function openFinal() {
   const root = outputPath.value.replace(/[\\/]+$/, '');
   // C4：先列出成品文件，优先直开文档；无可开文件则打开根目录
   try {
-    const res = await fetch(`${apiBase()}/api/final_files?output_path=${encodeURIComponent(root)}`);
+    const res = await apiFetch(`${apiBase()}/api/final_files?output_path=${encodeURIComponent(root)}`);
     if (res.ok) {
       const d = await res.json();
       const files = d.files || [];
@@ -1040,7 +989,7 @@ async function openFinal() {
 
 async function callOpenOutput(path: string): Promise<boolean> {
   try {
-    const res = await fetch(`${apiBase()}/api/open_output`, {
+    const res = await apiFetch(`${apiBase()}/api/open_output`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ output_path: path }),
@@ -1060,7 +1009,7 @@ async function forceExport() {
   if (forcingExport.value) return; // 防重复点击
   forcingExport.value = true;
   try {
-    const res = await fetch(`${apiBase()}/api/export/force`, {
+    const res = await apiFetch(`${apiBase()}/api/export/force`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
@@ -1098,7 +1047,7 @@ async function exportLog() {
 async function openComparisons() {
   if (!outputPath.value) return;
   try {
-    const res = await fetch(`${apiBase()}/api/comparisons?output_path=${encodeURIComponent(outputPath.value)}`);
+    const res = await apiFetch(`${apiBase()}/api/comparisons?output_path=${encodeURIComponent(outputPath.value)}`);
     if (!res.ok) { alert('获取对照失败'); return; }
     const d = await res.json();
     comparisonItems.value = d.items || [];
@@ -1118,7 +1067,7 @@ async function confirmBlueprint() {
   }
   confirmingBlueprint.value = true;
   try {
-    const res = await fetch(`${apiBase()}/api/blueprint/confirm`, {
+    const res = await apiFetch(`${apiBase()}/api/blueprint/confirm`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1169,7 +1118,7 @@ async function control(action: 'pause' | 'resume' | 'stop') {
   controlling.value = true;
   try {
     const label = { pause: '暂停', resume: '恢复', stop: '停止' }[action];
-    const res = await fetch(`${apiBase()}/api/${action}`, {
+    const res = await apiFetch(`${apiBase()}/api/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
@@ -1656,6 +1605,31 @@ const canStart = computed(() =>
       </div>
     </div>
 
+    <!-- 任务历史（跨会话） -->
+    <HistoryModal
+      v-if="showHistory"
+      :items="historyItems"
+      :query="histQuery"
+      :sort="histSort"
+      :busy="histBusy"
+      @update:query="histQuery = $event"
+      @update:sort="histSort = $event"
+      @refresh="refreshHistory()"
+      @load="loadFromHistory"
+      @forget="forgetHistoryItem"
+      @clear="clearAllHistory"
+      @close="showHistory = false"
+    />
+
+    <!-- 成品版本（重跑前的整版快照，可回滚） -->
+    <VersionsModal
+      v-if="showVersions"
+      :versions="versionList"
+      :busy="versionBusy"
+      @restore="doRestore"
+      @close="showVersions = false"
+    />
+
     <!-- 系统与后端设置 -->
     <SettingsModal
       v-if="showSettings"
@@ -1672,88 +1646,6 @@ const canStart = computed(() =>
       @apply-model="applyModelFromSettings"
       @apply-context="applyContextFromSettings"
     />
-
-    <!-- 任务历史（跨会话） -->
-    <div v-if="showHistory" class="modal-mask" @click.self="showHistory = false">
-      <div class="modal">
-        <h3>任务历史</h3>
-        <p class="hint">记录你跑过的每一本书：跑到哪一阶段、上次为什么停的都在这里。点「载入」填回配置，再点开始即可断点续跑。</p>
-        <div class="hist-toolbar">
-          <input v-model="histQuery" type="search" placeholder="搜索书名或路径…" />
-          <select v-model="histSort">
-            <option value="recent">最近更新</option>
-            <option value="progress">进度（未完成优先）</option>
-            <option value="name">书名</option>
-          </select>
-          <button class="ghost" :disabled="histBusy" @click="refreshHistory()">
-            {{ histBusy ? '刷新中…' : '刷新' }}
-          </button>
-        </div>
-        <div v-if="!historyView.length" class="log-empty">
-          {{ historyItems.length ? '没有匹配的任务' : '还没有历史任务' }}
-        </div>
-        <div class="sum-list">
-          <div v-for="(h, i) in historyView" :key="i" class="split-row hist-row">
-            <div class="hist-main">
-              <div class="hist-title">
-                {{ h.novel_name || '（未命名）' }}
-                <span class="badge" :class="historyState(h).cls">{{ historyState(h).text }}</span>
-                <span v-if="h.is_current" class="badge paused">当前目录</span>
-                <span class="hist-ago">{{ historyAgo(h.updated_at) }}</span>
-              </div>
-              <div class="hist-bar" :title="`批次 ${h.batches_done || 0}/${h.batches_total || 0}`">
-                <div class="hist-bar-fill" :style="{ width: historyPct(h) + '%' }"
-                     :class="{ done: h.finished, bad: !!h.last_error }"></div>
-              </div>
-              <div class="hint">
-                {{ h.total_chapters || 0 }} 章 · 批次 {{ h.batches_done || 0 }}/{{ h.batches_total || 0 }}
-                <template v-if="h.current_phase">· {{ h.current_phase }}</template>
-              </div>
-              <div class="hint mono">{{ h.output_path }}</div>
-              <div v-if="h.last_error" class="out-status err">上次中断：{{ h.last_error }}</div>
-              <div v-if="h.config_drift && h.config_drift.length" class="out-status err">
-                续跑配置与上次不同：{{ h.config_drift.join('；') }}
-              </div>
-            </div>
-            <div class="hist-actions">
-              <button class="open-btn" @click="loadFromHistory(h)">载入</button>
-              <button class="open-btn ghost" @click="forgetHistoryItem(h)">移除</button>
-            </div>
-          </div>
-        </div>
-        <div class="modal-actions">
-          <button v-if="historyItems.length" class="ghost" @click="clearAllHistory">清空历史记录</button>
-          <span></span>
-          <button @click="showHistory = false">关闭</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- 成品版本（重跑前的整版快照，可回滚） -->
-    <div v-if="showVersions" class="modal-mask" @click.self="showVersions = false">
-      <div class="modal">
-        <h3>成品版本</h3>
-        <p class="hint">每次重跑覆盖成品前，都会把上一版完整快照到这里（保留最近 10 版）。点「恢复」即可回滚；恢复前当前版本也会再留一份。</p>
-        <div v-if="versionBusy" class="log-empty">读取中…</div>
-        <div v-else-if="!versionList.length" class="log-empty">还没有历史版本（重跑一次就会自动留存上一版）</div>
-        <div class="sum-list">
-          <div v-for="v in versionList" :key="v.id" class="split-row hist-row">
-            <div class="hist-main">
-              <div class="hist-title">{{ v.id }}</div>
-              <div class="hint">{{ v.files }} 个文件 · {{ fmtSize(v.size) }}</div>
-              <div class="hint mono">{{ v.names.slice(0, 3).join('、') }}{{ v.names.length > 3 ? '…' : '' }}</div>
-            </div>
-            <div class="hist-actions">
-              <button class="open-btn" :disabled="versionBusy" @click="doRestore(v)">恢复</button>
-            </div>
-          </div>
-        </div>
-        <div class="modal-actions">
-          <span></span>
-          <button @click="showVersions = false">关闭</button>
-        </div>
-      </div>
-    </div>
   </div>
 </template>
 
@@ -1882,10 +1774,6 @@ const canStart = computed(() =>
 .tree-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
 html.dark .tree-box { background: #232b39; border-color: #4a5568; }
 html.dark .tree-toggle { color: #a0aec0; }
-.open-btn { margin-left: auto; padding: 4px 12px; border: 1px solid #3182ce; color: #3182ce; background: #fff; border-radius: 5px; font-size: 12px; cursor: pointer; }
-.open-btn:hover { background: #ebf8ff; }
-.open-btn.ghost { margin-left: 6px; border-color: #38a169; color: #38a169; }
-.open-btn.ghost:hover { background: #f0fff4; }
 
 .row {
   display: flex;
@@ -1959,9 +1847,6 @@ html.dark .tree-toggle { color: #a0aec0; }
   margin-bottom: 12px;
 }
 .phase { font-size: 14px; font-weight: 600; color: #2d3748; }
-.badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
-.badge.running { background: #bee3f8; color: #2c5282; }
-.badge.paused { background: #fefcbf; color: #975a16; }
 
 .controls { display: flex; gap: 8px; margin-bottom: 12px; }
 .controls button {
@@ -2009,32 +1894,11 @@ html.dark .tree-toggle { color: #a0aec0; }
 .log-warn { color: #fefcbf; }
 .log-err { color: #fc8181; }
 .log-accent { color: #90cdf4; }
-.log-empty { color: #718096; }
 .log-head { display: flex; align-items: center; gap: 8px; color: #4a5568; font-size: 12px; margin-bottom: 6px; }
 .log-count { color: #718096; }
 .min-btn { margin-left: auto; padding: 2px 10px; background: transparent; border: 1px solid #cbd5e0; border-radius: 4px; color: #4a5568; font-size: 12px; cursor: pointer; }
 .min-btn:hover { background: #edf2f7; }
 
-.modal-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-}
-.modal {
-  background: #fff;
-  border-radius: 8px;
-  padding: 20px 24px;
-  width: 640px;
-  max-height: 85vh;
-  display: flex;
-  flex-direction: column;
-}
-.modal h3 { margin: 0 0 6px; }
-.hint { font-size: 12px; color: #718096; margin: 0 0 10px; }
 .blueprint-area {
   flex: 1;
   width: 100%;
@@ -2045,48 +1909,18 @@ html.dark .tree-toggle { color: #a0aec0; }
   resize: vertical;
   min-height: 300px;
 }
-.modal-actions {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-top: 12px;
-}
 .sum-toggle {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: #4a5568; cursor: pointer; margin: 10px 0 4px;
 }
 .sum-toggle input { width: auto; margin: 0; }
-.sum-list {
-  max-height: 160px; overflow-y: auto;
-  border: 1px solid #e2e8f0; border-radius: 5px; padding: 8px 10px;
-  font-size: 12px; background: #f7fafc;
-}
 .sum-empty { color: #718096; }
-.split-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
 .split-id { flex: 1; color: #2d3748; word-break: break-all; }
 .redo-split { margin-top: 10px; }
-.out-status { margin: 6px 0 0; font-size: 12px; line-height: 1.6; color: #4a5568; }
-.out-status.err { color: #c53030; }
-.hist-row { align-items: flex-start; gap: 8px; }
-.hist-main { flex: 1; min-width: 0; }
-.hist-title { font-size: 13px; font-weight: 600; margin-bottom: 2px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.hist-actions { display: flex; gap: 6px; flex-shrink: 0; }
-.hist-ago { margin-left: auto; font-size: 11px; color: #718096; font-weight: 400; }
-.hist-toolbar { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
-.hist-toolbar input { flex: 1; padding: 5px 8px; font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px; }
-.hist-toolbar select { padding: 5px 8px; font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px; }
-.hist-bar { height: 4px; background: #e2e8f0; border-radius: 2px; margin: 6px 0 4px; overflow: hidden; }
-.hist-bar-fill { height: 100%; background: #3182ce; transition: width .2s; }
-.hist-bar-fill.done { background: #38a169; }
-.hist-bar-fill.bad { background: #e53e3e; }
-.mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; word-break: break-all; }
 .redo-split summary { cursor: pointer; color: #4a5568; font-size: 13px; }
 .redo-split textarea { width: 100%; margin-top: 8px; padding: 6px 8px; font-family: inherit;
   font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box; }
 .redo-split button { margin-top: 8px; }
-.badge.err2 { background: #fed7d7; color: #822727; }
-.badge-err { background: #fed7d7; color: #822727; }
-.badge-warn { background: #fefcbf; color: #975a16; }
 .fix-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; cursor: pointer; }
 .fix-row input { width: auto; margin: 0; }
 .fix-desc { color: #4a5568; word-break: break-all; }
@@ -2096,15 +1930,6 @@ html.dark .tree-toggle { color: #a0aec0; }
 .sum-item summary { cursor: pointer; color: #2d3748; margin-bottom: 2px; }
 .sum-preview { color: #4a5568; white-space: pre-wrap; word-break: break-all; }
 .count { font-size: 12px; color: #718096; }
-.modal-actions button {
-  padding: 8px 20px;
-  background: #3182ce;
-  color: #fff;
-  border: none;
-  border-radius: 5px;
-  cursor: pointer;
-}
-.modal-wide { width: 780px; max-width: 92vw; }
 .comp-preview {
   margin-top: 10px; max-height: 60vh; overflow: auto;
   background: #1a202c; color: #e2e8f0; border-radius: 6px;

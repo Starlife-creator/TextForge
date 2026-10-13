@@ -1,3 +1,4 @@
+import { apiFetch } from './client';
 /**
  * SSE 客户端。
  *
@@ -46,7 +47,7 @@ export async function connectSSE(port: number, handlers: SSEHandlers, attempt = 
   let watchdogFired = false;
 
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/api/events`, {
+    const response = await apiFetch(`http://127.0.0.1:${port}/api/events`, {
       signal: ctrl.signal,
       headers: { 'Accept': 'text/event-stream' },
     });

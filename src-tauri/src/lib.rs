@@ -1,23 +1,10 @@
 mod backend;
-use backend::{BackendProcess, get_backend_port, backend_info, restart_backend, port_file_path, get_port_from_json, spawn_backend};
+use backend::{
+    BackendProcess, backend_info, get_backend_port, get_backend_token, get_port_from_json,
+    kill_tree, port_file_path, reap_orphan_backend, restart_backend, spawn_backend,
+};
 use std::sync::Mutex;
 use tauri::Manager;
-
-/// 按**进程树**结束进程（仅 Windows）。
-///
-/// child.kill() 只对 Tauri 直接拉起的那个进程生效；PyInstaller onefile 还会
-/// 再拉起一个跑 Python 的子进程，于是子进程变孤儿继续运行。taskkill /T 连后代
-/// 一起收掉。失败静默忽略 —— 这只是 /api/shutdown 之后的兜底路径。
-fn kill_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    }
-    #[cfg(not(windows))]
-    let _ = pid;
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -28,9 +15,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(BackendProcess(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![get_backend_port, backend_info, restart_backend])
+        .invoke_handler(tauri::generate_handler![
+            get_backend_port,
+            backend_info,
+            restart_backend,
+            get_backend_token
+        ])
         .setup(|app| {
             if !cfg!(debug_assertions) {
+                // 先收掉上一轮崩溃/被强杀留下的孤儿，再拉新的。否则每崩一次
+                // 就多留一个常驻 70MB 的 backend + 40MB 的 %TEMP%\_MEI 目录。
+                reap_orphan_backend();
                 let child = spawn_backend(app.handle())?;
                 *app.state::<BackendProcess>().0.lock().unwrap() = Some(child);
             }
