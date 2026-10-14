@@ -11,6 +11,7 @@
 import json
 import logging
 import shutil
+import os
 from pathlib import Path
 
 from fastapi import APIRouter, Body, HTTPException, Query
@@ -72,6 +73,45 @@ async def output_inspect(output_path: str = Query(...)):
     return _summarize(output_path.strip())
 
 
+def _special_dirs(home: Path) -> set:
+    """返回需要保护、绝不允许清空的「特殊目录」。
+
+    之前这里只硬编码了英文 `~/Desktop`。但中文 Windows 在关闭了
+    「显示此语言的其他文件夹」之后，桌面实际叫 `桌面` —— 此时
+    `home / "Desktop"` 根本不存在，`desktop.exists()` 恒为假，
+    那道防护会**静默失效**，清空桌面照样放行。
+
+    正确做法是读注册表里系统自己记的真实路径（只读，不改系统），
+    再把常见本地化名兜底加上，任一命中即拒绝。
+    """
+    names = ["Desktop", "桌面"]
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        )
+        try:
+            val, _ = winreg.QueryValueEx(key, "Desktop")
+            if val:
+                names.insert(0, val)
+        finally:
+            winreg.CloseKey(key)
+    except Exception:
+        # 非 Windows 或注册表不可读：下面按本地化名兜底即可
+        pass
+
+    out = set()
+    for name in names:
+        try:
+            p = Path(os.path.expandvars(name))
+            if p.is_dir():
+                out.add(p.resolve())
+        except OSError:
+            continue
+    return out
+
+
 @router.post("/api/output/clear")
 async def output_clear(payload: dict = Body(...)):
     """清空输出目录里的 TextForge 产物（白名单逐个删，不动其它文件）。"""
@@ -91,17 +131,12 @@ async def output_clear(payload: dict = Body(...)):
         raise HTTPException(422, "输出目录无法解析")
     if resolved.parent == resolved:   # C:\ 或 /
         raise HTTPException(400, "拒绝清空文件系统根目录")
-    try:
-        home = Path.home().resolve()
-        if resolved == home:
-            raise HTTPException(400, "拒绝清空用户主目录")
-        desktop = home / "Desktop"
-        if desktop.exists() and resolved == desktop.resolve():
-            raise HTTPException(400, "拒绝清空桌面目录")
-    except HTTPException:
-        raise
-    except Exception:
-        pass
+    home = Path.home().resolve()
+    if resolved == home:
+        raise HTTPException(400, "拒绝清空用户主目录")
+    for special in _special_dirs(home):
+        if resolved == special:
+            raise HTTPException(400, f"拒绝清空特殊目录：{special.name}")
 
     removed, failed = [], []
     for name in ARTIFACTS:
