@@ -72,11 +72,16 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
         result, usage, _ = await call_with_retry(client, ep["api_url"], payload, sse_emit, run_id)
     
     atomic_write_text(story_bible, result)
+    # 顺序至关重要：**先清标志，再落盘 phase2_waiting**。
+    # 反过来就有一个窗口：progress 已经是 phase2_waiting（界面/状态都认为闸门开了），
+    # 但标志还没 clear，此刻到达的确认会被紧接着的 clear() 静默抹掉 ——
+    # 流水线随后永远等不到，用户界面却显示「已确认」，无任何报错。
+    # 调整后：任何在「闸门可见」之后到达的确认都不会再被清掉。
+    state.blueprint_confirmed.clear()
     progress['current_phase'] = 'phase2_waiting'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
-    # 同上：先 clear 再推送，否则「推送 → 用户确认 → clear」的顺序会让确认丢失。
-    state.blueprint_confirmed.clear()
+    # 同步重置暂停标志：重试失败或用户已停止的场景下，若不清会立刻被 pause 打断
     sse_emit("blueprint_ready", {"blueprint": result, "max_chars": blueprint_max}, run_id)
     logger.info("[phase2] 蓝图已生成，等待用户确认")
     while not state.blueprint_confirmed.is_set():

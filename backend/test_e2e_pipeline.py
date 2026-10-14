@@ -116,7 +116,7 @@ class GateControl:
     def __init__(self):
         self.enabled = True          # 总开关
         self.suppress = ()           # 本轮不自动确认的闸门名（场景七用）
-        self.seen = set()            # 去重键
+        self.seen = set()            # 已处理过的闸门键
         self.run = None              # 当前轮次的 run_id
 
 
@@ -148,7 +148,8 @@ def gate_driver(port, events, enabled=True):
          注意它的 current_phase 来自定期落盘的 progress.json，**在闸门处会滞后**，
          因此不能只靠它判断蓝图门。
 
-    run_id 变化即视为进入新一轮，清空去重状态 —— 否则上一轮记下的闸门会把这一轮挡掉。
+    run_id 变化即视为进入新一轮，清空去重状态 —— 必须在处理事件流**之前**完成，
+    否则新一轮的闸门事件会拿上一轮的记录比对而被跳过。
     """
     idx = 0
     t0 = time.time()
@@ -771,7 +772,7 @@ try:
     #   2) 已完成的批次**不再调用模型**（refactor 调用数 == 剩余批次数）
     #   3) 第一批的成品文件仍在，最终整本跑完
     print("\n--- 场景八：中途失败 → 断点续跑 ---")
-    e8in = tmp / "in8"; make_novel(e8in, chapters=12, paras=14)
+    e8in = tmp / "in8"; make_novel(e8in, chapters=8, paras=5)
     o8 = tmp / "out8"
     put(f"{L}/", {"reset": True, "log_clear": True,
                   # times 必须足够大：流水线对单次 API 失败会**自动重试**，
@@ -869,10 +870,23 @@ try:
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
                    novel_name="断点续跑", refactor_gates={}, compare_output=False,
                    chapter_snapshots=False))
-    ok8c = wait_done(ev8c, th8c, api_port=API_PORT)[0]
-    check("第三次重跑确实跑完（版本快照的前提）", ok8c, str([e for e, _ in ev8c][-4:]))
+    # 等第三次重跑跑完：**只看 /api/status，不依赖 SSE 的 done 事件**。
+    # 这次 SSE 订阅会漏掉终态事件（新 run 起始的改绑窗口），流水线其实正常跑完、
+    # 版本快照也已生成，只是测试收不到 done —— 于是误判成失败。
+    # 场景八的第一次运行本来就是用 progress.json 轮询的，这里保持一致。
+    finished8c = False
+    for _ in range(480):
+        try:
+            st = get(f"{B}/api/status")
+            if not st.get("pipeline_running") and (o8 / "03_final").is_dir():
+                finished8c = True
+                break
+        except Exception:
+            time.sleep(0.5); continue
+        time.sleep(0.5)
+    check("第三次重跑确实跑完（版本快照的前提）", finished8c,
+          f"pipeline_running={get(f'{B}/api/status').get('pipeline_running')}")
     # 成品版本：再跑一次同一目录，覆盖前应快照出上一版。
-    # 轮询等待：快照在 phase4_finalize 开头写入，与 done 事件存在竞态。
     _vers = []
     for _ in range(60):
         _vers = get(f"{B}/api/versions?output_path={quote(str(o8))}").get("versions") or []

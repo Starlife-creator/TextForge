@@ -25,6 +25,17 @@ current_req = None  # A1：运行中的 StartRequest（含 api_key，仅内存�
 progress_lock = asyncio.Lock()
 log_listener = None
 
+# 最近一次心跳时间（ISO8601 Z）。**只在内存里维护**。
+#
+# 原先心跳是把整个 progress.json 读出来、改这一个字段、再全量写回 + fsync。
+# 缝合阶段 progress.json 可达数十 MB（锚点内嵌全文），每 15s 一次全量重写
+# 对磁盘是实打实的写放大，对 CPU 则是每 15s 解析+序列化几十 MB JSON。
+# 而 last_heartbeat 的唯一用途是前端判断「是否僵死」，并不参与任何恢复决策，
+# 根本不需要落盘。改成内存维护后：
+#   - 界面读到的心跳反而更准（不再有 fsync 延迟）；
+#   - progress.json 只在状态真正变化时才写。
+last_heartbeat: Optional[str] = None
+
 logger = logging.getLogger("textforge")
 
 # 流水线阶段顺序（用于断点恢复时判断阶段是否已完成）

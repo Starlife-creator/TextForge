@@ -624,13 +624,15 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
         except OSError:
             preview = ""
         chapters.append({"id": cid, "preview": preview})
+# 先 clear 标志，再落盘 phase3_accept —— 顺序不能反。
+    # 反过来就存在窗口：progress 已是 phase3_accept（界面已弹出验收框、/api/status
+    # 的 resume 也已就绪），但标志尚未 clear，此刻到达的确认会被随后的 clear()
+    # 静默抹掉，流水线永远停在验收门，用户那边却显示「已确认」。
+    state.accept_confirm.clear()
     progress['current_phase'] = 'phase3_accept'
     progress['accept_pending_batch'] = batch['batch_id']
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
-    # 先 clear 再推送：否则用户在 SSE→HTTP 往返的几毫秒内点「验收通过」，
-    # 动作会被紧随其后的 clear() 抹掉，流水线带着这一批直接往下走或永久卡住。
-    state.accept_confirm.clear()
     sse_emit("accept_ready", {"batch_id": batch['batch_id'], "chapters": chapters,
         "accepted": progress.get('accepted_batches', [])}, run_id)
     logger.info(f"[accept] 批次 {batch['batch_id']} 待验收（{len(chapters)} 章）")

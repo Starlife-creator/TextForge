@@ -22,6 +22,10 @@ async def run_pipeline(req, run_id: str):
     # 统一心跳：原先只有各个「等待循环」在写 last_heartbeat，导致跑 LLM 批次期间
     # 心跳停更，前端 90s 僵尸检测误报「后端假死」，用户会点停止毁掉正在跑的任务。
     # 后台任务在 await 期间持续运行，能覆盖整个流水线生命周期。
+    # 心跳只在内存维护（state.last_heartbeat），不再为此重写 progress.json ——
+    # 那会在长时段运行里造成上百 GB 的原地覆写。界面从 /api/status 读内存值，
+    # 比读盘更准（没有 fsync 延迟），僵死告警不受影响。
+    state.last_heartbeat = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     hb = asyncio.create_task(_heartbeat_loop(progress_path))
     try:
         # v8.8 修正：断点恢复。若存在未完成的 progress.json，恢复而非覆盖。
@@ -129,25 +133,25 @@ async def run_pipeline(req, run_id: str):
 
 
 async def _heartbeat_loop(progress_path: Path, interval: float = 15.0):
-    """后台心跳：整个 run 期间（含 LLM 调用）刷新 last_heartbeat + 任务历史。
-    只改这一个键，不碰其它进度字段，避免与各阶段的写盘互相覆盖。
+    """后台心跳：run 在跑就刷新心跳 + 登记任务历史。
 
-    顺带把批次进度同步进历史注册表（复用已读到的 progress，不额外读盘）：
-    这样应用崩了/被关掉后，任务历史里仍能看到「上次跑到第几批」。
-
-    间隔 15s + 紧凑写 + 不 fsync：progress.json 在缝合阶段可能因锚点内嵌全文而
-    达到数十 MB，用 indent=2 + fsync 每 10s 全量重写会在事件循环上造成数十毫秒停顿，
-    足以让 SSE 心跳抖动、pause/stop 等控制端点排队。15s 对 90s 死狗看门狗仍有 6 倍余量。
+    心跳时间戳**只写内存**（state.last_heartbeat），不再重写 progress.json。
+    原先每 15s 会把整个 progress.json 读出来、改这一个字段、再全量写回 + fsync；
+    而 progress.json 在缝合阶段可达数十 MB（锚点内嵌全文），对磁盘是实打实的
+    写放大，对 CPU 则是每 15s 解析+序列化几十 MB JSON。
+    last_heartbeat 的唯一用途是前端判断「是否僵死」（pipeline_running 且心跳
+    超 90s 则报警），不参与任何恢复决策，因此完全不必落盘 ——
+    界面从 /api/status 拿到的是内存值，反而更准（没有 fsync 延迟）。
+    阶段推进、批次完成等**真正的状态变化**仍照常写 progress.json。
     """
     while True:
         await asyncio.sleep(interval)
         try:
+            state.last_heartbeat = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             async with state.progress_lock:
                 if not progress_path.exists():
                     continue
                 progress = json.loads(progress_path.read_text(encoding='utf-8'))
-                progress["last_heartbeat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                atomic_write_json(progress_path, progress, pretty=False)
                 _history_record(progress_path, progress)
         except asyncio.CancelledError:
             raise

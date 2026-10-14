@@ -274,25 +274,40 @@ for _bad in ("", "not-a-url", "localhost:1234/v1/chat/completions"):
     check(f"无法解析主机名时保留 Key（{_bad or '<空>'}）", _got == "SECRET-CLOUD-KEY", _got)
 
 # ---------- 13. 后台心跳覆盖 LLM 调用期 ----------
+# 心跳现在**只写内存**：progress.json 在缝合阶段可达数十 MB（锚点内嵌全文），
+# 每 15s 全量重写 + fsync 会造成大量写放大；而 last_heartbeat 的唯一用途是前端
+# 判断僵死，不参与恢复决策。因此这里断言「心跳刷新了内存值、且不动 progress.json」。
 from routes.pipeline_runner import _heartbeat_loop
 hb_dir = Path(tempfile.mkdtemp(prefix="tf_hb_")) / "progress.json"
 atomic_write_json(hb_dir, {"current_phase": "phase3-1", "stitch_anchors": ["x"]})
+_before_mtime = hb_dir.stat().st_mtime_ns
+
 
 async def _hb_test():
+    state.last_heartbeat = None
     task = asyncio.create_task(_heartbeat_loop(hb_dir, interval=0.2))
     await asyncio.sleep(0.5)                      # 模拟一次长时间 LLM await
+    seen = state.last_heartbeat
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         pass
-    data = json.loads(hb_dir.read_text(encoding="utf-8"))
-    return data
+    return seen
 
-data = asyncio.run(_hb_test())
+
+_hb_seen = asyncio.run(_hb_test())
 from datetime import datetime, timezone
-age = (datetime.now(timezone.utc) - datetime.strptime(data["last_heartbeat"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
-check("后台心跳在 await 期间刷新", age < 5, f"age={age}")
+check("后台心跳在 await 期间刷新", bool(_hb_seen), "心跳未更新内存值")
+if _hb_seen:
+    _age = (datetime.now(timezone.utc)
+            - datetime.strptime(_hb_seen, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            ).total_seconds()
+    check("心跳时间足够新鲜（供前端僵死告警）", _age < 5, f"age={_age:.1f}s")
+check("心跳不再重写 progress.json（避免每 15s 全量写放大）",
+      hb_dir.stat().st_mtime_ns == _before_mtime, "progress.json 被心跳改动了")
+data = json.loads(hb_dir.read_text(encoding="utf-8"))
+check("心跳不破坏其它字段", data["stitch_anchors"] == ["x"], str(data))
 check("后台心跳不破坏其它字段", data["stitch_anchors"] == ["x"])
 
 # ---------- 14. 超长章组：只告警不报错 ----------
@@ -869,6 +884,61 @@ with _TC(_app) as _c:
     check("force=true 可在运行中强制停机",
           _forced.status_code == 200, f"{_forced.status_code} {_forced.text[:60]}")
     state.pipeline_running = _running
+
+# ---------- 心跳不再重写 progress.json ----------
+# 前端据此判断僵死（pipeline_running 且心跳超 90s 报警），因此心跳必须新鲜；
+# 但原实现是每 15s 把整个 progress.json 读出来、改一个字段、再全量写回 + fsync，
+# 而 progress.json 在缝合阶段可达数十 MB（锚点内嵌全文）—— 长时段运行下是
+# 实打实的写放大。现在心跳只维护内存值，这条断言把这个不变量钉住。
+import routes.state as _ST
+import routes.status as _S2
+import routes.pipeline_runner as _PR
+import inspect as _inspect
+
+_hb_src = _inspect.getsource(_PR._heartbeat_loop)
+check("心跳循环不再全量重写 progress.json（避免写放大）",
+      "atomic_write_json" not in _hb_src, "心跳里又出现了 progress.json 全量写入")
+check("心跳维护内存心跳时间", "state.last_heartbeat" in _hb_src, "")
+
+# status 优先返回内存心跳，其次回落到 progress.json 里的旧值
+_status_src = _inspect.getsource(_S2)
+check("/api/status 的心跳优先取内存值（界面不会读到陈旧时间）",
+      "state.last_heartbeat or progress.get" in _status_src,
+      "status 未按「内存优先」返回心跳")
+check("内存心跳字段存在且默认 None", hasattr(_ST, "last_heartbeat"), "")
+
+# ---------- 闸门标志的 clear 必须早于阶段落盘 ----------
+# 这两个门原先都是「先写 progress.json 再 clear 标志」。于是存在一个窗口：
+# progress 已是 phase2_waiting / phase3_accept（界面弹框、/api/status 的 resume
+# 都已就绪），而标志还没 clear —— 此刻到达的确认会被紧接着的 clear() 静默抹掉，
+# 流水线随后永远等不到，用户界面却显示「已确认」，**无任何报错**。
+# 表现为端到端测试偶发卡死在 phase2_waiting / phase3_accept。
+import inspect as _insp
+import core.pipeline as _PL
+import core.refactor as _RF
+
+
+def _check_order(src, clear_stmt, phase_literal, label):
+    """clear 必须出现在「阶段落盘」之前。
+
+    只看 clear 之后那一段：文件里还散布着同名阶段字面量（断点恢复分支会先判断
+    current_phase == 'phase2_waiting'），拿第一次出现的位置比较会误判。
+    """
+    i = src.find(clear_stmt)
+    if i < 0:
+        check(label, False, "找不到 clear 语句")
+        return
+    j = src.find(phase_literal, i)
+    ok = 0 < i < j
+    check(label, ok, f"clear@{i} 其后未找到阶段赋值@{j}")
+
+
+_check_order(_insp.getsource(_PL), "state.blueprint_confirmed.clear()",
+             "progress['current_phase'] = 'phase2_waiting'",
+             "蓝图门：clear 早于 phase2_waiting 落盘")
+_check_order(_insp.getsource(_RF), "state.accept_confirm.clear()",
+             "progress['current_phase'] = 'phase3_accept'",
+             "验收门：clear 早于 phase3_accept 落盘")
 
 # ---------- 便携包数据目录（TEXTFORGE_DATA_DIR） ----------
 import utils.appdir as _AD

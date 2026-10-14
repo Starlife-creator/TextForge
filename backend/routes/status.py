@@ -50,7 +50,7 @@ async def status(output_path: str | None = None):
         "resumed": progress.get("resumed", False),
         "blueprint_confirmed": progress.get("blueprint_confirmed", False),
         "usage": progress.get("usage", {}),
-        "last_heartbeat": progress.get("last_heartbeat"),
+        "last_heartbeat": state.last_heartbeat or progress.get("last_heartbeat"),
         "batches": {
             "total": len(batches),
             "phase1_done": sum(1 for b in batches if b["status"] in ("phase1_done", "phase3_done")),
