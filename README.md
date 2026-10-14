@@ -89,6 +89,14 @@ onefile 每次运行都要把载荷解压到 `%TEMP%\_MEIxxx`，既是启动慢�
 
 ---
 
+## 架构决策
+
+关键取舍与其实测依据记在 [docs/ADR.md](docs/ADR.md)，例如：
+为什么 sidecar 用 onedir 而不是 onefile、心跳为什么不落盘、
+闸门标志的 clear 为什么必须早于阶段落盘。
+
+---
+
 ## 本地开发
 
 ```bash

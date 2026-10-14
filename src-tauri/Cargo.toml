@@ -1,6 +1,6 @@
 [package]
 name = "textforge"
-version = "0.7.0"
+version = "0.7.1"
 description = "鏂囩偧宸ュ潑 TextForge"
 authors = ["you"]
 edition = "2021"

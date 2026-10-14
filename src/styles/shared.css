@@ -113,3 +113,19 @@
   margin-top: 4px;
 }
 .out-status.err { color: #b91c1c; }
+
+/* ---------- 运行统计与进度条 ---------- */
+/* 从 App.vue 的 scoped 样式移来：RunStats.vue 是子组件，scoped 不会作用到它内部。 */
+.stats {
+  display: flex; flex-wrap: wrap; gap: 14px;
+  font-size: 12px; color: #4a5568;
+  padding: 8px 10px; margin-bottom: 10px;
+  background: #f7fafc; border-radius: 5px;
+}
+.stat b { color: #2d3748; }
+.bars { display: flex; flex-direction: column; gap: 7px; margin-bottom: 10px; }
+.bar { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #4a5568; }
+.bar-label { flex: 0 0 46px; }
+.bar-track { flex: 1; height: 8px; background: #edf2f7; border-radius: 5px; overflow: hidden; }
+.bar-fill { height: 100%; width: 0; background: #3182ce; border-radius: 5px; transition: width 0.3s ease; }
+.bar-num { flex: 0 0 60px; text-align: right; }

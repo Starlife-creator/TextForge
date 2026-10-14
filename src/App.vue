@@ -6,6 +6,7 @@ import { waitForPort } from './api/backend';
 import { connectSSE, disconnectSSE, type SSEHandlers } from './api/sse';
 import SettingsModal from './components/SettingsModal.vue';
 import GateModal from './components/GateModal.vue';
+import RunStats from './components/RunStats.vue';
 import { apiFetch, initAuth } from './api/client';
 import {
   fetchHistory, forgetHistory, fetchVersions, restoreVersion,
@@ -1408,31 +1409,17 @@ const canStart = computed(() =>
           <button class="danger" @click="control('stop')" :disabled="controlling">停止</button>
         </div>
 
-        <div class="stats">
-          <span class="stat">总章节：<b>{{ totalChapters || '-' }}</b></span>
-          <span class="stat">批次：<b>{{ batchStats.phase1 }}/{{ batchStats.total }}</b>（诊断）</span>
-          <span class="stat">重构：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b></span>
-          <span class="stat" v-if="pipelineRunning || elapsed !== '00:00'">已运行：<b>{{ elapsed }}</b></span>
-          <span class="stat">Tokens：<b>{{ usageTokens.prompt }}</b>输入 / <b>{{ usageTokens.completion }}</b>输出</span>
-        </div>
-
-        <div class="bars">
-          <div class="bar">
-            <span class="bar-label">诊断批次</span>
-            <div class="bar-track"><div class="bar-fill" :style="{ width: diagPercent }"></div></div>
-            <span class="bar-num">{{ batchStats.phase1 }}/{{ batchStats.total }} · {{ diagPercent }}</span>
-          </div>
-          <div class="bar">
-            <span class="bar-label">重构批次</span>
-            <div class="bar-track"><div class="bar-fill recon" :style="{ width: reconPercent }"></div></div>
-            <span class="bar-num">{{ batchStats.phase3 }}/{{ batchStats.total }} · {{ reconPercent }}</span>
-          </div>
-          <div v-if="chapterProgress.total" class="bar">
-            <span class="bar-label">已重构章</span>
-            <div class="bar-track"><div class="bar-fill chapter" :style="{ width: chapterPercent }"></div></div>
-            <span class="bar-num">{{ chapterProgress.done }}/{{ chapterProgress.total }} · {{ chapterPercent }}</span>
-          </div>
-        </div>
+        <RunStats
+          :total-chapters="totalChapters"
+          :batch-stats="batchStats"
+          :chapter-progress="chapterProgress"
+          :usage-tokens="usageTokens"
+          :elapsed="elapsed"
+          :pipeline-running="pipelineRunning"
+          :diag-percent="diagPercent"
+          :recon-percent="reconPercent"
+          :chapter-percent="chapterPercent"
+        />
 
         <div class="tree-head" v-if="chapterRows.length">
           <button class="tree-toggle" @click="showChapterTree = !showChapterTree">
@@ -1739,22 +1726,9 @@ const canStart = computed(() =>
   color: inherit; padding: 0 4px;
 }
 
-.stats {
-  display: flex; flex-wrap: wrap; gap: 14px;
-  font-size: 12px; color: #4a5568;
-  padding: 8px 10px; margin-bottom: 10px;
-  background: #f7fafc; border-radius: 5px;
-}
-.stat b { color: #2d3748; }
 
-.bars { display: flex; flex-direction: column; gap: 7px; margin-bottom: 10px; }
-.bar { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #4a5568; }
-.bar-label { flex: 0 0 46px; }
-.bar-track { flex: 1; height: 8px; background: #edf2f7; border-radius: 5px; overflow: hidden; }
-.bar-fill { height: 100%; width: 0; background: #3182ce; border-radius: 5px; transition: width 0.3s ease; }
 .bar-fill.recon { background: #38a169; }
 .bar-fill.chapter { background: #805ad5; }
-.bar-num { flex: 0 0 60px; text-align: right; }
 .tree-head { margin-bottom: 6px; }
 .tree-toggle { background: transparent; border: none; color: #4a5568; font-size: 13px; font-weight: 600; cursor: pointer; padding: 4px 0; }
 .tree-box { max-height: 150px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 5px; padding: 6px 10px; margin-bottom: 10px; background: #f7fafc; }

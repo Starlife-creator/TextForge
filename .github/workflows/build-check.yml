@@ -1,7 +1,7 @@
 name: build-check
 
-# 质量门：代码改动即验证能否编译（sidecar + 前端 + Rust），不发布安装包。
-# 触发：推送 main、创建/更新 PR。避免等到打 tag 发版才发现编译错误。
+# 质量门：代码改动即验证能否编译与通过测试，不发布安装包。
+# 触发：推送 main、创建/更新 PR。避免等到打 tag 发版才发现问题。
 on:
   push:
     branches: [main]
@@ -14,8 +14,13 @@ env:
   NODE_VERSION: '20'
   PYTHON_VERSION: '3.13'
 
+# 拆成三个并行 job。此前所有检查串行跑在一个 job 里，墙钟时间等于各步之和；
+# 而它们之间几乎没有依赖（端到端只需要 Python 后端，不需要 Node/Rust）。
+# 并行后墙钟 ≈ 最慢的一项，失败时也能立刻看出是哪一类出问题。
 jobs:
-  check:
+  # ---------------------------------------------------------------- 静态检查
+  static:
+    name: 静态检查（前端 + Rust）
     runs-on: windows-latest
     steps:
       - name: 检出代码
@@ -28,13 +33,6 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      - name: 安装 Python（sidecar 后端）
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-          cache-dependency-path: backend/requirements.txt
-
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -43,7 +41,6 @@ jobs:
         with:
           workspaces: src-tauri
 
-      # 前端类型检查
       - name: 前端类型检查
         run: npm ci && npx vue-tsc --noEmit
 
@@ -53,9 +50,33 @@ jobs:
       - name: 前端单元测试
         run: npm run test
 
-      # 先构建 sidecar（--onefile）——Tauri build-script 要求 exe 存在才能过校验，
-      # 参数与 release workflow / build_sidecar.bat 保持一致。
-      - name: 构建 sidecar（供 Rust 编译校验）
+      - name: 前端构建
+        run: npm run build
+
+      # Rust 侧的进程生命周期逻辑此前完全无测试覆盖，而这里正是最容易出错的
+      # 一层（孤儿进程、端口发现、数据目录解析）。
+      - name: Rust 编译检查
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust 单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # ------------------------------------------------------------ 后端单元/回归
+  backend-unit:
+    name: 后端单测 / 回归 / 事件流
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 准备虚拟环境
         shell: bash
         run: |
           cd backend
@@ -63,45 +84,53 @@ jobs:
           source venv/Scripts/activate
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
-          python -m PyInstaller --noconsole --onefile \
-            --collect-all fastapi --collect-all starlette --collect-all pydantic \
-            --collect-all pydantic_core --collect-all uvicorn --collect-all anyio \
-            --collect-all httpx --collect-all h11 --collect-all sniffio \
-            --collect-all chardet --collect-all charset_normalizer \
-            --collect-all socksio --collect-all lxml --collect-all docx \
-            --collect-all cn2an --collect-all certifi --collect-all httpcore --collect-all idna \
-            --name backend main.py
-          mkdir -p ../src-tauri/binaries
-          cp dist/backend.exe ../src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
+          pip install pytest
 
-      # Rust 编译检查（不打包发布，快速反馈编译是否通过）
-      - name: Rust 编译检查
-        run: cargo check --manifest-path src-tauri/Cargo.toml
-
-      # Rust 侧的进程生命周期逻辑此前完全无测试覆盖，而这里正是最容易出错的
-      # 一层（孤儿进程、端口发现、数据目录解析）。
-      - name: Rust 单元测试
-        run: cargo test --manifest-path src-tauri/Cargo.toml
-
-      # D1：后端单测（复用上面 sidecar 已装好全部依赖的 backend/venv）
-      - name: 后端单测
+      - name: pytest
         shell: bash
         run: |
           cd backend
           source venv/Scripts/activate
-          pip install pytest
           python -m pytest tests -q
 
-      # 回归 / 事件流 / 端到端 三套脚本式测试。
-      # 端到端（mock LLM 真跑 phase0→phase4）能抓到单元测试结构上抓不到的问题，
-      # 例如 stitch.py 用了未导入的 sse_emit —— 那类 NameError 只有真正执行才暴露。
-      # 脚本形态而非 pytest 收集：这些文件在模块顶层执行并自行退出码。
-      - name: 回归 / 事件流 / 端到端测试
+      # 脚本形态而非 pytest 收集：这两个文件在模块顶层执行并自行退出码。
+      - name: 回归 / 事件流
         shell: bash
         run: |
           cd backend
           source venv/Scripts/activate
           python regression_test.py
           python test_event_stream.py
+
+  # ------------------------------------------------------------------ 端到端
+  e2e:
+    name: 端到端（mock LLM 真跑 phase0→phase4）
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 准备虚拟环境
+        shell: bash
+        run: |
+          cd backend
+          python -m venv venv
+          source venv/Scripts/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 端到端能抓到单元测试结构上抓不到的问题，例如 stitch.py 用了未导入的
+      # sse_emit —— 那类 NameError 只有真正执行才会暴露。
+      - name: 端到端测试
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
           python test_e2e_pipeline.py
