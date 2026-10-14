@@ -53,6 +53,16 @@ jobs:
       - name: 前端构建
         run: npm run build
 
+      # tauri-build 的构建脚本会校验 externalBin 指向的文件**存在**（供打包配置解析），
+      # 找不到就直接失败。此前这个 job 靠「先真构建一遍 sidecar」顺带满足它，
+      # 但 cargo check / cargo test 根本不会执行那个 exe —— 放个占位文件即可，
+      # 省掉整条 PyInstaller 构建链。
+      - name: 占位 sidecar（仅满足 tauri-build 的存在性校验）
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          printf 'placeholder for cargo check/test' > src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
+
       # Rust 侧的进程生命周期逻辑此前完全无测试覆盖，而这里正是最容易出错的
       # 一层（孤儿进程、端口发现、数据目录解析）。
       - name: Rust 编译检查
