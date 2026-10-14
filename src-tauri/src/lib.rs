@@ -45,20 +45,15 @@ pub fn run() {
                     if port > 0 {
                         // 先停流水线，再让它整个服务退出。
                         // 必须带 token：后端 release 下会校验 X-TextForge-Token，
-                        // 漏带会让这两个请求被 401 静默拒绝，优雅退出退化成强杀，
-                        // 孤儿进程与 %TEMP%\_MEI 残留又会回来。
+                        // 漏带会让这两个请求被 401 静默拒绝，优雅退出退化成强杀。
                         let _ = client.post(format!("http://127.0.0.1:{}/api/stop", port))
                             .header(TOKEN_HEADER, auth_token()).send().await;
                         // 复用既有的 /api/system/shutdown（设置面板「停止后端」同一个端点），
-                        // 不新增重复路由。让后端自己 os._exit，PyInstaller 引导进程
-                        // 随之退出并清掉 %TEMP%\_MEIxxx。
+                        // 不新增重复路由。
                         let _ = client.post(format!("http://127.0.0.1:{}/api/system/shutdown", port))
                             .header(TOKEN_HEADER, auth_token()).send().await;
 
                         // **轮询**等后端真的下线，而不是固定 sleep。
-                        // 只有优雅退出（uvicorn should_exit → 子进程退出 → PyInstaller
-                        // 引导进程自行退出）才会清掉 %TEMP%\_MEIxxx 里的约 40MB 解压产物；
-                        // 一旦走到强杀，引导进程来不及清理就会永久留下这个目录。
                         let mut down = false;
                         for _ in 0..24 {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -72,17 +67,15 @@ pub fn run() {
                         }
                         if down {
                             graceful = true;
-                            // 再给引导进程一点时间收尾并删除 _MEI 目录
-                            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
                         }
                     }
                     {
                         // 兜底：优雅路径超时（端口读不到、请求全失败、被杀等）才强杀。
-                        // 顺序上必须**先**按进程树杀再 child.kill()：反过来先 kill 掉
-                        // 父引导进程，父子关系就断了，taskkill /T 找不到后代，
-                        // PyInstaller 拉起的 Python 子进程会变成孤儿继续跑。
+                        // 现在 sidecar 是 PyInstaller **onedir**，单进程，
+                        // child.kill() 直接就能打中；kill_tree 保留作
+                        // 「将来若回退到 onefile」的安全网。
                         //
-                        // 优雅成功时**不能**再 taskkill：pid 可能已被系统回收给
+                        // 优雅成功时**绝不能**再 taskkill：pid 可能已被系统回收给
                         // 别的进程，/T /F 会误杀无关的进程树。
                         let state = app.state::<BackendProcess>();
                         let taken = state.0.lock().unwrap().take();
@@ -90,7 +83,7 @@ pub fn run() {
                         if let Some(child) = taken {
                             let pid = child.pid();
                             if !graceful {
-                                eprintln!("[backend] 优雅退出未完成，按进程树强杀 pid={pid}");
+                                eprintln!("[backend] 优雅退出未完成，强杀 pid={pid}");
                                 kill_tree(pid);
                                 if let Err(e) = child.kill() {
                                     eprintln!("[backend] kill 失败({pid}): {e:?}");

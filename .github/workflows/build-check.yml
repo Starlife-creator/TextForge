@@ -47,6 +47,12 @@ jobs:
       - name: 前端类型检查
         run: npm ci && npx vue-tsc --noEmit
 
+      # vue-tsc 只能证明「能编译」，证明不了「行为对」。后端 release 下要求每个
+      # 请求都带 X-TextForge-Token，而 apiFetch 是全部调用点的唯一中转站 ——
+      # 漏注入的后果是所有接口 401，表现却只是界面空白。
+      - name: 前端单元测试
+        run: npm run test
+
       # 先构建 sidecar（--onefile）——Tauri build-script 要求 exe 存在才能过校验，
       # 参数与 release workflow / build_sidecar.bat 保持一致。
       - name: 构建 sidecar（供 Rust 编译校验）

@@ -156,6 +156,22 @@ def gate_driver(port, events, enabled=True):
                   "accept": "accept_ready", "qc": "qc_failed"}
     gates = set(_resume_ev.values()) | {"blueprint_ready"}
     while time.time() - t0 < 900:
+        # ---- 先取一次状态，顺带做 run 切换检测 ----
+        # 顺序很关键：run 切换必须在处理事件流**之前**完成去重清理。
+        # 否则新一轮的 blueprint_ready 会拿上一轮的记录去比对而被跳过，
+        # 随后才清空 —— 流水线永远卡在 phase2_waiting。
+        st = None
+        cur = None
+        if enabled and _GATE.enabled:
+            try:
+                st = get(f"http://127.0.0.1:{port}/api/status", timeout=5)
+                cur = st.get("run_id")
+                if cur != _GATE.run:
+                    _GATE.run = cur
+                    _GATE.seen = set()
+            except Exception as e:
+                print(f"    [gate] 状态轮询异常（忽略）: {type(e).__name__} {e}")
+
         # ---- A. 事件流 ----
         while idx < len(events):
             ev, data = events[idx]; idx += 1
@@ -174,16 +190,11 @@ def gate_driver(port, events, enabled=True):
                 continue
             _GATE.seen.add(key)
             if enabled and _GATE.enabled:
-                _drive_gate(port, ev, {**d, "run_id": _cur_run(port)})
+                _drive_gate(port, ev, d)
 
-        # ---- B. 状态轮询兜底 ----
-        if enabled and _GATE.enabled:
+        # ---- B. 状态轮询兜底（订阅漏事件时用） ----
+        if st is not None:
             try:
-                st = get(f"http://127.0.0.1:{port}/api/status", timeout=5)
-                cur = st.get("run_id")
-                if cur != _GATE.run:
-                    _GATE.run = cur
-                    _GATE.seen = set()
                 r = st.get("resume")
                 if isinstance(r, dict) and r.get("key"):
                     ev = _resume_ev.get(r["key"])
@@ -760,20 +771,28 @@ try:
     #   2) 已完成的批次**不再调用模型**（refactor 调用数 == 剩余批次数）
     #   3) 第一批的成品文件仍在，最终整本跑完
     print("\n--- 场景八：中途失败 → 断点续跑 ---")
-    e8in = tmp / "in8"; make_novel(e8in, chapters=6)
+    e8in = tmp / "in8"; make_novel(e8in, chapters=12, paras=14)
     o8 = tmp / "out8"
     put(f"{L}/", {"reset": True, "log_clear": True,
-                  "fail": {"phase": "refactor", "times": 1, "status": 500,
-                           "body": "injected-fail", "skip": 1, "extra_breaks": 0},
+                  # times 必须足够大：流水线对单次 API 失败会**自动重试**，
+                  # 只注入一次的话大概率被重试救回来，整轮跑完、error_logs 为空
+                  # （实测表现为随机 FAIL）。连打 5 次让重试耗尽，
+                  # 批次才一定会真正失败。
+                  "fail": {"phase": "refactor", "times": 5, "status": 500,
+                           "body": "injected-fail", "skip": 0, "arm_after": 1,
+                           "extra_breaks": 0},
                   "ctx_limit": {"max_chapters": 0}})
     ev8, th8 = sse_events(API_PORT, 300, stop_on="done")
+    # context_window 给足、书做大，保证被拆成多个批次 —— 场景八要构造
+    # 「第一批成功、之后失败」，前提是确实存在第二批可失败。
+    # arm_after=1 即「第 1 次 refactor 调用放行，第 2 次起失败」。
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
                    novel_name="断点续跑", refactor_gates={}, compare_output=False,
                    chapter_snapshots=False))
-    # 第一次应当失败。以 progress.json 为准轮询（不依赖可能漏事件的 SSE）：
-    # error_logs 出现且 pipeline_running 已复位即视为「已中断」。
+
+    # 第一轮应当因注入的失败而中断。以 progress.json 为准轮询（不依赖可能漏事件的 SSE）。
     prog8 = {}
-    for _ in range(240):
+    for _ in range(480):
         try:
             prog8 = json.loads((o8 / "progress.json").read_text(encoding="utf-8"))
         except Exception:
@@ -781,6 +800,9 @@ try:
         if prog8.get("error_logs") and not prog8.get("pipeline_running"):
             break
         time.sleep(0.5)
+    st8a = put(f"{L}/", {})["stats"]
+    check("注入的失败发生在第 2 次重构调用之后（第一批未被波及）",
+          st8a.get("refactor", 0) >= 2, str(st8a))
     st8a = put(f"{L}/", {})["stats"]
     done8 = [b for b in prog8.get("batches", []) if b.get("status") == "phase3_done"]
     recon8a = sorted((o8 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
@@ -794,7 +816,8 @@ try:
 
     # 第二次：清掉故障，原样重跑同一输出目录
     put(f"{L}/", {"reset": True, "log_clear": True,
-                  "fail": {"phase": None, "times": 0, "status": 500, "body": "", "skip": 0},
+                  "fail": {"phase": None, "times": 0, "status": 500, "body": "", "skip": 0,
+                   "arm_after": 0},
                   "ctx_limit": {"max_chapters": 0}})
     ev8b, th8b = sse_events(API_PORT, 300, stop_on="done")
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
@@ -804,8 +827,12 @@ try:
     st8b = put(f"{L}/", {})["stats"]
     prog8b = json.loads((o8 / "progress.json").read_text(encoding="utf-8"))
     check("重跑被识别为断点续跑", prog8b.get("resumed") is True, str(prog8b.get("resumed")))
-    check("续跑没有再重做已完成批次（refactor 调用数仅为剩余批次）",
-          st8b.get("refactor", 99) <= 3, str(st8b))
+    # 断言「没有重做」要比**整本书的总批次**少，而不是写死一个魔法数字：
+    # 批次数会随 context_window 与自愈拆批变化，写死会在参数调整后悄悄失效。
+    n_batches = len(prog8b.get("batches") or [])
+    check("续跑没有再重做已完成批次（refactor 调用数少于总批次）",
+          n_batches > 1 and st8b.get("refactor", 99) < n_batches,
+          f"refactor={st8b.get('refactor')} 总批次={n_batches}")
     # 第一批成品必须在续跑后仍在（内容完整）。
     # 注意：不能断言字节完全不变 —— 缝合阶段本来就会改写**批次边界章**的尾/首，
     # 那是流水线的正常行为，不是「重做」。用「文件仍在且正文标记未丢」来证明未丢内容。

@@ -1,60 +1,151 @@
-# 📘 文炼工坊（TextForge）
+# 📘 文炼工坊 TextForge
 
-本地桌面应用，将长篇原始小说全自动重构为高质量成品。Tauri + Vue 3 + FastAPI，后端以 sidecar 随应用分发。
+本地桌面应用，将长篇原始小说全自动重构为高质量成品。
+Tauri + Vue 3 + FastAPI，后端以 sidecar 随应用分发。
+
+所有处理都在本机完成，不上传任何文件（除非你主动连接本地大模型）。
+
+---
 
 ## 功能流水线
-- **阶段0 拆书**：按章节拆分（支持 `第一章：`/`第一章` 无分隔符等格式），超长章自动虚拟化
-- **阶段1 诊断**：逐批次生成章节摘要、人物状态、断层诊断
-- **阶段2 蓝图**：汇总生成全书重构建议书，**人工确认**后进入重构
-- **阶段3 重构+缝合**：按章重构；跨批次、跨虚拟章边界执行文字缝合（可断点续跑）
-- **阶段4 收尾**：合并输出 `txt`/`docx`，备份旧稿，生成缝合报告
+
+| 阶段 | 作用 |
+|---|---|
+| 阶段0 拆书 | 按章节拆分，支持无分隔符格式；**人工确认**后继续；识别不准可填自定义章节标记重拆 |
+| 阶段1 诊断 | 逐批次生成章节摘要、人物状态、断层诊断；**人工勾选**要修复的断层 |
+| 阶段2 蓝图 | 汇总全书重构建议书；**人工确认/编辑**后进入重构 |
+| 阶段3 重构+缝合 | 按章重构；跨批次、跨虚拟章边界执行文字缝合；**逐章验收** |
+| 阶段4 收尾 | 合并输出 txt/docx，备份旧稿，生成缝合报告 |
+
+所有闸门都是**无界等待**（`while not Event`）——程序会一直停在那里等你确认，
+漏掉任何一个都会让任务假死。前端靠 `/api/status` 的 `resume` 字段在刷新后恢复弹窗。
+
+### 其他能力
+
+- **上下文预算**：按 token 估算自动分批；上下文超限时对半拆批自愈
+- **断点续跑**：中断后重跑同一输出目录，只做未完成的批次，并检测配置漂移
+- **成品版本**：重跑覆盖前自动快照上一版，可回滚
+- **任务历史**：跨会话记录跑过哪些书、停在哪、为什么停
+
+---
 
 ## 目录结构
+
 ```
-backend/           FastAPI 后端（Python 3.12+）
-src/               Vue 3 前端
-src-tauri/         Tauri 壳（sidecar 生命周期、端口管理）
-src-tauri/binaries/ sidecar 后端 exe（构建产物，入库忽略）
+backend/               FastAPI 后端（Python 3.12+）
+  core/                流水线各阶段：拆章、诊断、蓝图、重构、缝合、收尾
+  routes/              HTTP 接口
+  utils/               appdir（数据目录）、auth（调用方鉴权）、日志、token 估算
+  main.py              入口：绑随机端口 → 写 port.json → 起 uvicorn
+src/                   Vue 3 前端
+  api/                 后端调用（client.ts 是 token 注入的唯一中转站）
+  components/          弹窗与面板组件
+src-tauri/             Tauri 壳：sidecar 生命周期、端口发现、进程清理
+docs/使用说明.txt       随便携包分发的用户文档
 ```
+
+---
+
+## 架构要点
+
+### 数据目录（便携自包含）
+
+历史、日志、端口文件全部由 `backend/utils/appdir.py` 解析，**唯一数据源**：
+
+```
+TEXTFORGE_DATA_DIR（外壳注入） > exe 旁的 data/ > %APPDATA%\TextForge
+```
+
+Rust 外壳先解析目录，再经环境变量注入 sidecar，避免两侧各算一套路径
+（一旦不一致，前端就永远读不到 `port.json`）。便携包因此完全自包含。
+
+### 调用方鉴权
+
+后端绑 `127.0.0.1` 随机端口，但**任何本地进程**读一下 `port.json` 就能直接调接口，
+而 `/api/start` 可指定任意读写路径。防护方式：
+
+1. 外壳用 CSPRNG 生成 token，经环境变量注入 sidecar，**从不落盘**
+2. 前端只能经 Tauri IPC（同进程）取到
+3. 后端纯 ASGI 中间件校验 `X-TextForge-Token`
+
+`/api/health` 豁免（不返回任何数据，供探活）。未配置 token 时放行（开发/测试）。
+
+> 注意：外壳自己发起的 HTTP 调用**也必须**带 token，漏带会让关窗时的
+> `/api/stop`、`/api/system/shutdown` 被 401 静默拒绝，优雅退出退化成强杀。
+
+### 进程生命周期
+
+sidecar 是 PyInstaller **onedir**（不是 onefile）：
+
+| | onefile | onedir（当前） |
+|---|---|---|
+| 启动到接口可用 | 2.5–2.8s | **0.65–0.69s** |
+| `%TEMP%` 临时目录 | 1 个（约 40MB） | **0 个** |
+| 进程数 | 2（引导 + Python） | **1** |
+
+onefile 每次运行都要把载荷解压到 `%TEMP%\_MEIxxx`，既是启动慢的原因，
+也正是 Defender 把它误判为恶意软件的主要特征。onedir 单进程，`child.kill()`
+直接生效。
+
+---
 
 ## 本地开发
 
-### 1. 后端
-```powershell
-cd backend
-# 首次：创建 venv 并安装依赖
-python -m venv venv
-.\venv\Scripts\pip install -r .\requirements.txt
-# 启动（开发模式固定 8000 端口，与 Tauri debug 对齐）
-.\run_dev.ps1
-```
-健康检查：`GET http://127.0.0.1:8000/api/health`
-
-### 2. 前端
 ```bash
-npm install
-npm run dev        # Vite 开发服务（端口 1420）
-npm run build      # 类型检查 + 产物构建
+# 依赖
+cd backend && python -m venv venv && venv\Scripts\activate
+pip install -r requirements.txt
+pip install pyinstaller
+cd .. && npm install
+
+# 构建 sidecar（产出 src-tauri\binaries\）
+backend\build_sidecar.bat
+
+# 开发模式：前端热更新 + 手动起后端
+python backend\main.py          # 终端 A
+npm run tauri dev               # 终端 B
 ```
 
-### 3. Tauri
+### 测试
+
 ```bash
-npm run tauri dev    # 开发调试
-```
-
-## 打包发布
-```powershell
-# 1) 构建 sidecar 后端（PyInstaller --onefile，产物为单 exe）
 cd backend
-.\build_sidecar.bat
-# 2) 打包安装程序
-cd ..
-npm run tauri build
-```
-**注意**：sidecar 必须用 `--onefile`。Tauri `externalBin` 只复制单个 exe，`--onedir` 的依赖目录不会带进安装包，会导致应用启动时后端缺依赖。
+venv\Scripts\python regression_test.py    # 249 项 单元/回归
+venv\Scripts\python test_event_stream.py  # 20 项 事件流
+venv\Scripts\python -m pytest tests -q    # 7 项
+venv\Scripts\python test_e2e_pipeline.py  # 98 项 端到端
 
-## 数据与日志
-- 运行日志：`%APPDATA%\TextForge\logs\backend.log`
-- 端口文件：`%APPDATA%\TextForge\port.json`（应用关闭时自动清理）
-- 输出目录：`{output_path}/{01_summaries, 02_workspace, 03_final, _backup, progress.json}`
-- `progress.json` 为唯一进度真相源，支持崩溃/断电后**断点恢复**（重启应用再次点击开始即续跑）
+cd ..\src-tauri && cargo test             # 10 项 Rust
+cd .. && npm run test                     # 7 项 前端
+npm run build                             # 类型检查 + 构建
+```
+
+端到端测试会用 `mock_llm.py` 冒充大模型，并**自动确认所有人工闸门**
+（`gate_driver`），因此可以无人值守跑完整条流水线。
+
+### 组装便携包
+
+```powershell
+cd src-tauri
+cargo tauri build --config tauri.portable.json --target x86_64-pc-windows-msvc
+# 然后把 release\textforge.exe 与 backend\dist\backend\{backend.exe,_internal}
+# 一起平铺到同一目录后压 zip —— onedir 的 exe 从**自身同级**的 _internal 找依赖
+```
+
+`bundle.active=false` 让 Tauri 不生成 NSIS/MSI 安装壳。
+
+---
+
+## 常见问题
+
+**双击没反应 / 一闪即退**
+看 `data\logs\backend.log`。常见原因：杀毒软件拦截、文件夹被压缩包直接运行、
+手工整理时挪走了 `_internal\`。
+
+**Defender 误报**
+本项目未购买代码签名证书，没有数字签名。若被误报，在「病毒和威胁防护 → 保护历史记录」
+恢复，并把文件夹加入排除项。便携版已去掉自解压行为，误报概率大幅降低。
+
+**接本地大模型**
+LM Studio / Ollama / llama.cpp / 任意 OpenAI 兼容端点均可。
+设置面板有「实测上下文窗口」，探到的真实值会自动用来缩小批次。

@@ -5,6 +5,7 @@ import { isTauri } from '@tauri-apps/api/core';
 import { waitForPort } from './api/backend';
 import { connectSSE, disconnectSSE, type SSEHandlers } from './api/sse';
 import SettingsModal from './components/SettingsModal.vue';
+import GateModal from './components/GateModal.vue';
 import { apiFetch, initAuth } from './api/client';
 import {
   fetchHistory, forgetHistory, fetchVersions, restoreVersion,
@@ -1467,10 +1468,8 @@ const canStart = computed(() =>
     </main>
 
     <!-- 拆书确认弹窗 -->
-    <div v-if="showSplit" class="modal-mask">
-      <div class="modal">
-        <h3>请确认拆书结果</h3>
-        <p class="hint">共拆分出 {{ splitChapters.length }} 章。确认后进入诊断。</p>
+    <GateModal v-if="showSplit" title="请确认拆书结果">
+      <p class="hint">共拆分出 {{ splitChapters.length }} 章。确认后进入诊断。</p>
         <p v-if="splitDetection" class="hint" :class="splitDetection.needs_review ? 'err' : 'ok'">
           识别方式：{{ splitDetection.mode }}
           <template v-if="splitDetection.confidence">· 置信度 {{ splitDetection.confidence }}</template>
@@ -1492,19 +1491,16 @@ const canStart = computed(() =>
             {{ redoingSplit ? '重拆中…' : '按此标记重新拆分' }}
           </button>
         </details>
-        <div class="modal-actions">
+        <template #actions>
           <span></span>
           <button :disabled="confirmingSplit" @click="confirmSplit">
             {{ confirmingSplit ? '确认中…' : '确认拆分，继续' }}
           </button>
-        </div>
-      </div>
-    </div>
+        </template>
+    </GateModal>
 
     <!-- 断层勾选确认弹窗 -->
-    <div v-if="showFixReview" class="modal-mask">
-      <div class="modal">
-        <h3>修复断层：请勾选需修复项</h3>
+    <GateModal v-if="showFixReview" title="修复断层：请勾选需修复项">
         <p class="hint">共诊断出 {{ fixGaps.length }} 处断层，默认全选。确认后将按勾选项执行修复（其余内容保持原样）。</p>
         <label class="sum-toggle"><input type="checkbox"
           :checked="fixGaps.length > 0 && fixSelected.length === fixGaps.length"
@@ -1518,17 +1514,14 @@ const canStart = computed(() =>
             <span class="fix-desc">{{ g.description }}</span>
           </label>
         </div>
-        <div class="modal-actions">
+        <template #actions>
           <span></span>
           <button :disabled="confirmingFix" @click="confirmFix">确认修复（{{ fixSelected.length }} 处）</button>
-        </div>
-      </div>
-    </div>
+        </template>
+    </GateModal>
 
     <!-- 逐章验收确认弹窗 -->
-    <div v-if="showAccept" class="modal-mask">
-      <div class="modal">
-        <h3>验收重构稿：批次 {{ acceptBatch }}</h3>
+    <GateModal v-if="showAccept" :title="`验收重构稿：批次 ${acceptBatch}`">
         <p class="hint">以下为本批已产出的章节（预览为开头 80 字）。验收通过后继续下一批；不通过请停止后调整或重跑。</p>
         <div class="sum-list">
           <div v-for="c in acceptChapters" :key="c.id" class="split-row accept-row">
@@ -1537,27 +1530,24 @@ const canStart = computed(() =>
             <button class="min-btn" :disabled="regenerating.has(c.id)" @click="regenChapter(c)">{{ regenerating.has(c.id) ? '重写中…' : '重写此章' }}</button>
           </div>
         </div>
-        <div class="modal-actions">
+        <template #actions>
           <span></span>
           <button :disabled="confirmingAccept" @click="confirmAccept">验收通过，继续</button>
-        </div>
-      </div>
-    </div>
+        </template>
+    </GateModal>
 
     <!-- 质检拦截决策弹窗 -->
-    <div v-if="showQcBlock" class="modal-mask">
-      <div class="modal">
-        <h3>质检未通过（{{ qcIssues.length }} 项）</h3>
+    <GateModal v-if="showQcBlock" :title="`质检未通过（${qcIssues.length} 项）`">
         <p class="hint">以下问题按规则检出不满足导出条件。可选择「强制导出」忽略并继续，或「停止」保留进度待修正后重跑。</p>
         <div class="sum-list">
           <div v-for="(it, i) in qcIssues" :key="i" class="split-row"><span class="fix-desc">{{ it }}</span></div>
         </div>
-        <div class="modal-actions">
+        <template #actions>
+          <span></span>
           <button class="danger" @click="control('stop')">停止</button>
           <button class="primary" :disabled="forcingExport" @click="forceExport">强制导出</button>
-        </div>
-      </div>
-    </div>
+        </template>
+    </GateModal>
 
     <!-- 左右对照预览弹窗 -->
     <div v-if="showComparisons" class="modal-mask">
@@ -1578,9 +1568,7 @@ const canStart = computed(() =>
     </div>
 
     <!-- 蓝图确认弹窗 -->
-    <div v-if="showBlueprint" class="modal-mask">
-      <div class="modal">
-        <h3>请确认重构蓝图</h3>
+    <GateModal v-if="showBlueprint" title="请检查并确认蓝图">
         <p class="hint">可直接编辑后确认，蓝图将作为后续重构的系统提示词。</p>
         <textarea v-model="blueprintText" rows="16" class="blueprint-area"></textarea>
 
@@ -1596,14 +1584,13 @@ const canStart = computed(() =>
           </details>
         </div>
 
-        <div class="modal-actions">
+        <template #actions>
           <span class="count">{{ blueprintText.length }} 字</span>
           <button @click="confirmBlueprint" :disabled="confirmingBlueprint">
-            {{ confirmingBlueprint ? '确认中...' : '确认并继续' }}
+            {{ confirmingBlueprint ? '确认中...' : '确认蓝图' }}
           </button>
-        </div>
-      </div>
-    </div>
+        </template>
+    </GateModal>
 
     <!-- 任务历史（跨会话） -->
     <HistoryModal

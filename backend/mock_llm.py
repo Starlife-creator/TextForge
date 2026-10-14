@@ -16,7 +16,8 @@ BREAK = "===CHAPTER_BREAK==="
 # 统计各阶段调用次数，便于测试断言
 STATS = {"diagnose": 0, "blueprint": 0, "refactor": 0, "stitch": 0, "total": 0}
 # 故障注入
-FAIL = {"phase": None, "times": 0, "status": 500, "body": "injected", "extra_breaks": 0, "skip": 0}
+FAIL = {"phase": None, "times": 0, "status": 500, "body": "injected",
+        "extra_breaks": 0, "skip": 0, "arm_after": 0}
 # 上下文上限模拟：max_chapters>0 时，请求里章数超过它即返回 400（LM Studio 文案）。
 CTX_LIMIT = {"max_chapters": 0}
 # 服务端上报的真实上下文窗口（供 /props、/api/v0/models、/models、/api/show 探测）。
@@ -218,18 +219,21 @@ class H(BaseHTTPRequestHandler):
                 STATS["ctx_overflow"] = STATS.get("ctx_overflow", 0) + 1
                 return self._json(400, {"error": {"message": msg}})
         if FAIL["phase"] == phase and FAIL["times"] > 0:
-            # skip>0 时先放过前 N 次匹配调用，再开始失败 —— 用来构造「第一批成功、
-            # 第二批失败」的中途断裂现场，验证断点续跑。
-            #
-            # 已知局限：N 必须 ≥ 实际批次数。批内会因上下文超限自愈而继续拆批，
-            # 批数并不固定，因此极端情况下 N 过大会让整轮都不失败。
-            # e2e 场景八用 skip=1（每批至少 1 次调用），实测约 1/7 概率因批数过少
-            # 而不触发失败 —— 属于**测试桩**的注入时序局限，与被测代码无关。
-            if FAIL.get("skip", 0) > 0:
-                FAIL["skip"] -= 1
-            else:
-                FAIL["times"] -= 1
-                return self._json(FAIL["status"], {"error": {"message": FAIL["body"]}})
+            # 触发点用「第 N 次调用」在 mock 内部计数，而不是由测试在外面布防。
+            # 外部布防（armed）依赖测试轮询 progress.json，而 mock 跑得极快：
+            # 12 个批次约 2 秒跑完，而轮询间隔 0.5 秒 —— 等测试发现「第一批已完成」
+            # 时，早就全部跑完了，失败永远不会触发（表现为随机 FAIL）。
+            # 放在这里由调用序号决定，与测试的轮询节奏彻底解耦。
+            # 前提：测试必须保证这一阶段**至少有 N+1 次调用**（即书足够大、
+            # 会被拆成多个批次），否则同样不会触发。
+            _after = FAIL.get("arm_after", 0) or 0
+            _ordinal = STATS.get(phase, 0)      # 本次调用是该阶段的第几次
+            if not _after or _ordinal > _after:
+                if FAIL.get("skip", 0) > 0:
+                    FAIL["skip"] -= 1
+                else:
+                    FAIL["times"] -= 1
+                    return self._json(FAIL["status"], {"error": {"message": FAIL["body"]}})
 
         content = make_text(user, phase)
         self.send_response(200)

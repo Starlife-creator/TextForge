@@ -52,14 +52,18 @@ jobs:
       - name: 前端依赖安装
         run: npm ci
 
-      # 构建 sidecar（PyInstaller onefile exe）。
-      # 参数与 backend/build_sidecar.bat 保持一致（均已移除已精简的 natsort/PyYAML）。
+      # 构建 sidecar。**必须用 --onedir**，理由有三：
+      #   1. onefile 每次运行都把载荷解压到 %TEMP%\_MEIxxxxxx（实测约 40MB），
+      #      启动要 2.5~2.8s；onedir 直接铺开，实测 0.65~0.69s。
+      #   2. onefile 是父子双进程，child.kill() 只杀得掉引导进程，Python 子进程会
+      #      变孤儿并残留 _MEI 目录；onedir 单进程，kill 直接生效。
+      #   3. 「运行时自解压到临时目录」正是 Defender 把它误判为恶意软件的主要特征，
+      #      去掉它同时也降低误报概率。
       #
-      # 注意：此前发布的是 NSIS 安装包，被 Defender 以 Trojan:Win32/Wacatac.B!ml
-      # 误报拦截（`!ml` = 机器学习泛化判定，非病毒特征码）。实测把 sidecar
-      # 单独拿出来扫是干净的，元凶是 NSIS 安装壳把 25MB 高熵载荷再包一层。
-      # 因此改为发布**免安装便携 zip**：无安装壳、无注册表、无 Program Files 写入。
-      - name: 构建 sidecar 后端
+      # Tauri 的 externalBin 要求单文件，故仍产出该占位文件供 tauri build 校验；
+      # 真正的便携包在下一步由我们手工组装 —— onedir 的 exe 正是从
+      # 「自身所在目录/_internal」找依赖，把两者铺平即可。
+      - name: 构建 sidecar 后端（PyInstaller onedir）
         shell: bash
         run: |
           cd backend
@@ -68,7 +72,7 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-          python -m PyInstaller --noconsole --onefile \
+          python -m PyInstaller --noconsole --onedir \
             --collect-all fastapi --collect-all starlette --collect-all pydantic \
             --collect-all pydantic_core --collect-all uvicorn --collect-all anyio \
             --collect-all httpx --collect-all h11 --collect-all sniffio \
@@ -77,23 +81,26 @@ jobs:
             --collect-all cn2an --collect-all certifi --collect-all httpcore --collect-all idna \
             --name backend main.py
           mkdir -p ../src-tauri/binaries
-          cp dist/backend.exe ../src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
+          cp dist/backend/backend.exe ../src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
 
-      # bundle.active=false → 只出裸二进制，不生成 NSIS/MSI 安装壳。
-      # 运行时 Tauri 按 <exe同级>/backend.exe 定位 sidecar（见 tauri-plugin-shell
-      # 的 relative_command_path），所以便携目录只需平铺两个 exe。
-      - name: 构建便携版（不生成安装包）
+      # bundle.active=false → 只出外壳二进制，不生成 NSIS/MSI 安装壳。
+      # sidecar 不用 tauri 拷贝：它在下一步直接从 PyInstaller 的 onedir 产物组装。
+      - name: 构建外壳（不生成安装包）
         run: npx tauri build --config src-tauri/tauri.portable.json --target x86_64-pc-windows-msvc
 
       - name: 组装便携目录并打包 zip
         shell: pwsh
         run: |
           $rel = 'src-tauri\target\x86_64-pc-windows-msvc\release'
+          $od  = 'backend\dist\backend'          # PyInstaller onedir 产物
           $stage = 'TextForge'
           if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "$rel\textforge.exe" $stage
-          Copy-Item "$rel\backend.exe" $stage
+          # sidecar 必须是 backend.exe（运行时按 <exe同级>/backend.exe 定位），
+          # 且 _internal 必须与它同级 —— onedir 的 exe 从自身目录找依赖。
+          Copy-Item "$od\backend.exe" "$stage\backend.exe"
+          Copy-Item "$od\_internal" $stage -Recurse
           Copy-Item 'docs\使用说明.txt' $stage
           $ver = (Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
           $zip = "TextForge_${ver}_portable_x64.zip"
