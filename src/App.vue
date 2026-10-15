@@ -17,6 +17,9 @@ import {
   type VersionInfo,
 } from './api/system';
 
+// 版本号单一来源：package.json（经 vite define 注入，见 vite.config.ts）
+const appVersion = __APP_VERSION__;
+
 // ---------- 后端连接 ----------
 const port = ref<number | null>(null);
 const backendReady = ref(false);
@@ -1414,7 +1417,9 @@ const canStart = computed(
 <template>
   <div class="app">
     <header class="header">
-      <h1>文炼工坊 <span class="version">TextForge v0.9.1</span></h1>
+      <h1>
+        文炼工坊 <span class="version">TextForge v{{ appVersion }}</span>
+      </h1>
       <div class="status">
         <button
           class="status-link"

@@ -133,6 +133,14 @@ npm run build                             # 类型检查 + 构建
 代码风格由 `eslint.config.js`（ESLint 10 扁平配置）+ `.prettierrc.json` 统一，
 两者的规则边界靠 `@vue/eslint-config-prettier` 划开，CI 里都会阻断。
 
+### 版本号（单一来源）
+
+版本号**只在 `package.json` 的 `version` 改这一处**。`npm run build` / `npm run dev`
+会经 `prebuild` / `predev` 钩子调用 `scripts/sync-version.mjs`，把版本同步进
+`src-tauri/Cargo.toml` 与 `src-tauri/tauri.conf.json`；前端由 Vite 注入 `__APP_VERSION__`，
+后端由 Tauri 外壳注入 `TEXTFORGE_VERSION`。发布时打 `v<version>` 标签即可，
+`release.yml` 会校验三处版本与标签一致。
+
 端到端测试会用 `mock_llm.py` 冒充大模型，并**自动确认所有人工闸门**
 （`gate_driver`），因此可以无人值守跑完整条流水线。
 

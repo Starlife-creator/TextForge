@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "predev": "node scripts/sync-version.mjs",
     "build": "vue-tsc --noEmit && vite build",
+    "prebuild": "node scripts/sync-version.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -13,6 +15,7 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "sync-version": "node scripts/sync-version.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

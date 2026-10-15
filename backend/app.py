@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from routes import state
 from utils.auth import TokenAuthMiddleware
 from utils.logging_setup import setup_logging
+from utils.version import VERSION
 import asyncio
 
 logger, listener = setup_logging()
@@ -30,7 +31,7 @@ from routes.system import router as system_router
 from routes.output import router as output_router
 from routes.history import router as history_router
 
-app = FastAPI(title="TextForge", version="0.9.1", lifespan=lifespan)
+app = FastAPI(title="TextForge", version=VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

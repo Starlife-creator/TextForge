@@ -192,6 +192,9 @@ pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
     // 注入调用方 token：后端所有接口（/api/health 除外）都会校验 X-TextForge-Token，
     // 挡住「任何本地进程读 port.json 就能调 /api/start 读写任意路径」这一攻击面。
     cmd = cmd.env("TEXTFORGE_TOKEN", auth_token());
+    // 注入版本号：单一来源是 package.json，经 sync-version 同步到 Cargo.toml，
+    // 这里把编译期 crate 版本传给后端，界面与 /api/health / /api/system/info 一致。
+    cmd = cmd.env("TEXTFORGE_VERSION", env!("CARGO_PKG_VERSION"));
     let (mut rx, child) = cmd.spawn()
         .map_err(|e| format!("sidecar 启动失败: {}", e))?;
     let child_pid = child.pid();

@@ -8,6 +8,7 @@ from core.pipeline import phase2_blueprint
 from core.refactor import phase3_refactor_stitch
 from core.finalize import phase4_finalize
 from utils.atomic import atomic_write_json
+from utils.version import VERSION
 
 logger = logging.getLogger("textforge")
 
@@ -341,7 +342,7 @@ def init_progress(req, run_id):
         Path(req.input_path).parent.name if req.input_mode == "single_file" else Path(req.input_path).name
     ) or "重构终稿"
     return {
-        "schema_version": "0.9.1", "run_id": run_id, "input_mode": req.input_mode,
+        "schema_version": VERSION, "run_id": run_id, "input_mode": req.input_mode,
         "input_format": req.input_format, "input_path": req.input_path, "output_path": req.output_path,
         "api_config": {"api_url": req.api_url, "model": req.model, "context_window": req.context_window},
         "novel_name": novel_name, "rich_text": req.rich_text,

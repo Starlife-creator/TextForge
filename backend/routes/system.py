@@ -10,13 +10,13 @@ from fastapi import APIRouter, HTTPException, Body, Query
 import httpx
 from routes import state
 from utils.appdir import data_dir
+from utils.version import VERSION
 import logging
 
 router = APIRouter()
 logger = logging.getLogger("textforge")
 
 START_TIME = time.time()
-VERSION = "0.9.1"
 
 
 def _app_paths() -> dict:
