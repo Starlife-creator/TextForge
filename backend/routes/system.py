@@ -16,7 +16,7 @@ router = APIRouter()
 logger = logging.getLogger("textforge")
 
 START_TIME = time.time()
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 
 
 def _app_paths() -> dict:
