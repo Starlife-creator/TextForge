@@ -1414,7 +1414,7 @@ const canStart = computed(
 <template>
   <div class="app">
     <header class="header">
-      <h1>文炼工坊 <span class="version">TextForge v8.8</span></h1>
+      <h1>文炼工坊 <span class="version">TextForge v0.9.0</span></h1>
       <div class="status">
         <button
           class="status-link"

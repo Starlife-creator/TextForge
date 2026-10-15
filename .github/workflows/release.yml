@@ -29,10 +29,10 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安装 Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
@@ -53,7 +53,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # 版本号硬编码在 package.json / src-tauri/Cargo.toml / src-tauri/tauri.conf.json
       # 三处。三者不一致、或与 tag 不一致时，会产出「文件名是旧版本、却挂在 v新版本
@@ -73,14 +73,14 @@ jobs:
           }
 
       - name: 安装 Node（前端）
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
           cache-dependency-path: package-lock.json
 
       - name: 安装 Python（sidecar 后端）
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip

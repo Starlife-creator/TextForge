@@ -4,4 +4,4 @@ router = APIRouter()
 
 @router.get("/api/health")
 async def health():
-    return {"status": "ok", "version": "8.8", "pipeline_running": state.pipeline_running}
+    return {"status": "ok", "version": "0.9.0", "pipeline_running": state.pipeline_running}

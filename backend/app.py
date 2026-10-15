@@ -30,7 +30,7 @@ from routes.system import router as system_router
 from routes.output import router as output_router
 from routes.history import router as history_router
 
-app = FastAPI(title="TextForge", version="8.8", lifespan=lifespan)
+app = FastAPI(title="TextForge", version="0.9.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
