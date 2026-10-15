@@ -22,28 +22,51 @@ defineProps<{
 
 <template>
   <div class="stats">
-    <span class="stat">总章节：<b>{{ totalChapters || '-' }}</b></span>
-    <span class="stat">批次：<b>{{ batchStats.phase1 }}/{{ batchStats.total }}</b>（诊断）</span>
-    <span class="stat">重构：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b></span>
-    <span class="stat" v-if="pipelineRunning || elapsed !== '00:00'">已运行：<b>{{ elapsed }}</b></span>
-    <span class="stat">Tokens：<b>{{ usageTokens.prompt }}</b>输入 / <b>{{ usageTokens.completion }}</b>输出</span>
+    <span class="stat"
+      >总章节：<b>{{ totalChapters || '-' }}</b></span
+    >
+    <span class="stat"
+      >批次：<b>{{ batchStats.phase1 }}/{{ batchStats.total }}</b
+      >（诊断）</span
+    >
+    <span class="stat"
+      >重构：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b></span
+    >
+    <span class="stat" v-if="pipelineRunning || elapsed !== '00:00'"
+      >已运行：<b>{{ elapsed }}</b></span
+    >
+    <span class="stat"
+      >Tokens：<b>{{ usageTokens.prompt }}</b
+      >输入 / <b>{{ usageTokens.completion }}</b
+      >输出</span
+    >
   </div>
 
   <div class="bars">
     <div class="bar">
       <span class="bar-label">诊断批次</span>
       <div class="bar-track"><div class="bar-fill" :style="{ width: diagPercent }"></div></div>
-      <span class="bar-num">{{ batchStats.phase1 }}/{{ batchStats.total }} · {{ diagPercent }}</span>
+      <span class="bar-num"
+        >{{ batchStats.phase1 }}/{{ batchStats.total }} · {{ diagPercent }}</span
+      >
     </div>
     <div class="bar">
       <span class="bar-label">重构批次</span>
-      <div class="bar-track"><div class="bar-fill recon" :style="{ width: reconPercent }"></div></div>
-      <span class="bar-num">{{ batchStats.phase3 }}/{{ batchStats.total }} · {{ reconPercent }}</span>
+      <div class="bar-track">
+        <div class="bar-fill recon" :style="{ width: reconPercent }"></div>
+      </div>
+      <span class="bar-num"
+        >{{ batchStats.phase3 }}/{{ batchStats.total }} · {{ reconPercent }}</span
+      >
     </div>
     <div v-if="chapterProgress.total" class="bar">
       <span class="bar-label">已重构章</span>
-      <div class="bar-track"><div class="bar-fill chapter" :style="{ width: chapterPercent }"></div></div>
-      <span class="bar-num">{{ chapterProgress.done }}/{{ chapterProgress.total }} · {{ chapterPercent }}</span>
+      <div class="bar-track">
+        <div class="bar-fill chapter" :style="{ width: chapterPercent }"></div>
+      </div>
+      <span class="bar-num"
+        >{{ chapterProgress.done }}/{{ chapterProgress.total }} · {{ chapterPercent }}</span
+      >
     </div>
   </div>
 </template>

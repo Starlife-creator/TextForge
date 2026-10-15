@@ -191,7 +191,9 @@ async def regen_single_chapter(req, output_path, chapter_id):
         "model": ep["model"],
         "messages": [{"role": "user", "content": prompt}],
         "temperature": req.temperatures.refactor,
-        "max_tokens": int(len(batch_content) / 1.5),
+        # 与主重构路径保持一致：用 token 估算 + 预留，而不是旧的 len/1.5 字符公式
+        # （后者对中文低估约 50%，会让模型被迫截断单章重生成）。
+        "max_tokens": output_token_reserve(estimate_tokens(batch_content)),
         "stream": True,
     }
     logger.info(f"[regen] 单章重生成 chapter_{chapter_id} 开始")
@@ -338,7 +340,7 @@ def _break_feedback(n_chapters: int):
         if m:
             got = int(m.group(1))
         if got is None:
-            tail = (f"上一��输出不符合格式要求：{str(exc)[:200]}\n"
+            tail = (f"上一次输出不符合格式要求：{str(exc)[:200]}\n"
                     f"本批共 {n_chapters} 章，请只输出 {need} 个 ===CHAPTER_BREAK===。")
         else:
             delta = need - got

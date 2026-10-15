@@ -75,14 +75,6 @@ _EN_PATTERN = re.compile(
     re.MULTILINE,
 )
 
-# 英文/数字章节（次选，仅当中文模式几乎没命中时才启用，避免误抓正文里的 "Chapter"）
-_EN_PATTERN = re.compile(
-    rf'(?:^|(?<=[\u3002\uff01\uff1f!?\uff1b;\u2026]))'
-    rf'{_INDENT}(?:{_DECO}{_SP}*)*{_Q_OPEN}?'
-    rf'(?:Chapter|CHAPTER|Part|PART|Book|BOOK){_SP}*[0-9]+{_HEAD_END}',
-    re.MULTILINE,
-)
-
 # 无编号的特殊章节名：楔子/序章/尾声/番外/间章… —— 这类写法完全不含「第X章」，
 # 规则枚举永远列不全创新说法，但常见的一批必须先覆盖（零成本）。
 _SPECIAL_NAMES = (r'序章|序言|自序|序|楔子|引子|引言|前言|序幕|尾声|终章|尾章|终篇|终幕'

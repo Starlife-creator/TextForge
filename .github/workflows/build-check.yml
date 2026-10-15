@@ -10,6 +10,12 @@ on:
 permissions:
   contents: read
 
+# 同一分支/PR 的新推送取消仍在跑的旧任务：否则连推几次会同时占满多台
+# Windows runner（分钟数按并发计费），且旧结果毫无价值。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   NODE_VERSION: '20'
   PYTHON_VERSION: '3.13'
@@ -22,6 +28,7 @@ jobs:
   static:
     name: 静态检查（前端 + Rust）
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -41,14 +48,24 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: 前端类型检查
-        run: npm ci && npx vue-tsc --noEmit
+      # 只装依赖：类型检查交给下面 `npm run build`（其脚本本就是
+      # `vue-tsc --noEmit && vite build`），避免 vue-tsc 跑两遍。
+      - name: 安装前端依赖
+        run: npm ci
 
       # vue-tsc 只能证明「能编译」，证明不了「行为对」。后端 release 下要求每个
       # 请求都带 X-TextForge-Token，而 apiFetch 是全部调用点的唯一中转站 ——
       # 漏注入的后果是所有接口 401，表现却只是界面空白。
       - name: 前端单元测试
         run: npm run test
+
+      # ESLint 管代码质量、Prettier 管排版；两者在 CI 各自阻断，避免风格分歧
+      # 在本地被忽略、累积成大范围重排的 diff。
+      - name: 前端 Lint（ESLint）
+        run: npm run lint
+
+      - name: 前端格式检查（Prettier）
+        run: npm run format:check
 
       - name: 前端构建
         run: npm run build
@@ -75,6 +92,7 @@ jobs:
   backend-unit:
     name: 后端单测 / 回归 / 事件流
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -116,6 +134,7 @@ jobs:
   e2e:
     name: 端到端（mock LLM 真跑 phase0→phase4）
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -144,3 +163,38 @@ jobs:
           cd backend
           source venv/Scripts/activate
           python test_e2e_pipeline.py
+
+  # ------------------------------------------------------- 非 Windows 编译门
+  # backend.rs 里的 `cfg(not(windows))` libc::kill 分支此前从未被任何 CI 编译过
+  #（release 只出 Windows），Cargo.toml 注释也记录了它「曾经根本编译不过」。
+  # 这里用 ubuntu 跑一次 cargo check，把这个分支重新纳入编译门。
+  rust-nonwindows:
+    name: Rust 编译（非 Windows）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust 依赖缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 安装 Tauri Linux 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            patchelf build-essential pkg-config
+
+      - name: 占位 sidecar（仅满足 tauri-build 的存在性校验）
+        run: |
+          mkdir -p src-tauri/binaries
+          printf 'placeholder for cargo check' > src-tauri/binaries/backend-x86_64-unknown-linux-gnu
+
+      - name: Rust 编译检查
+        run: cargo check --manifest-path src-tauri/Cargo.toml

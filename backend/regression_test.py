@@ -898,6 +898,9 @@ import inspect as _inspect
 _hb_src = _inspect.getsource(_PR._heartbeat_loop)
 check("心跳循环不再全量重写 progress.json（避免写放大）",
       "atomic_write_json" not in _hb_src, "心跳里又出现了 progress.json 全量写入")
+check("心跳不再重读 progress.json（改用内存引用登记历史）",
+      "read_text" not in _hb_src and "json.loads" not in _hb_src,
+      "心跳里又出现了 progress.json 全量读取")
 check("心跳维护内存心跳时间", "state.last_heartbeat" in _hb_src, "")
 
 # status 优先返回内存心跳，其次回落到 progress.json 里的旧值

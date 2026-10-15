@@ -49,7 +49,7 @@ export async function connectSSE(port: number, handlers: SSEHandlers, attempt = 
   try {
     const response = await apiFetch(`http://127.0.0.1:${port}/api/events`, {
       signal: ctrl.signal,
-      headers: { 'Accept': 'text/event-stream' },
+      headers: { Accept: 'text/event-stream' },
     });
     if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`);
     const reader = response.body.getReader();
@@ -80,15 +80,24 @@ export async function connectSSE(port: number, handlers: SSEHandlers, attempt = 
     }
     throw new Error('服务端关闭了事件流');
   } catch (e: any) {
-    if (timeoutCheck !== null) { clearInterval(timeoutCheck); timeoutCheck = null; }
-    if (gen !== generation) return;               // 已被新连接取代
+    if (timeoutCheck !== null) {
+      clearInterval(timeoutCheck);
+      timeoutCheck = null;
+    }
+    if (gen !== generation) return; // 已被新连接取代
     const aborted = e?.name === 'AbortError';
-    if (aborted && !watchdogFired) return;          // disconnectSSE() 主动断开，不算故障
+    if (aborted && !watchdogFired) return; // disconnectSSE() 主动断开，不算故障
     scheduleReconnect(port, handlers, attempt + 1, e?.message, gen);
   }
 }
 
-function scheduleReconnect(port: number, handlers: SSEHandlers, attempt: number, detail: string | undefined, gen: number) {
+function scheduleReconnect(
+  port: number,
+  handlers: SSEHandlers,
+  attempt: number,
+  detail: string | undefined,
+  gen: number,
+) {
   if (gen !== generation) return;
   const delay = (BACKOFF_SEC[attempt - 1] ?? BACKOFF_FLOOR_SEC) * 1000;
   handlers.onStatus?.({ connected: false, attempt, detail, retrying: true });
@@ -101,12 +110,15 @@ function scheduleReconnect(port: number, handlers: SSEHandlers, attempt: number,
 }
 
 function clearRetryTimer() {
-  if (retryTimer !== null) { clearTimeout(retryTimer); retryTimer = null; }
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
 }
 
 /** 主动断开并停止重连（流水线结束、组件卸载时调用）。 */
 export function disconnectSSE() {
-  generation++;              // 让在途连接的回调失效
+  generation++; // 让在途连接的回调失效
   clearRetryTimer();
   abortController?.abort();
   abortController = null;
@@ -121,6 +133,9 @@ function parseSSEEvent(raw: string, handlers: SSEHandlers) {
     else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
   }
   if (dataLines.length === 0) return; // 纯心跳注释行
-  try { handlers.onEvent(eventType, JSON.parse(dataLines.join('\n'))); }
-  catch (e) { console.error('SSE 解析失败:', dataLines); }
+  try {
+    handlers.onEvent(eventType, JSON.parse(dataLines.join('\n')));
+  } catch {
+    console.error('SSE 解析失败:', dataLines);
+  }
 }

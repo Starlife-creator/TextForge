@@ -152,7 +152,8 @@ pub fn reap_orphan_backend() {
     }
 }
 
-/// 按进程树结束进程（仅 Windows）。
+/// 结束进程树。Windows 走 taskkill /T（连后代一起收）；
+/// 其它平台退化为终止该 PID 本身（sidecar 是单进程，够用）。
 ///
 /// child.kill() 只对 Tauri 直接拉起的那个进程生效；PyInstaller onefile 还会再拉起
 /// 一个跑 Python 的子进程，于是子进程变孤儿继续运行。taskkill /T 连后代一起收掉。
@@ -165,7 +166,9 @@ pub fn kill_tree(pid: u32) {
             .output();
     }
     #[cfg(not(windows))]
-    let _ = pid;
+    {
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
 }
 
 /// TCP 探测：端口文件存在 ≠ 进程活着。用它把「有 port.json 但连不上」区分出来。
@@ -191,6 +194,7 @@ pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
     cmd = cmd.env("TEXTFORGE_TOKEN", auth_token());
     let (mut rx, child) = cmd.spawn()
         .map_err(|e| format!("sidecar 启动失败: {}", e))?;
+    let child_pid = child.pid();
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
             match event {
@@ -198,11 +202,16 @@ pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
                 CommandEvent::Stderr(line) => eprintln!("[backend stderr] {}", String::from_utf8_lossy(&line)),
                 CommandEvent::Terminated(payload) => {
                     eprintln!("[backend] 进程退出: {:?}", payload);
-                    // 只有当 port.json 记录的端口确实没人监听时才删。
-                    // restart_backend 是「先 kill 旧子进程、再 spawn 新进程」，而
-                    // Terminated 事件异步投递 —— 无条件删除会把新进程刚写好的
-                    // port.json 抹掉，前端只能对着空端口空等 30s。
-                    //
+                    // 只清理「本子进程」写下的 port.json。restart_backend 是
+                    // 「kill 旧子进程 → 删 port.json → spawn 新进程」，而 Terminated
+                    // 事件异步投递：旧进程的退出事件可能在新进程刚写好 port.json、
+                    // 但**尚未 listen** 的窗口才被处理，此时按端口探测会把新进程误判成
+                    // 死进程而删掉文件 → 前端对着空端口空等 30s。
+                    // 用 PID 绑定即可精确区分，绝不误删别人的 port.json。
+                    if get_pid_from_json() != child_pid {
+                        eprintln!("[backend] port.json 已属于更新的进程，跳过清理");
+                        continue;
+                    }
                     // 用 spawn_blocking：probe_port 最多阻塞 800ms，不能占着
                     // async runtime 的 worker 线程（退出和重启都会走到这里）。
                     let p = get_port_from_json();

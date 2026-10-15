@@ -74,6 +74,15 @@ class TokenAuthMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # CORS 预检必须放行。本中间件在最外层（app.py 里最后注册），会先于
+        # CORSMiddleware 拿到请求；而预检 OPTIONS **按规范不带任何自定义头**，
+        # 也就永远带不上 X-TextForge-Token —— 若在此拦成 401，浏览器拿不到
+        # Access-Control-Allow-*，真正的业务请求根本发不出去（release 下前端
+        # 全废）。预检不碰业务、无泄露价值，交给内层 CORSMiddleware 应答即可。
+        if scope.get("method") == "OPTIONS":
+            await self.app(scope, receive, send)
+            return
+
         path = scope.get("path", "")
         if path in _EXEMPT:
             await self.app(scope, receive, send)

@@ -138,6 +138,13 @@ async def output_clear(payload: dict = Body(...)):
         if resolved == special:
             raise HTTPException(400, f"拒绝清空特殊目录：{special.name}")
 
+    # 正向证据：只有「明确像 TextForge 输出目录」才允许删。此前仅挡了根/主目录/桌面，
+    # 指向 Documents 之类的任意目录时，仍会把碰巧同名的 03_final/_versions/_backup
+    # 一并删掉。progress.json 与 02_workspace 是 TextForge 独有、几乎不会撞名的产物。
+    if not ((p / "progress.json").exists() or (p / "02_workspace").exists()):
+        raise HTTPException(
+            400, "该目录不像 TextForge 输出目录（缺少 progress.json / 02_workspace），拒绝清空")
+
     removed, failed = [], []
     for name in ARTIFACTS:
         target = p / name

@@ -12,16 +12,65 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   NODE_VERSION: '20'
   PYTHON_VERSION: '3.13'
 
 jobs:
-  build-release:
+  # 发布前快检：此前 release 仅由 tag/dispatch 触发，从不跑测试或 lint ——
+  # 一个没通过 build-check 的提交打了 tag 就能直接发布。这里补一道最便宜的门。
+  test:
+    name: 发布前测试门
     runs-on: windows-latest
+    timeout-minutes: 25
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 单元测试
+        run: npm run test
+
+      - name: Lint
+        run: npm run lint
+
+  build-release:
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 版本号硬编码在 package.json / src-tauri/Cargo.toml / src-tauri/tauri.conf.json
+      # 三处。三者不一致、或与 tag 不一致时，会产出「文件名是旧版本、却挂在 v新版本
+      # 这个 tag 下」的包，用户下载到的版本号全错，且很难撤回。
+      - name: 校验三处版本号 + tag 一致性
+        shell: pwsh
+        run: |
+          $pkg   = (Get-Content 'package.json' -Raw | ConvertFrom-Json).version
+          $tauri = (Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json).version
+          $cargo = (Select-String -Path 'src-tauri\Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          Write-Host "package.json=$pkg  Cargo.toml=$cargo  tauri.conf.json=$tauri  ref=${{ github.ref }}"
+          if ($pkg -ne $cargo -or $pkg -ne $tauri) {
+            throw "三处版本号不一致：package=$pkg cargo=$cargo tauri=$tauri"
+          }
+          if ("${{ github.ref }}" -like 'refs/tags/v*' -and ("v$pkg" -ne "${{ github.ref_name }}")) {
+            throw "tag ${{ github.ref_name }} 与版本 v$pkg 不一致（应打 v$pkg）"
+          }
 
       - name: 安装 Node（前端）
         uses: actions/setup-node@v4
@@ -63,7 +112,9 @@ jobs:
       # Tauri 的 externalBin 要求单文件，故仍产出该占位文件供 tauri build 校验；
       # 真正的便携包在下一步由我们手工组装 —— onedir 的 exe 正是从
       # 「自身所在目录/_internal」找依赖，把两者铺平即可。
-      - name: 构建 sidecar 后端（PyInstaller onedir）
+      # PyInstaller 的 flag 列表（--collect-all 等）集中在 backend\build_sidecar.bat：
+      # 本地与 CI 共用同一入口，杜绝两处配置漂移后、只在冻结版运行期才炸 ImportError。
+      - name: 准备后端虚拟环境
         shell: bash
         run: |
           cd backend
@@ -72,16 +123,10 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-          python -m PyInstaller --noconsole --onedir \
-            --collect-all fastapi --collect-all starlette --collect-all pydantic \
-            --collect-all pydantic_core --collect-all uvicorn --collect-all anyio \
-            --collect-all httpx --collect-all h11 --collect-all sniffio \
-            --collect-all chardet --collect-all charset_normalizer \
-            --collect-all socksio --collect-all lxml --collect-all docx \
-            --collect-all cn2an --collect-all certifi --collect-all httpcore --collect-all idna \
-            --name backend main.py
-          mkdir -p ../src-tauri/binaries
-          cp dist/backend/backend.exe ../src-tauri/binaries/backend-x86_64-pc-windows-msvc.exe
+
+      - name: 构建 sidecar 后端（backend\build_sidecar.bat，onedir）
+        shell: cmd
+        run: call backend\build_sidecar.bat
 
       # bundle.active=false → 只出外壳二进制，不生成 NSIS/MSI 安装壳。
       # sidecar 不用 tauri 拷贝：它在下一步直接从 PyInstaller 的 onedir 产物组装。
@@ -92,7 +137,7 @@ jobs:
         shell: pwsh
         run: |
           $rel = 'src-tauri\target\x86_64-pc-windows-msvc\release'
-          $od  = 'backend\dist\backend'          # PyInstaller onedir 产物
+          $od  = 'backend\build\dist\backend'    # build_sidecar.bat 的 PyInstaller onedir 产物
           $stage = 'TextForge'
           if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
@@ -152,9 +197,13 @@ jobs:
           $notes = $notes -replace '__VER__', $ver
           $notes | Out-File -Encoding utf8 RELEASE_NOTES.md
 
-          gh release create "${{ github.ref_name }}" `
-            "TextForge_${ver}_portable_x64.zip" `
-            "SHA256SUMS.txt" `
-            --title "TextForge $ver（免安装便携版）" `
-            --notes-file RELEASE_NOTES.md `
-            --repo "${{ github.repository }}"
+          # workflow_dispatch 时 github.ref_name 是分支名（如 main），不能当 tag 用。
+          # tag 推送时 ref_name 本来就是 v$ver，统一取 v$ver 两种情况都对；
+          # dispatch 时该 tag 尚不存在，显式 --target 到当前提交。
+          $tag = "v$ver"
+          $args = @($tag, "TextForge_${ver}_portable_x64.zip", "SHA256SUMS.txt",
+                    "--title", "TextForge $ver（免安装便携版）",
+                    "--notes-file", "RELEASE_NOTES.md",
+                    "--repo", "${{ github.repository }}")
+          if ("${{ github.ref }}" -notlike 'refs/tags/*') { $args += @("--target", "${{ github.sha }}") }
+          gh release create @args

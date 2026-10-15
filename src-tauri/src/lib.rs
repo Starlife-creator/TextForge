@@ -39,34 +39,39 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     let port = get_port_from_json();
                     let mut graceful = false;
-                    let client = reqwest::Client::builder()
+                    // 不用 unwrap：Cargo.toml 里 panic="abort"，builder 一旦失败会直接
+                    // 终止进程，而此刻 sidecar 尚未被杀 → 留下孤儿进程 + 陈旧 port.json
+                    //（正是本段代码要防的）。失败就跳过优雅退出，交给下面强杀兜底。
+                    if let Ok(client) = reqwest::Client::builder()
                         .timeout(std::time::Duration::from_secs(5))
-                        .build().unwrap();
-                    if port > 0 {
-                        // 先停流水线，再让它整个服务退出。
-                        // 必须带 token：后端 release 下会校验 X-TextForge-Token，
-                        // 漏带会让这两个请求被 401 静默拒绝，优雅退出退化成强杀。
-                        let _ = client.post(format!("http://127.0.0.1:{}/api/stop", port))
-                            .header(TOKEN_HEADER, auth_token()).send().await;
-                        // 复用既有的 /api/system/shutdown（设置面板「停止后端」同一个端点），
-                        // 不新增重复路由。
-                        let _ = client.post(format!("http://127.0.0.1:{}/api/system/shutdown", port))
-                            .header(TOKEN_HEADER, auth_token()).send().await;
+                        .build()
+                    {
+                        if port > 0 {
+                            // 先停流水线，再让它整个服务退出。
+                            // 必须带 token：后端 release 下会校验 X-TextForge-Token，
+                            // 漏带会让这两个请求被 401 静默拒绝，优雅退出退化成强杀。
+                            let _ = client.post(format!("http://127.0.0.1:{}/api/stop", port))
+                                .header(TOKEN_HEADER, auth_token()).send().await;
+                            // 复用既有的 /api/system/shutdown（设置面板「停止后端」同一个端点），
+                            // 不新增重复路由。
+                            let _ = client.post(format!("http://127.0.0.1:{}/api/system/shutdown", port))
+                                .header(TOKEN_HEADER, auth_token()).send().await;
 
-                        // **轮询**等后端真的下线，而不是固定 sleep。
-                        let mut down = false;
-                        for _ in 0..24 {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                            if client
-                                .get(format!("http://127.0.0.1:{}/api/health", port))
-                                .send().await.is_err()
-                            {
-                                down = true;
-                                break;
+                            // **轮询**等后端真的下线，而不是固定 sleep。
+                            let mut down = false;
+                            for _ in 0..24 {
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                if client
+                                    .get(format!("http://127.0.0.1:{}/api/health", port))
+                                    .send().await.is_err()
+                                {
+                                    down = true;
+                                    break;
+                                }
                             }
-                        }
-                        if down {
-                            graceful = true;
+                            if down {
+                                graceful = true;
+                            }
                         }
                     }
                     {

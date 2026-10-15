@@ -29,7 +29,9 @@ REM backend.exe 与 _internal 一起铺到同一个目录里 —— onedir 的 e
 REM 「自身所在目录/_internal」找依赖的，两者同级即可。
 
 echo [2/4] PyInstaller 打包（onedir，控制台关闭）...
-venv\Scripts\python.exe -m PyInstaller --noconsole --onedir ^
+REM --collect-all 列表是本项目 sidecar 的**唯一**配置源：release.yml 也调用本脚本，
+REM 不要在两处各写一份。--noconfirm --clean 保证重建时不会卡在覆盖确认上。
+venv\Scripts\python.exe -m PyInstaller --noconfirm --clean --noconsole --onedir ^
   --collect-all fastapi --collect-all starlette --collect-all pydantic ^
   --collect-all pydantic_core --collect-all uvicorn --collect-all anyio ^
   --collect-all httpx --collect-all h11 --collect-all sniffio ^

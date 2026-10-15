@@ -54,6 +54,19 @@ def validate_request_paths(req) -> tuple[Path, Path]:
     if norm_output.startswith(norm_base + os.sep):
         raise PathValidationError("输出目录不能位于输入目录内部，避免下次运行时把成品当原稿扫描")
 
+    # diagnose_json（可选）：必须落在输出目录之内。该值会被 pipeline 直接
+    # mkdir + 写入 diagnose_XX.json，不做校验的话任意调用方都能往任意目录
+    # （启动目录、系统目录……）写文件 —— 与 output.clear 同类风险。
+    dj = getattr(req, "diagnose_json", None)
+    if dj:
+        try:
+            dj_resolved = Path(dj).expanduser().resolve()
+        except OSError as e:
+            raise PathValidationError(f"诊断输出路径无法解析：{dj}（{e}）")
+        norm_dj = os.path.normcase(str(dj_resolved))
+        if norm_dj != norm_output and not norm_dj.startswith(norm_output + os.sep):
+            raise PathValidationError("诊断输出目录必须位于输出目录之内")
+
     # 输出目录可写探测
     probe = output_path / ".textforge_write_probe"
     try:

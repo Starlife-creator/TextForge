@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-ssr
+coverage
+src-tauri
+backend
+public
+package-lock.json
+*.md

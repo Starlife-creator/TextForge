@@ -10,10 +10,18 @@
  */
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import {
-  getSystemInfo, getLogs, openPath, shutdownBackend, fetchModels, checkLlm,
-  type SystemInfo, type ModelListResult, type LlmCheckResult,
+  getSystemInfo,
+  getLogs,
+  openPath,
+  shutdownBackend,
+  fetchModels,
+  checkLlm,
+  type SystemInfo,
+  type ModelListResult,
+  type LlmCheckResult,
 } from '../api/system';
 import { fetchBackendInfo, invokeRestartBackend, type BackendInfo } from '../api/backend';
+import { apiFetch } from '../api/client';
 
 const props = defineProps<{
   port: number | null;
@@ -27,7 +35,10 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   (e: 'close'): void;
-  (e: 'apply-model', v: { model: string; apiUrl: string; apiKey: string; proxy: string; sslVerify: boolean }): void;
+  (
+    e: 'apply-model',
+    v: { model: string; apiUrl: string; apiKey: string; proxy: string; sslVerify: boolean },
+  ): void;
   (e: 'apply-context', v: number): void;
   (e: 'reconnect'): void;
 }>();
@@ -60,7 +71,7 @@ let infoTimer: number | null = null;
 const filteredLogs = computed(() => {
   const f = logFilter.value.trim().toLowerCase();
   if (!f) return logLines.value;
-  return logLines.value.filter(l => l.toLowerCase().includes(f));
+  return logLines.value.filter((l) => l.toLowerCase().includes(f));
 });
 
 const uptimeText = computed(() => {
@@ -93,8 +104,13 @@ function say(kind: 'ok' | 'err' | 'info', text: string) {
 }
 async function withBusy(key: string, fn: () => Promise<void>) {
   busy.value = key;
-  try { await fn(); } catch (e: any) { say('err', e?.message || String(e)); }
-  finally { busy.value = ''; }
+  try {
+    await fn();
+  } catch (e: any) {
+    say('err', e?.message || String(e));
+  } finally {
+    busy.value = '';
+  }
 }
 function requirePort(): number {
   if (!props.port) throw new Error('后端端口未知，无法请求。请先重启后端。');
@@ -130,7 +146,7 @@ async function doRestart() {
     emit('reconnect');
     // 新进程起来要一点时间，轮询几次让 UI 自动跟上
     for (let i = 0; i < 12; i++) {
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise((r) => setTimeout(r, 1000));
       await refreshInfo();
       if (native.value?.reachable || info.value) break;
     }
@@ -140,7 +156,11 @@ async function doRestart() {
 
 async function doShutdown() {
   await withBusy('stop', async () => {
-    if (info.value?.pipeline_running && !window.confirm('流水线正在运行，强制停止后端会中断本次任务。继续？')) return;
+    if (
+      info.value?.pipeline_running &&
+      !window.confirm('流水线正在运行，强制停止后端会中断本次任务。继续？')
+    )
+      return;
     await shutdownBackend(requirePort(), true);
     say('ok', '后端已停止。点击「重新连接」或「重启后端」恢复。');
     await refreshInfo();
@@ -177,14 +197,22 @@ async function loadLogs(full = false) {
     }
   } catch (e: any) {
     logLines.value = [...logLines.value, `[读取日志失败] ${e?.message || e}`];
+    // 后端挂掉时本分支每 3s 追加一行，不封顶会把内存和 DOM 拖垮。
+    if (logLines.value.length > 2000) logLines.value = logLines.value.slice(-1500);
   }
 }
-function clearLogView() { logLines.value = []; logOffset.value = 0; loadLogs(true); }
+function clearLogView() {
+  logLines.value = [];
+  logOffset.value = 0;
+  loadLogs(true);
+}
 async function copyLogs() {
   try {
     await navigator.clipboard.writeText(logLines.value.join('\n'));
     say('ok', `已复制 ${logLines.value.length} 行`);
-  } catch (e: any) { say('err', `复制失败：${e?.message || e}`); }
+  } catch (e: any) {
+    say('err', `复制失败：${e?.message || e}`);
+  }
 }
 
 // ---------- 模型配置 ----------
@@ -195,8 +223,16 @@ const mProxy = ref(props.proxy);
 const mSslVerify = ref(props.sslVerify);
 // 父组件可能在面板打开期间改模型配置；不 watch 就会显示旧值，
 // 再点「应用到运行配置」就把旧值写回去。
-watch(() => [props.apiUrl, props.apiKey, props.model, props.proxy, props.sslVerify] as const,
-  ([u, k, m, p, s]) => { mApiUrl.value = u; mApiKey.value = k; mModel.value = m; mProxy.value = p; mSslVerify.value = s; });
+watch(
+  () => [props.apiUrl, props.apiKey, props.model, props.proxy, props.sslVerify] as const,
+  ([u, k, m, p, s]) => {
+    mApiUrl.value = u;
+    mApiKey.value = k;
+    mModel.value = m;
+    mProxy.value = p;
+    mSslVerify.value = s;
+  },
+);
 const models = ref<string[]>([]);
 const modelsErr = ref('');
 const modelsEndpoint = ref('');
@@ -205,9 +241,21 @@ const llmCheck = ref<LlmCheckResult | null>(null);
 
 /** LM Studio / Ollama / OpenAI 兼容端的常见形态，一键填入省得手敲 */
 const ENDPOINT_PRESETS: { label: string; url: string; hint: string }[] = [
-  { label: 'LM Studio', url: 'http://127.0.0.1:1234/v1/chat/completions', hint: '本机 LM Studio 默认端口 1234' },
-  { label: 'Ollama', url: 'http://127.0.0.1:11434/v1/chat/completions', hint: '本机 Ollama 默认端口 11434' },
-  { label: 'OpenAI 兼容', url: 'https://api.example.com/v1/chat/completions', hint: '云端 OpenAI 兼容服务' },
+  {
+    label: 'LM Studio',
+    url: 'http://127.0.0.1:1234/v1/chat/completions',
+    hint: '本机 LM Studio 默认端口 1234',
+  },
+  {
+    label: 'Ollama',
+    url: 'http://127.0.0.1:11434/v1/chat/completions',
+    hint: '本机 Ollama 默认端口 11434',
+  },
+  {
+    label: 'OpenAI 兼容',
+    url: 'https://api.example.com/v1/chat/completions',
+    hint: '云端 OpenAI 兼容服务',
+  },
 ];
 
 async function probeModels() {
@@ -226,23 +274,31 @@ async function probeModels() {
         modelsErr.value = (r.errors || []).join('；') || '未找到模型列表';
         say('err', '模型探测失败');
       }
-    } finally { probing.value = false; }
+    } finally {
+      probing.value = false;
+    }
   });
 }
 
 async function runLlmCheck() {
   await withBusy('check', async () => {
     llmCheck.value = await checkLlm(requirePort(), {
-      api_url: mApiUrl.value, model: mModel.value, api_key: mApiKey.value,
-      proxy: mProxy.value, ssl_verify: mSslVerify.value,
+      api_url: mApiUrl.value,
+      model: mModel.value,
+      api_key: mApiKey.value,
+      proxy: mProxy.value,
+      ssl_verify: mSslVerify.value,
     });
   });
 }
 
 /** 探测到的窗口比用户填的小 —— 这是最容易踩的坑：程序按大窗口切批，模型实际放不下。 */
-const ctxTooLarge = computed(() =>
-  !!llmCheck.value?.ok && !!llmCheck.value.context_limit
-  && props.contextWindow > (llmCheck.value.context_limit as number));
+const ctxTooLarge = computed(
+  () =>
+    !!llmCheck.value?.ok &&
+    !!llmCheck.value.context_limit &&
+    props.contextWindow > (llmCheck.value.context_limit as number),
+);
 
 function applyDetectedContext() {
   const n = llmCheck.value?.context_limit;
@@ -253,8 +309,11 @@ function applyDetectedContext() {
 
 function applyModel() {
   emit('apply-model', {
-    model: mModel.value.trim(), apiUrl: mApiUrl.value.trim(),
-    apiKey: mApiKey.value, proxy: mProxy.value.trim(), sslVerify: mSslVerify.value,
+    model: mModel.value.trim(),
+    apiUrl: mApiUrl.value.trim(),
+    apiKey: mApiKey.value,
+    proxy: mProxy.value.trim(),
+    sslVerify: mSslVerify.value,
   });
   say('ok', '已应用到运行配置');
 }
@@ -262,13 +321,20 @@ function applyModel() {
 /** 把误填的 /models 列表端点纠正为 /chat/completions 对话端点 */
 function fixEndpoint() {
   const u = mApiUrl.value.trim().replace(/\/+$/, '');
-  if (!u.endsWith('/models')) { say('info', '当前 URL 已经是对话端点，无需修正'); return; }
+  if (!u.endsWith('/models')) {
+    say('info', '当前 URL 已经是对话端点，无需修正');
+    return;
+  }
   mApiUrl.value = u.replace(/\/models$/, '/chat/completions');
   say('ok', `已修正为对话端点：${mApiUrl.value}`);
 }
 
 // ---------- 诊断 ----------
-interface DiagItem { name: string; ok: boolean; detail: string }
+interface DiagItem {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
 const diag = ref<DiagItem[]>([]);
 const diagnosing = ref(false);
 
@@ -282,32 +348,63 @@ async function runDiagnose() {
     native.value = bi;
     if (bi?.port) add('端口文件', true, `port=${bi.port} pid=${bi.pid}`);
     else add('端口文件', false, '未找到 port.json（后端可能未启动）');
-    if (bi) add('TCP 探测', bi.reachable, bi.reachable ? `127.0.0.1:${bi.port} 可连接` : '端口文件存在但连不上（孤儿进程或进程已死）');
+    if (bi)
+      add(
+        'TCP 探测',
+        bi.reachable,
+        bi.reachable ? `127.0.0.1:${bi.port} 可连接` : '端口文件存在但连不上（孤儿进程或进程已死）',
+      );
 
     // 2. HTTP 健康检查
     if (props.port) {
       try {
-        const r = await fetch(`http://127.0.0.1:${props.port}/api/health`);
+        // 必须走 apiFetch：release 下后端要求 X-TextForge-Token，
+        // 裸 fetch 会拿到 401，把「后端正常」误报成不健康。
+        const r = await apiFetch(`http://127.0.0.1:${props.port}/api/health`);
         add('/api/health', r.ok, `HTTP ${r.status}`);
-      } catch (e: any) { add('/api/health', false, e?.message || String(e)); }
+      } catch (e: any) {
+        add('/api/health', false, e?.message || String(e));
+      }
       // 3. 系统信息接口
       try {
         const si = await getSystemInfo(props.port);
         info.value = si;
         add('/api/system/info', true, `v${si.version} 运行 ${si.uptime_sec}s`);
-      } catch (e: any) { add('/api/system/info', false, e?.message || String(e)); }
+      } catch (e: any) {
+        add('/api/system/info', false, e?.message || String(e));
+      }
       // 4. 日志可读
       try {
         const lg = await getLogs(props.port, 0, 50);
-        add('backend.log', lg.exists, lg.exists ? `${lg.total} 行，${(lg.size || 0) / 1024 | 0} KB` : '日志文件不存在');
-      } catch (e: any) { add('backend.log', false, e?.message || String(e)); }
+        add(
+          'backend.log',
+          lg.exists,
+          lg.exists ? `${lg.total} 行，${((lg.size || 0) / 1024) | 0} KB` : '日志文件不存在',
+        );
+      } catch (e: any) {
+        add('backend.log', false, e?.message || String(e));
+      }
       // 5. 模型端点
       try {
-        const r = await fetchModels(props.port, mApiUrl.value || props.apiUrl, mApiKey.value || props.apiKey);
-        add('模型端点', r.ok, r.ok ? `${r.models.length} 个模型 @ ${r.endpoint}` : (r.errors || []).join('；'));
-      } catch (e: any) { add('模型端点', false, e?.message || String(e)); }
+        const r = await fetchModels(
+          props.port,
+          mApiUrl.value || props.apiUrl,
+          mApiKey.value || props.apiKey,
+        );
+        add(
+          '模型端点',
+          r.ok,
+          r.ok ? `${r.models.length} 个模型 @ ${r.endpoint}` : (r.errors || []).join('；'),
+        );
+      } catch (e: any) {
+        add('模型端点', false, e?.message || String(e));
+      }
     }
-    add('事件流 SSE', props.connected, props.connected ? '流在线' : '断开中（会自动重连；后端心跳 15s）');
+    add(
+      '事件流 SSE',
+      props.connected,
+      props.connected ? '流在线' : '断开中（会自动重连；后端心跳 15s）',
+    );
   } catch (e: any) {
     // 没有 catch 时，任何未来新增的未捕获 await 都会变成 unhandled rejection
     say('err', `诊断中断：${e?.message || e}`);
@@ -325,7 +422,9 @@ watch(tab, (t) => {
 onMounted(() => {
   refreshInfo();
   infoTimer = window.setInterval(refreshInfo, 5000);
-  logTimer = window.setInterval(() => { if (tabRef.value === 'logs' && !logPaused.value) loadLogs(false); }, 3000);
+  logTimer = window.setInterval(() => {
+    if (tabRef.value === 'logs' && !logPaused.value) loadLogs(false);
+  }, 3000);
 });
 
 onUnmounted(() => {
@@ -333,14 +432,32 @@ onUnmounted(() => {
   if (logTimer !== null) clearInterval(logTimer);
   if (sayTimer !== null) clearTimeout(sayTimer);
 });
+
+// 可关闭弹窗：Escape 关闭 + 打开即聚焦（键盘/读屏可用性）。
+const root = ref<HTMLElement | null>(null);
+function onKey(e: KeyboardEvent) {
+  if (e.key === 'Escape') emit('close');
+}
+onMounted(() => {
+  window.addEventListener('keydown', onKey);
+  root.value?.focus();
+});
+onUnmounted(() => window.removeEventListener('keydown', onKey));
 </script>
 
 <template>
   <div class="modal-mask" @click.self="emit('close')">
-    <div class="modal modal-wide">
+    <div
+      ref="root"
+      class="modal modal-wide"
+      role="dialog"
+      aria-modal="true"
+      aria-label="系统与后端设置"
+      tabindex="-1"
+    >
       <div class="head">
         <h3>系统与后端设置</h3>
-        <button class="x" @click="emit('close')">×</button>
+        <button type="button" class="x" aria-label="关闭设置" @click="emit('close')">×</button>
       </div>
 
       <nav class="tabs">
@@ -360,12 +477,14 @@ onUnmounted(() => {
             <div class="status-title">{{ connectionLabel.text }}</div>
             <div class="status-sub">
               <template v-if="info">
-                v{{ info.version }} · 端口 <b>{{ info.port || '?' }}</b> · PID <b>{{ info.pid }}</b> ·
-                已运行 {{ uptimeText }} · Python {{ info.python }} · {{ info.platform }}
+                v{{ info.version }} · 端口 <b>{{ info.port || '?' }}</b> · PID
+                <b>{{ info.pid }}</b> · 已运行 {{ uptimeText }} · Python {{ info.python }} ·
+                {{ info.platform }}
               </template>
               <template v-else-if="native">
-                端口 <b>{{ native.port || '?' }}</b> · PID <b>{{ native.pid || '?' }}</b> ·
-                TCP {{ native.reachable ? '可达' : '不可达' }} · {{ native.debug ? '开发模式' : '发布模式' }}
+                端口 <b>{{ native.port || '?' }}</b> · PID <b>{{ native.pid || '?' }}</b> · TCP
+                {{ native.reachable ? '可达' : '不可达' }} ·
+                {{ native.debug ? '开发模式' : '发布模式' }}
               </template>
               <template v-else>正在读取后端信息…</template>
             </div>
@@ -388,12 +507,33 @@ onUnmounted(() => {
           <summary>后端文件位置</summary>
           <table class="kv">
             <tbody>
-              <tr><th>数据目录</th><td>{{ info?.app_dir || native?.app_dir || '—' }}</td></tr>
-              <tr><th>端口文件</th><td>{{ info?.port_file || native?.port_file || '—' }}</td></tr>
-              <tr><th>日志文件</th><td>{{ info?.log_path || native?.log_path || '—' }}</td></tr>
-              <tr><th>运行模式</th><td>{{ info?.debug ? '开发（TEXTFORGE_DEBUG=1）' : '发布（sidecar）' }}</td></tr>
-              <tr><th>解释器</th><td>{{ info?.executable || '—' }}</td></tr>
-              <tr><th>当前 run</th><td>{{ info?.run_id || '（无）' }} · 订阅者 {{ Object.keys(info?.subscribers || {}).length }}</td></tr>
+              <tr>
+                <th>数据目录</th>
+                <td>{{ info?.app_dir || native?.app_dir || '—' }}</td>
+              </tr>
+              <tr>
+                <th>端口文件</th>
+                <td>{{ info?.port_file || native?.port_file || '—' }}</td>
+              </tr>
+              <tr>
+                <th>日志文件</th>
+                <td>{{ info?.log_path || native?.log_path || '—' }}</td>
+              </tr>
+              <tr>
+                <th>运行模式</th>
+                <td>{{ info?.debug ? '开发（TEXTFORGE_DEBUG=1）' : '发布（sidecar）' }}</td>
+              </tr>
+              <tr>
+                <th>解释器</th>
+                <td>{{ info?.executable || '—' }}</td>
+              </tr>
+              <tr>
+                <th>当前 run</th>
+                <td>
+                  {{ info?.run_id || '（无）' }} · 订阅者
+                  {{ Object.keys(info?.subscribers || {}).length }}
+                </td>
+              </tr>
             </tbody>
           </table>
         </details>
@@ -407,9 +547,11 @@ onUnmounted(() => {
           <button class="ghost" @click="copyLogs">复制全部</button>
           <label class="chk"><input type="checkbox" v-model="logAutoScroll" /> 自动滚动</label>
           <label class="chk"><input type="checkbox" v-model="logPaused" /> 暂停</label>
-          <input class="filter" v-model="logFilter" placeholder="过滤…" />
+          <input class="filter" v-model="logFilter" aria-label="过滤日志" placeholder="过滤…" />
         </div>
-        <div class="log-path">{{ logPath || 'backend.log' }} · 已显示 {{ filteredLogs.length }}/{{ logTotal }} 行</div>
+        <div class="log-path">
+          {{ logPath || 'backend.log' }} · 已显示 {{ filteredLogs.length }}/{{ logTotal }} 行
+        </div>
         <div class="log-view" ref="logBoxRef">
           <div v-if="!filteredLogs.length" class="log-empty">暂无日志</div>
           <div v-for="(l, i) in filteredLogs" :key="i" class="log-row">{{ l }}</div>
@@ -421,17 +563,31 @@ onUnmounted(() => {
         <div class="field">
           <label>API URL（对话端点）</label>
           <input v-model="mApiUrl" placeholder="http://127.0.0.1:1234/v1/chat/completions" />
-          <p class="hint">必须是 <code>.../chat/completions</code>。若填成了 <code>/models</code> 列表端点，点「修正端点」。</p>
+          <p class="hint">
+            必须是 <code>.../chat/completions</code>。若填成了
+            <code>/models</code> 列表端点，点「修正端点」。
+          </p>
           <div class="btn-row">
-            <button class="ghost" v-for="p in ENDPOINT_PRESETS" :key="p.label" :title="p.hint"
-              @click="mApiUrl = p.url">{{ p.label }}</button>
+            <button
+              class="ghost"
+              v-for="p in ENDPOINT_PRESETS"
+              :key="p.label"
+              :title="p.hint"
+              @click="mApiUrl = p.url"
+            >
+              {{ p.label }}
+            </button>
             <button class="ghost" @click="fixEndpoint">修正端点</button>
           </div>
         </div>
 
         <div class="field">
           <label>API Key</label>
-          <input v-model="mApiKey" type="password" placeholder="可选，本地服务一般留空；仅存内存不落盘" />
+          <input
+            v-model="mApiKey"
+            type="password"
+            placeholder="可选，本地服务一般留空；仅存内存不落盘"
+          />
         </div>
 
         <div class="btn-row">
@@ -467,16 +623,24 @@ onUnmounted(() => {
           <button class="primary" @click="applyModel">应用到运行配置</button>
         </div>
         <p v-if="llmCheck" class="hint" :class="llmCheck.ok ? 'ok' : 'err'">
-          <template v-if="llmCheck.ok">连通正常 · {{ llmCheck.elapsed_ms }}ms · 回包「{{ llmCheck.reply }}」</template>
+          <template v-if="llmCheck.ok"
+            >连通正常 · {{ llmCheck.elapsed_ms }}ms · 回包「{{ llmCheck.reply }}」</template
+          >
           <template v-else>失败 · {{ llmCheck.error }}</template>
         </p>
-        <p v-if="llmCheck?.ok && llmCheck.context_limit" class="hint" :class="ctxTooLarge ? 'err' : 'ok'">
+        <p
+          v-if="llmCheck?.ok && llmCheck.context_limit"
+          class="hint"
+          :class="ctxTooLarge ? 'err' : 'ok'"
+        >
           实测模型上下文：<b>{{ llmCheck.context_limit }}</b> token
           <template v-if="llmCheck.context_source">（来源 {{ llmCheck.context_source }}）</template>
           <template v-if="ctxTooLarge">
             · 你设置的是 {{ contextWindow }}，比实测大 —— 程序会按实测自动缩小批次，
             但建议直接改成实测值以获得更准确的批次划分。
-            <button class="ghost" @click="applyDetectedContext">套用 {{ llmCheck.context_limit }}</button>
+            <button class="ghost" @click="applyDetectedContext">
+              套用 {{ llmCheck.context_limit }}
+            </button>
           </template>
         </p>
       </div>
@@ -505,110 +669,360 @@ onUnmounted(() => {
 
 <style scoped>
 .modal-mask {
-  position: fixed; inset: 0; background: rgba(0,0,0,0.5);
-  display: flex; align-items: center; justify-content: center; z-index: 200;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
 }
 .modal {
-  background: #fff; border-radius: 8px; padding: 0;
-  width: 760px; max-width: 94vw; max-height: 88vh;
-  display: flex; flex-direction: column; overflow: hidden;
+  background: #fff;
+  border-radius: 8px;
+  padding: 0;
+  width: 760px;
+  max-width: 94vw;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 .head {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 14px 20px; border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 14px 20px;
+  border-bottom: 1px solid #e2e8f0;
 }
-.head h3 { margin: 0; font-size: 15px; }
-.x { background: transparent; border: none; font-size: 20px; cursor: pointer; color: #718096; line-height: 1; }
-.tabs { display: flex; gap: 2px; padding: 8px 20px 0; border-bottom: 1px solid #e2e8f0; }
+.head h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.x {
+  background: transparent;
+  border: none;
+  font-size: 20px;
+  cursor: pointer;
+  color: #718096;
+  line-height: 1;
+}
+.tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 20px 0;
+  border-bottom: 1px solid #e2e8f0;
+}
 .tabs button {
-  padding: 7px 16px; border: none; background: transparent; cursor: pointer;
-  font-size: 13px; color: #718096; border-bottom: 2px solid transparent;
+  padding: 7px 16px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 13px;
+  color: #718096;
+  border-bottom: 2px solid transparent;
 }
-.tabs button.on { color: #3182ce; border-bottom-color: #3182ce; font-weight: 600; }
-.body { padding: 16px 20px 20px; overflow-y: auto; flex: 1; }
+.tabs button.on {
+  color: #3182ce;
+  border-bottom-color: #3182ce;
+  font-weight: 600;
+}
+.body {
+  padding: 16px 20px 20px;
+  overflow-y: auto;
+  flex: 1;
+}
 
-.notice { margin: 12px 20px 0; padding: 7px 12px; border-radius: 5px; font-size: 12px; }
-.notice.ok { background: #c6f6d5; color: #22543d; }
-.notice.err { background: #fed7d7; color: #822727; }
-.notice.info { background: #bee3f8; color: #2c5282; }
+.notice {
+  margin: 12px 20px 0;
+  padding: 7px 12px;
+  border-radius: 5px;
+  font-size: 12px;
+}
+.notice.ok {
+  background: #c6f6d5;
+  color: #22543d;
+}
+.notice.err {
+  background: #fed7d7;
+  color: #822727;
+}
+.notice.info {
+  background: #bee3f8;
+  color: #2c5282;
+}
 
 .status-card {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 14px; border-radius: 7px; margin-bottom: 14px; border: 1px solid;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 7px;
+  margin-bottom: 14px;
+  border: 1px solid;
 }
-.status-card.ok { background: #f0fff4; border-color: #9ae6b4; }
-.status-card.bad { background: #fff5f5; border-color: #feb2b2; }
-.big-dot { width: 12px; height: 12px; border-radius: 50%; flex: 0 0 auto; }
-.status-card.ok .big-dot { background: #38a169; }
-.status-card.bad .big-dot { background: #e53e3e; }
-.status-title { font-size: 14px; font-weight: 600; color: #2d3748; }
-.status-sub { font-size: 12px; color: #4a5568; margin-top: 2px; }
+.status-card.ok {
+  background: #f0fff4;
+  border-color: #9ae6b4;
+}
+.status-card.bad {
+  background: #fff5f5;
+  border-color: #feb2b2;
+}
+.big-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.status-card.ok .big-dot {
+  background: #38a169;
+}
+.status-card.bad .big-dot {
+  background: #e53e3e;
+}
+.status-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #2d3748;
+}
+.status-sub {
+  font-size: 12px;
+  color: #4a5568;
+  margin-top: 2px;
+}
 
-.btn-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
-.btn-row .spacer { flex: 1; }
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.btn-row .spacer {
+  flex: 1;
+}
 .btn-row button {
-  padding: 6px 14px; border: 1px solid #d1d5db; background: #fff;
-  border-radius: 5px; cursor: pointer; font-size: 13px;
+  padding: 6px 14px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 13px;
 }
-.btn-row button:hover:not(:disabled) { background: #f0f4f8; }
-.btn-row button:disabled { opacity: 0.45; cursor: not-allowed; }
-.btn-row button.primary { background: #3182ce; border-color: #3182ce; color: #fff; }
-.btn-row button.primary:hover:not(:disabled) { background: #2b6cb0; }
-.btn-row button.danger { color: #c53030; border-color: #feb2b2; }
-.btn-row button.ghost { border-color: #cbd5e0; color: #4a5568; }
+.btn-row button:hover:not(:disabled) {
+  background: #f0f4f8;
+}
+.btn-row button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-row button.primary {
+  background: #3182ce;
+  border-color: #3182ce;
+  color: #fff;
+}
+.btn-row button.primary:hover:not(:disabled) {
+  background: #2b6cb0;
+}
+.btn-row button.danger {
+  color: #c53030;
+  border-color: #feb2b2;
+}
+.btn-row button.ghost {
+  border-color: #cbd5e0;
+  color: #4a5568;
+}
 
-.block { border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 12px; }
-.block summary { cursor: pointer; font-size: 13px; color: #4a5568; }
+.block {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+.block summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: #4a5568;
+}
 
-.kv { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+.kv {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 12px;
+}
 .kv th {
-  text-align: left; font-weight: 500; color: #718096; width: 96px;
-  vertical-align: top; padding: 3px 8px 3px 0; white-space: nowrap;
+  text-align: left;
+  font-weight: 500;
+  color: #718096;
+  width: 96px;
+  vertical-align: top;
+  padding: 3px 8px 3px 0;
+  white-space: nowrap;
 }
-.kv td { color: #2d3748; word-break: break-all; font-family: Consolas, monospace; padding: 3px 0; }
-.kv .ok-txt { color: #22543d; }
-.kv .err-txt { color: #822727; }
-.diag th { width: 120px; }
-.mini-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; }
-.mini-dot.ok { background: #38a169; }
-.mini-dot.err { background: #e53e3e; }
-
-.field { margin-bottom: 12px; }
-.field label { display: block; font-size: 13px; color: #4a5568; margin-bottom: 4px; }
-.field input, .field select {
-  width: 100%; padding: 6px 10px; border: 1px solid #d1d5db;
-  border-radius: 5px; font-size: 13px;
+.kv td {
+  color: #2d3748;
+  word-break: break-all;
+  font-family: Consolas, monospace;
+  padding: 3px 0;
 }
-.field .chk { display: inline-flex; align-items: center; gap: 5px; margin-top: 6px; font-size: 12px; }
-.field .chk input { width: auto; }
-.filter { flex: 1; min-width: 120px; padding: 5px 10px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 12px; }
-.chk { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: #4a5568; }
-.chk input { width: auto; }
+.kv .ok-txt {
+  color: #22543d;
+}
+.kv .err-txt {
+  color: #822727;
+}
+.diag th {
+  width: 120px;
+}
+.mini-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.mini-dot.ok {
+  background: #38a169;
+}
+.mini-dot.err {
+  background: #e53e3e;
+}
 
-.hint { font-size: 12px; color: #718096; margin: 4px 0 8px; }
-.hint.inline { margin: 0; }
-.hint.err { color: #c53030; }
-.hint.ok { color: #2f855a; }
+.field {
+  margin-bottom: 12px;
+}
+.field label {
+  display: block;
+  font-size: 13px;
+  color: #4a5568;
+  margin-bottom: 4px;
+}
+.field input,
+.field select {
+  width: 100%;
+  padding: 6px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  font-size: 13px;
+}
+.field .chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+.field .chk input {
+  width: auto;
+}
+.filter {
+  flex: 1;
+  min-width: 120px;
+  padding: 5px 10px;
+  border: 1px solid #d1d5db;
+  border-radius: 5px;
+  font-size: 12px;
+}
+.chk {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #4a5568;
+}
+.chk input {
+  width: auto;
+}
 
-.log-path { font-size: 11px; color: #718096; margin-bottom: 4px; font-family: Consolas, monospace; }
+.hint {
+  font-size: 12px;
+  color: #718096;
+  margin: 4px 0 8px;
+}
+.hint.inline {
+  margin: 0;
+}
+.hint.err {
+  color: #c53030;
+}
+.hint.ok {
+  color: #2f855a;
+}
+
+.log-path {
+  font-size: 11px;
+  color: #718096;
+  margin-bottom: 4px;
+  font-family: Consolas, monospace;
+}
 .log-view {
-  height: 380px; overflow-y: auto; background: #1a202c; color: #e2e8f0;
-  border-radius: 6px; padding: 10px 12px; font-family: Consolas, monospace; font-size: 12px; line-height: 1.6;
+  height: 380px;
+  overflow-y: auto;
+  background: #1a202c;
+  color: #e2e8f0;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.6;
 }
-.log-row { white-space: pre-wrap; word-break: break-all; }
-.log-empty { color: #718096; font-size: 12px; padding: 8px 0; }
+.log-row {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-empty {
+  color: #718096;
+  font-size: 12px;
+  padding: 8px 0;
+}
 
-html.dark .modal { background: #1f2733; }
-html.dark .head, html.dark .tabs { border-color: #4a5568; }
-html.dark .tabs button { color: #a0aec0; }
-html.dark .tabs button.on { color: #63b3ed; border-bottom-color: #63b3ed; }
-html.dark .status-card.ok { background: #1d2b21; border-color: #2f855a; }
-html.dark .status-card.bad { background: #2d1d1d; border-color: #9b2c2c; }
-html.dark .status-title, html.dark .kv td, html.dark .block summary { color: #e2e8f0; }
-html.dark .status-sub, html.dark .kv th, html.dark .hint, html.dark .field label, html.dark .chk { color: #a0aec0; }
-html.dark .btn-row button, html.dark .field input, html.dark .field select, html.dark .filter {
-  background: #2d3748; color: #e2e8f0; border-color: #4a5568;
+html.dark .modal {
+  background: #1f2733;
 }
-html.dark .block { border-color: #4a5568; }
-html.dark .x { color: #a0aec0; }
+html.dark .head,
+html.dark .tabs {
+  border-color: #4a5568;
+}
+html.dark .tabs button {
+  color: #a0aec0;
+}
+html.dark .tabs button.on {
+  color: #63b3ed;
+  border-bottom-color: #63b3ed;
+}
+html.dark .status-card.ok {
+  background: #1d2b21;
+  border-color: #2f855a;
+}
+html.dark .status-card.bad {
+  background: #2d1d1d;
+  border-color: #9b2c2c;
+}
+html.dark .status-title,
+html.dark .kv td,
+html.dark .block summary {
+  color: #e2e8f0;
+}
+html.dark .status-sub,
+html.dark .kv th,
+html.dark .hint,
+html.dark .field label,
+html.dark .chk {
+  color: #a0aec0;
+}
+html.dark .btn-row button,
+html.dark .field input,
+html.dark .field select,
+html.dark .filter {
+  background: #2d3748;
+  color: #e2e8f0;
+  border-color: #4a5568;
+}
+html.dark .block {
+  border-color: #4a5568;
+}
+html.dark .x {
+  color: #a0aec0;
+}
 </style>

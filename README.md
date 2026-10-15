@@ -125,8 +125,13 @@ venv\Scripts\python test_e2e_pipeline.py  # 98 项 端到端
 
 cd ..\src-tauri && cargo test             # 10 项 Rust
 cd .. && npm run test                     # 7 项 前端
+npm run lint                              # ESLint 代码质量
+npm run format:check                      # Prettier 排版检查
 npm run build                             # 类型检查 + 构建
 ```
+
+代码风格由 `eslint.config.js`（ESLint 10 扁平配置）+ `.prettierrc.json` 统一，
+两者的规则边界靠 `@vue/eslint-config-prettier` 划开，CI 里都会阻断。
 
 端到端测试会用 `mock_llm.py` 冒充大模型，并**自动确认所有人工闸门**
 （`gate_driver`），因此可以无人值守跑完整条流水线。

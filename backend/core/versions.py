@@ -71,8 +71,9 @@ def _prune(root: Path, keep: int) -> None:
     for _, _, old in versions[keep:]:
         try:
             shutil.rmtree(old)
-        except OSError:
-            pass
+        except OSError as e:
+            # 静默会让磁盘在「版本数看着正常、实际没删掉」的情况下悄悄膨胀。
+            logger.warning(f"[versions] 删除旧版本 {old.name} 失败（可能被占用）：{e}")
 
 
 def list_versions(output_path: Path) -> list[dict]:
@@ -113,12 +114,14 @@ def restore(output_path: Path, version_id: str) -> dict:
     cur_name = snapshot(output_path, novel_name="恢复前")
     final_dir = output_path / "03_final"
     tmp = output_path / ("._restore_tmp")
+    # backup_dir 必须在 try 之前绑定：否则 copytree 一旦抛错，finally 里引用
+    # 未绑定的名字会再抛 NameError，把真实异常盖掉、还残留临时目录。
+    backup_dir = output_path / "._restore_old"
     try:
         if tmp.exists():
             shutil.rmtree(tmp)
         shutil.copytree(src, tmp)
         # 原子替换 03_final
-        backup_dir = output_path / "._restore_old"
         if backup_dir.exists():
             shutil.rmtree(backup_dir)
         if final_dir.exists():

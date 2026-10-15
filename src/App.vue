@@ -9,8 +9,12 @@ import GateModal from './components/GateModal.vue';
 import RunStats from './components/RunStats.vue';
 import { apiFetch, initAuth } from './api/client';
 import {
-  fetchHistory, forgetHistory, fetchVersions, restoreVersion,
-  type HistoryItem, type VersionInfo,
+  fetchHistory,
+  forgetHistory,
+  fetchVersions,
+  restoreVersion,
+  type HistoryItem,
+  type VersionInfo,
 } from './api/system';
 
 // ---------- 后端连接 ----------
@@ -35,7 +39,9 @@ const sseHandlers: SSEHandlers = {
     // 只有连续失败到第 3 次才提示，避免一次网络抖动就弹红字
     errorMsg.value = s.connected
       ? ''
-      : (s.attempt >= 3 ? `后端连接断开，正在自动重连（第 ${s.attempt} 次）` : '');
+      : s.attempt >= 3
+        ? `后端连接断开，正在自动重连（第 ${s.attempt} 次）`
+        : '';
   },
 };
 
@@ -53,8 +59,12 @@ const novelName = ref('');
 const refactorMode = ref<'full_rewrite' | 'fidelity' | 'fix_gaps' | 'reskin'>('full_rewrite');
 // 重构保护门（后端 refactor_gates，默认全关）
 const gates = reactive({
-  lock_names: false, lock_plot: false, inject_forbidden: false,
-  require_chapter_accept: false, skip_stitch_if_smooth: false, qc_block_export: false,
+  lock_names: false,
+  lock_plot: false,
+  inject_forbidden: false,
+  require_chapter_accept: false,
+  skip_stitch_if_smooth: false,
+  qc_block_export: false,
 });
 // 逐章验收弹窗
 const showAccept = ref(false);
@@ -111,12 +121,21 @@ function applyPreset() {
   batchInterval.value = p.interval;
 }
 // A2：构建 models 字典——仅模型则为字符串；配了独立端点则为 {model, api_url[, api_key]}
-function buildModels(): Record<string, string | { model: string; api_url: string; api_key?: string }> {
+function buildModels(): Record<
+  string,
+  string | { model: string; api_url: string; api_key?: string }
+> {
   const out: Record<string, string | { model: string; api_url: string; api_key?: string }> = {};
   const put = (ph: string, m: string, u: string, k: string) => {
     if (!m || !m.trim()) return;
-    if (!u || !u.trim()) { out[ph] = m.trim(); return; }
-    const entry: { model: string; api_url: string; api_key?: string } = { model: m.trim(), api_url: u.trim() };
+    if (!u || !u.trim()) {
+      out[ph] = m.trim();
+      return;
+    }
+    const entry: { model: string; api_url: string; api_key?: string } = {
+      model: m.trim(),
+      api_url: u.trim(),
+    };
     if (k && k.trim()) entry.api_key = k.trim();
     out[ph] = entry;
   };
@@ -137,6 +156,9 @@ const comparisonSel = ref('');
 const runId = ref<string | null>(null);
 const pipelineRunning = ref(false);
 const isPaused = ref(false);
+// 「已提交、等后端确认」窗口：/api/start 返回前 pipelineRunning 仍是 false，
+// 连点两次「开始重构」会先后发出两个 run。用它把按钮立刻锁住。
+const starting = ref(false);
 const currentPhase = ref('');
 type LogEntry = { ts: string; text: string; level: 'info' | 'ok' | 'warn' | 'err' | 'accent' };
 const eventLog = ref<LogEntry[]>([]);
@@ -167,6 +189,16 @@ const confirmingBlueprint = ref(false);
 const controlling = ref(false);
 // #2 流式增量预览（最近 500 字）
 const streamingText = ref('');
+// 流式增量按帧合并。每个 SSE chunk 都直接写 streamingText 会让整个 App
+// 重渲染（模板在 App 作用域内），高频输出下明显卡顿；攒到下一帧一次性刷新。
+let streamBuf = '';
+let streamRaf = 0;
+function flushStream() {
+  streamRaf = 0;
+  if (!streamBuf) return;
+  streamingText.value = (streamingText.value + streamBuf).slice(-500);
+  streamBuf = '';
+}
 
 // 统计与提示
 const usageTokens = ref({ prompt: 0, completion: 0 });
@@ -175,6 +207,8 @@ const chapterProgress = ref({ total: 0, done: 0 });
 const chapterRows = ref<{ id: string; label: string; status: string }[]>([]);
 const showChapterTree = ref(false);
 const topError = ref<string | null>(null);
+// 轮询已点亮的最后一条错误，用于避免同一错误被每个轮询周期重复点亮。
+let lastPolledError: string | null = null;
 const topTip = ref<string | null>(null);
 // B4：僵尸运行检测
 const zombieWarn = ref(false);
@@ -189,25 +223,42 @@ function toggleTheme() {
 const PERSIST_KEY = 'textforge_prefs_v1';
 function persist() {
   try {
-    localStorage.setItem(PERSIST_KEY, JSON.stringify({
-      apiUrl: apiUrl.value, model: model.value, contextWindow: contextWindow.value,
-      authorStyle: authorStyle.value, refactorMode: refactorMode.value,
-      batchInterval: batchInterval.value, darkMode: darkMode.value,
-      forbiddenCanon: forbiddenCanon.value, nameMapText: nameMapText.value,
-      outputPath: outputPath.value, inputPath: inputPath.value, aiSplit: aiSplit.value,
-      // inputMode / inputFormat / novelName 必须一起存：后端 paths.py 会硬校验
-      // 「声明格式 == 文件扩展名」，只存 inputPath 会让重开后的默认 txt + .docx 直接 422
-      inputMode: inputMode.value, inputFormat: inputFormat.value, novelName: novelName.value,
-      sslVerify: sslVerify.value,
-      tDiagnose: tDiagnose.value, tBlueprint: tBlueprint.value,
-      tRefactor: tRefactor.value, tStitch: tStitch.value,
-      proxy: proxy.value, richText: richText.value,
-      // 刻意不持久化 apiKey：后端全链路约定「Key 仅存内存、不落盘、不进日志」
-      // （api_client.make_httpx_client / routes/state.current_req），明文写进
-      // WebView2 localStorage 会打破这个不变量，也会让设置面板上
-      // 「仅存内存不落盘」的提示变成假话。
-    }));
-  } catch { /* 忽略持久化失败 */ }
+    localStorage.setItem(
+      PERSIST_KEY,
+      JSON.stringify({
+        apiUrl: apiUrl.value,
+        model: model.value,
+        contextWindow: contextWindow.value,
+        authorStyle: authorStyle.value,
+        refactorMode: refactorMode.value,
+        batchInterval: batchInterval.value,
+        darkMode: darkMode.value,
+        forbiddenCanon: forbiddenCanon.value,
+        nameMapText: nameMapText.value,
+        outputPath: outputPath.value,
+        inputPath: inputPath.value,
+        aiSplit: aiSplit.value,
+        // inputMode / inputFormat / novelName 必须一起存：后端 paths.py 会硬校验
+        // 「声明格式 == 文件扩展名」，只存 inputPath 会让重开后的默认 txt + .docx 直接 422
+        inputMode: inputMode.value,
+        inputFormat: inputFormat.value,
+        novelName: novelName.value,
+        sslVerify: sslVerify.value,
+        tDiagnose: tDiagnose.value,
+        tBlueprint: tBlueprint.value,
+        tRefactor: tRefactor.value,
+        tStitch: tStitch.value,
+        proxy: proxy.value,
+        richText: richText.value,
+        // 刻意不持久化 apiKey：后端全链路约定「Key 仅存内存、不落盘、不进日志」
+        // （api_client.make_httpx_client / routes/state.current_req），明文写进
+        // WebView2 localStorage 会打破这个不变量，也会让设置面板上
+        // 「仅存内存不落盘」的提示变成假话。
+      }),
+    );
+  } catch {
+    /* 忽略持久化失败 */
+  }
 }
 function restore() {
   try {
@@ -218,14 +269,21 @@ function restore() {
     if (typeof p.model === 'string') model.value = p.model;
     if (typeof p.contextWindow === 'number') contextWindow.value = p.contextWindow;
     if (typeof p.authorStyle === 'string') authorStyle.value = p.authorStyle;
-    if (p.refactorMode) refactorMode.value = p.refactorMode;
+    // 白名单校验：localStorage 可能存着旧版/损坏的值，直接赋值会让
+    // /api/start 收到非法 refactor_mode 而 422（提示还很难懂）。
+    if (['full_rewrite', 'fidelity', 'fix_gaps', 'reskin'].includes(p.refactorMode))
+      refactorMode.value = p.refactorMode;
     if (typeof p.batchInterval === 'number') batchInterval.value = p.batchInterval;
-    if (typeof p.darkMode === 'boolean') { darkMode.value = p.darkMode; document.documentElement.classList.toggle('dark', p.darkMode); }
+    if (typeof p.darkMode === 'boolean') {
+      darkMode.value = p.darkMode;
+      document.documentElement.classList.toggle('dark', p.darkMode);
+    }
     if (typeof p.forbiddenCanon === 'string') forbiddenCanon.value = p.forbiddenCanon;
     if (typeof p.nameMapText === 'string') nameMapText.value = p.nameMapText;
     if (typeof p.outputPath === 'string') outputPath.value = p.outputPath;
     if (typeof p.inputPath === 'string') inputPath.value = p.inputPath;
-    if (p.inputMode === 'single_file' || p.inputMode === 'multi_file') inputMode.value = p.inputMode;
+    if (p.inputMode === 'single_file' || p.inputMode === 'multi_file')
+      inputMode.value = p.inputMode;
     if (['txt', 'md', 'docx'].includes(p.inputFormat)) inputFormat.value = p.inputFormat;
     if (typeof p.aiSplit === 'boolean') aiSplit.value = p.aiSplit;
     if (typeof p.novelName === 'string') novelName.value = p.novelName;
@@ -233,27 +291,50 @@ function restore() {
     if (typeof p.proxy === 'string') proxy.value = p.proxy;
     if (typeof p.richText === 'boolean') richText.value = p.richText;
     // 不恢复 apiKey：见 persist() 处的说明（凭据不落盘）
-    for (const [k, ref] of [['tDiagnose', tDiagnose], ['tBlueprint', tBlueprint],
-                            ['tRefactor', tRefactor], ['tStitch', tStitch]] as const) {
+    for (const [k, ref] of [
+      ['tDiagnose', tDiagnose],
+      ['tBlueprint', tBlueprint],
+      ['tRefactor', tRefactor],
+      ['tStitch', tStitch],
+    ] as const) {
       if (typeof p[k] === 'number') ref.value = p[k];
     }
-  } catch { /* 忽略损坏数据 */ }
+  } catch {
+    /* 忽略损坏数据 */
+  }
 }
 
 // C3：键盘快捷键（Space 暂停/恢复，Enter 确认当前弹窗）；输入组件内不触发
 function onKeydown(e: KeyboardEvent) {
   const t = e.target as HTMLElement | null;
-  const typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+  const typing =
+    t &&
+    (t.tagName === 'INPUT' ||
+      t.tagName === 'TEXTAREA' ||
+      t.tagName === 'SELECT' ||
+      t.isContentEditable);
   if (typing) return;
   if (e.code === 'Space' && pipelineRunning.value && !e.repeat) {
     e.preventDefault();
     control(isPaused.value ? 'resume' : 'pause');
   }
   if (e.key === 'Enter' && !e.repeat) {
-    if (showSplit.value) { confirmSplit(); return; }
-    if (showFixReview.value) { confirmFix(); return; }
-    if (showAccept.value) { confirmAccept(); return; }
-    if (showQcBlock.value) { forceExport(); return; }
+    if (showSplit.value) {
+      confirmSplit();
+      return;
+    }
+    if (showFixReview.value) {
+      confirmFix();
+      return;
+    }
+    if (showAccept.value) {
+      confirmAccept();
+      return;
+    }
+    if (showQcBlock.value) {
+      forceExport();
+      return;
+    }
   }
 }
 
@@ -264,16 +345,18 @@ const phaseLabel: Record<string, string> = {
   phase1_fixreview: '阶段1：等待断层勾选',
   phase2: '阶段2：蓝图生成',
   phase2_waiting: '阶段2：等待蓝图确认',
-  'phase3_accept': '阶段3：等待逐章验收',
-  'phase3_qc': '阶段3：等待质检决策',
+  phase3_accept: '阶段3：等待逐章验收',
+  phase3_qc: '阶段3：等待质检决策',
   'phase3-1': '阶段3-1：重构',
   phase4: '阶段4：收尾',
 };
 
+const logRev = ref(0);
 function addLog(msg: string, level: LogEntry['level'] = 'info') {
   const ts = new Date().toLocaleTimeString();
   eventLog.value.push({ ts, text: msg, level });
   if (eventLog.value.length > 300) eventLog.value.shift();
+  logRev.value++; // 通知自动滚动 watch，免去对 300 条对象的 deep 遍历
 }
 
 const diagPercent = computed(() => {
@@ -289,12 +372,17 @@ const chapterPercent = computed(() => {
   return t ? `${Math.round((chapterProgress.value.done / t) * 100)}%` : '0%';
 });
 
-// 新日志自动滚到底部。必须 deep：eventLog 是 ref 数组，addLog 用的是 push（原地修改），
-// 不开 deep 时 watch 永远不触发，运行中日志不会自动跟随。
-watch(eventLog, () => {
-  const el = logBoxRef.value;
-  if (el) el.scrollTop = el.scrollHeight;
-}, { deep: true });
+// 新日志自动滚到底部。用递增的 logRev 作触发源，而非 deep watch：
+// deep 每次 addLog 都要遍历整份日志数组；改用 length 也不行 —— 封顶后
+// shift 掉一条长度不变，watch 便不再触发。flush:'post' 等 DOM 更新后再滚。
+watch(
+  logRev,
+  () => {
+    const el = logBoxRef.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  },
+  { flush: 'post' },
+);
 
 onMounted(async () => {
   restore();
@@ -313,7 +401,7 @@ async function connectBackend() {
     // 页面刷新/SSE 晚连接时，从后端恢复 UI 状态（暂停态、待确认蓝图、用量等）
     await fetchStatus();
     startStatusPolling();
-    refreshHistory();          // 任务历史（跨会话）
+    refreshHistory(); // 任务历史（跨会话）
   } catch (e: any) {
     errorMsg.value = e.message || String(e);
     backendReady.value = false;
@@ -334,6 +422,9 @@ onUnmounted(() => {
   stopStatusPolling();
   stopElapsed();
   window.removeEventListener('keydown', onKeydown);
+  if (outputPathTimer) clearTimeout(outputPathTimer);
+  if (persistTimer) clearTimeout(persistTimer);
+  if (streamRaf) cancelAnimationFrame(streamRaf);
   persist();
 });
 
@@ -342,7 +433,10 @@ function startStatusPolling() {
   statusTimer = window.setInterval(fetchStatus, 5000);
 }
 function stopStatusPolling() {
-  if (statusTimer !== null) { clearInterval(statusTimer); statusTimer = null; }
+  if (statusTimer !== null) {
+    clearInterval(statusTimer);
+    statusTimer = null;
+  }
 }
 
 function startElapsed() {
@@ -358,7 +452,10 @@ function startElapsed() {
   }, 1000);
 }
 function stopElapsed() {
-  if (elapsedTimer !== null) { clearInterval(elapsedTimer); elapsedTimer = null; }
+  if (elapsedTimer !== null) {
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
+  }
 }
 
 // ---------- 闸门闩锁 ----------
@@ -367,9 +464,15 @@ function stopElapsed() {
 // 用户再点一次会拿到 409，而该弹窗没有关闭按钮 → 全屏锁死。
 // 用 run_id + 闸门名做闩锁，确认过后不再响应 _build_resume。
 const confirmedGates = ref<Set<string>>(new Set());
-function gateKey(k: string) { return `${runId.value || '-'}:${k}`; }
-function isGateSettled(k: string) { return confirmedGates.value.has(gateKey(k)); }
-function markGateSettled(k: string) { confirmedGates.value.add(gateKey(k)); }
+function gateKey(k: string) {
+  return `${runId.value || '-'}:${k}`;
+}
+function isGateSettled(k: string) {
+  return confirmedGates.value.has(gateKey(k));
+}
+function markGateSettled(k: string) {
+  confirmedGates.value.add(gateKey(k));
+}
 
 // 输出目录状态：是否可续跑 / 已完成 / 失败原因。用于「重跑为什么没保存」的困惑：
 // 数据其实一直在盘上，缺的是让用户看见、并能一键重来。
@@ -386,17 +489,21 @@ const histBusy = ref(false);
 /** 未完成且可续跑的数量，用于「任务历史」按钮上的角标提醒。
  *  刻意放在 App.vue 而非 HistoryModal：这里统计的是**全部**未完成条目，
  *  与弹窗内按搜索词过滤后的列表无关。 */
-const historyPendingCount = computed(() =>
-  historyItems.value.filter((h) => !h.finished && !h.running && h.current_phase).length);
+const historyPendingCount = computed(
+  () => historyItems.value.filter((h) => !h.finished && !h.running && h.current_phase).length,
+);
 
 async function refreshHistory() {
   if (!port.value || histBusy.value) return;
   histBusy.value = true;
-  try { historyItems.value = (await fetchHistory(port.value)).items || []; }
-  catch { /* 后端未起/无历史：静默 */ }
-  finally { histBusy.value = false; }
+  try {
+    historyItems.value = (await fetchHistory(port.value)).items || [];
+  } catch {
+    /* 后端未起/无历史：静默 */
+  } finally {
+    histBusy.value = false;
+  }
 }
-
 
 async function clearAllHistory() {
   if (!port.value) return;
@@ -405,12 +512,15 @@ async function clearAllHistory() {
     await req0('/api/history/clear');
     await refreshHistory();
     addLog('已清空任务历史记录（磁盘文件未动）');
-  } catch (e: any) { topError.value = `清空历史失败：${e.message}`; }
+  } catch (e: any) {
+    topError.value = `清空历史失败：${e.message}`;
+  }
 }
 /** 裸请求（供不需要强类型的清空操作使用） */
 async function req0(path: string) {
   const res = await apiFetch(`${apiBase()}${path}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json().catch(() => ({}));
@@ -418,7 +528,8 @@ async function req0(path: string) {
 /** 把历史条目填回配置（不自动开跑，用户确认后再点开始） */
 function loadFromHistory(h: HistoryItem) {
   if (h.input_path) inputPath.value = h.input_path;
-  if (h.input_mode === 'single_file' || h.input_mode === 'multi_file') inputMode.value = h.input_mode;
+  if (h.input_mode === 'single_file' || h.input_mode === 'multi_file')
+    inputMode.value = h.input_mode;
   if (h.input_path) {
     const dot = h.input_path.lastIndexOf('.');
     if (dot > 0) {
@@ -433,8 +544,12 @@ function loadFromHistory(h: HistoryItem) {
 }
 async function forgetHistoryItem(h: HistoryItem) {
   if (!port.value) return;
-  try { await forgetHistory(port.value, h.output_path); await refreshHistory(); }
-  catch (e: any) { topError.value = `移除失败：${e.message}`; }
+  try {
+    await forgetHistory(port.value, h.output_path);
+    await refreshHistory();
+  } catch (e: any) {
+    topError.value = `移除失败：${e.message}`;
+  }
 }
 
 // ---------- 成品版本（重跑前的整版快照，可回滚）----------
@@ -445,37 +560,61 @@ async function openVersions() {
   if (!port.value || !outputPath.value) return;
   showVersions.value = true;
   versionBusy.value = true;
-  try { versionList.value = (await fetchVersions(port.value, outputPath.value)).versions || []; }
-  catch (e: any) { versionList.value = []; topError.value = `读取版本失败：${e.message}`; }
-  finally { versionBusy.value = false; }
+  try {
+    versionList.value = (await fetchVersions(port.value, outputPath.value)).versions || [];
+  } catch (e: any) {
+    versionList.value = [];
+    topError.value = `读取版本失败：${e.message}`;
+  } finally {
+    versionBusy.value = false;
+  }
 }
 async function doRestore(v: VersionInfo) {
   if (!port.value || !outputPath.value) return;
-  if (!window.confirm(`把成品恢复到版本 ${v.id} 吗？\n（恢复前会先给当前版本留一份快照，仍可再回退）`)) return;
+  if (
+    !window.confirm(`把成品恢复到版本 ${v.id} 吗？\n（恢复前会先给当前版本留一份快照，仍可再回退）`)
+  )
+    return;
   versionBusy.value = true;
   try {
     await restoreVersion(port.value, outputPath.value, v.id);
     addLog(`已恢复成品版本 ${v.id}`);
     await openVersions();
     await fetchStatus();
-  } catch (e: any) { topError.value = `恢复失败：${e.message}`; }
-  finally { versionBusy.value = false; }
+  } catch (e: any) {
+    topError.value = `恢复失败：${e.message}`;
+  } finally {
+    versionBusy.value = false;
+  }
 }
 
 async function refreshOutInfo() {
-  if (!port.value || !outputPath.value) { outInfo.value = null; return; }
+  if (!port.value || !outputPath.value) {
+    outInfo.value = null;
+    return;
+  }
   try {
-    const res = await apiFetch(`${apiBase()}/api/output/inspect?output_path=${encodeURIComponent(outputPath.value)}`);
+    const res = await apiFetch(
+      `${apiBase()}/api/output/inspect?output_path=${encodeURIComponent(outputPath.value)}`,
+    );
     outInfo.value = res.ok ? await res.json() : null;
-  } catch { outInfo.value = null; }
+  } catch {
+    outInfo.value = null;
+  }
 }
 async function clearOutputDir() {
   if (!outputPath.value) return;
-  if (!window.confirm('确定清空输出目录里的 TextForge 产物吗？\n（只删 01_summaries / 02_workspace / 03_final / _diagnostics / Story_Bible.md / progress.json，不影响你的其它文件）')) return;
+  if (
+    !window.confirm(
+      '确定清空输出目录里的 TextForge 产物吗？\n（只删 01_summaries / 02_workspace / 03_final / _diagnostics / Story_Bible.md / progress.json，不影响你的其它文件）',
+    )
+  )
+    return;
   clearingOutput.value = true;
   try {
     const res = await apiFetch(`${apiBase()}/api/output/clear`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ output_path: outputPath.value }),
     });
     if (await checkRes(res, '清空输出目录')) {
@@ -485,10 +624,23 @@ async function clearOutputDir() {
     }
   } catch (e: any) {
     topError.value = `清空失败：${e.message}`;
-  } finally { clearingOutput.value = false; }
+  } finally {
+    clearingOutput.value = false;
+  }
 }
-watch(outputPath, () => { persist(); refreshOutInfo(); });
-watch([port, () => pipelineRunning.value], () => { refreshOutInfo(); });
+// 路径是逐字符敲进去的：persist（全量 JSON→localStorage）与 refreshOutInfo
+//（一次 /api/output/inspect HTTP）都不该每个按键都跑，统一防抖 400ms。
+let outputPathTimer: ReturnType<typeof setTimeout> | undefined;
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
+watch(outputPath, () => {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(persist, 400);
+  if (outputPathTimer) clearTimeout(outputPathTimer);
+  outputPathTimer = setTimeout(refreshOutInfo, 400);
+});
+watch([port, () => pipelineRunning.value], () => {
+  refreshOutInfo();
+});
 
 async function fetchStatus(): Promise<boolean> {
   if (!port.value) return false;
@@ -509,33 +661,53 @@ async function fetchStatus(): Promise<boolean> {
     pipelineRunning.value = !!s.pipeline_running;
     // B4：僵尸检测。后端已改为后台任务每 10s 刷新心跳（覆盖 LLM 调用期间），
     // 所以 90s 阈值现在是真的「进程卡死」，不会再在跑大批次时误报。
-    zombieWarn.value = !!(s.pipeline_running && s.last_heartbeat
-      && Date.now() - new Date(s.last_heartbeat).getTime() > 90_000);
+    zombieWarn.value = !!(
+      s.pipeline_running &&
+      s.last_heartbeat &&
+      Date.now() - new Date(s.last_heartbeat).getTime() > 90_000
+    );
     usageTokens.value = {
       prompt: s.usage?.prompt_tokens || 0,
       completion: s.usage?.completion_tokens || 0,
     };
     if (s.summaries) summaries.value = s.summaries;
-    if (s.total_chapters) totalChapters.value = s.total_chapters;
-    if (s.batches) batchStats.value = {
-      total: s.batches.total || 0,
-      phase1: s.batches.phase1_done || 0,
-      phase3: s.batches.phase3_done || 0,
-    };
-    if (s.total_logic_chapters || s.reconstructed_chapters) chapterProgress.value = {
-      total: s.total_logic_chapters || 0,
-      done: s.reconstructed_chapters || 0,
-    };
+    // 用 typeof 判断而非真值：0 也是合法状态（新一轮更短、或尚未开始），
+    // 真值判断会让进度条/总数残留上一轮 run 的旧数字。
+    if (typeof s.total_chapters === 'number') totalChapters.value = s.total_chapters;
+    if (s.batches)
+      batchStats.value = {
+        total: s.batches.total || 0,
+        phase1: s.batches.phase1_done || 0,
+        phase3: s.batches.phase3_done || 0,
+      };
+    if (typeof s.total_logic_chapters === 'number' || typeof s.reconstructed_chapters === 'number')
+      chapterProgress.value = {
+        total: s.total_logic_chapters || 0,
+        done: s.reconstructed_chapters || 0,
+      };
     if (Array.isArray(s.chapters_summary)) chapterRows.value = s.chapters_summary;
-    if (pipelineRunning.value && s.current_phase) currentPhase.value = phaseLabel[s.current_phase] || s.current_phase;
-    // 恢复时重新弹出蓝图确认（SSE 事件已错过）
-    if (s.current_phase === 'phase2_waiting' && s.blueprint && !showBlueprint.value) {
+    if (pipelineRunning.value && s.current_phase)
+      currentPhase.value = phaseLabel[s.current_phase] || s.current_phase;
+    // 恢复时重新弹出蓝图确认（SSE 事件已错过）。已确认过就不要再弹：
+    // 确认后后端推进到下一阶段前，仍有 1~5s 的轮询窗口会命中这个分支，
+    // 反复重开会让用户卡在「确认→又被弹回」的循环里（再点必得 409）。
+    if (
+      s.current_phase === 'phase2_waiting' &&
+      s.blueprint &&
+      !showBlueprint.value &&
+      !isGateSettled('blueprint')
+    ) {
       blueprintText.value = s.blueprint;
       showBlueprint.value = true;
       addLog('检测到待确认蓝图（从后端状态恢复）');
     }
     const lastErr = s.error_logs?.[s.error_logs.length - 1];
-    if (lastErr && !pipelineRunning.value) topError.value = lastErr.message;
+    // 只在错误「变化」时点亮横幅：否则空闲期每 5s 轮询都会把用户刚关掉的
+    // 红条重新拉回来，永远关不掉。新一轮 run 会在别处把它重置为 null。
+    if (lastErr && !pipelineRunning.value && lastErr.message !== lastPolledError) {
+      lastPolledError = lastErr.message;
+      topError.value = lastErr.message;
+    }
     // B3：刷新后恢复等待态弹窗（必须覆盖后端 _build_resume 的全部分支）
     if (s.resume) {
       const r = s.resume;
@@ -543,7 +715,11 @@ async function fetchStatus(): Promise<boolean> {
         splitChapters.value = r.chapters || [];
         showSplit.value = true;
         addLog('已恢复拆书确认（刷新后重开）', 'warn');
-      } else if (r.key === 'accept' && !showAccept.value && !isGateSettled(`accept:${r.batch_id}`)) {
+      } else if (
+        r.key === 'accept' &&
+        !showAccept.value &&
+        !isGateSettled(`accept:${r.batch_id}`)
+      ) {
         acceptBatch.value = r.batch_id;
         acceptChapters.value = r.chapters || [];
         showAccept.value = true;
@@ -572,7 +748,7 @@ function handleSSEEvent(event: string, payload: any) {
     case 'run_id':
       runId.value = payload.run_id;
       break;
-case 'run_start':
+    case 'run_start':
       // 「重放」由服务端用 _replay 标记（backend/routes/events.py）。
       // **不能**用 `payload.run_id === runId.value` 判断：后端在重放 run_start
       // 之前必定先发 run_id 事件并把它写进 runId.value，那样判据 100% 命中，
@@ -583,6 +759,7 @@ case 'run_start':
       }
       pipelineRunning.value = true;
       topError.value = null;
+      lastPolledError = null;
       runId.value = payload.run_id || runId.value;
       confirmedGates.value = new Set(); // 新一轮 run：清掉上一轮的闸门闩锁
       finalFiles.value = [];
@@ -596,9 +773,17 @@ case 'run_start':
     case 'phase_done':
       if (payload.phase === 'phase0') totalChapters.value = payload.total_chapters;
       currentPhase.value = phaseLabel[payload.phase] || payload.phase;
-      addLog(`阶段完成：${phaseLabel[payload.phase] || payload.phase}${payload.resumed_skip ? '（恢复跳过）' : ''}`, 'ok');
+      addLog(
+        `阶段完成：${phaseLabel[payload.phase] || payload.phase}${payload.resumed_skip ? '（恢复跳过）' : ''}`,
+        'ok',
+      );
       break;
     case 'batch_start':
+      if (streamRaf) {
+        cancelAnimationFrame(streamRaf);
+        streamRaf = 0;
+      }
+      streamBuf = '';
       streamingText.value = ''; // 新批次清空流式预览
       addLog(`批次 ${payload.batch_id} 开始：章节 ${payload.chapter_ids?.join(',')}`, 'accent');
       break;
@@ -612,8 +797,9 @@ case 'run_start':
       addLog(payload.message || `批次 ${payload.from_batch} 自动拆分重跑`, 'warn');
       break;
     case 'stream_chunk':
-      // #2 节流后的流式增量，保留最近 500 字
-      streamingText.value = (streamingText.value + (payload.text || '')).slice(-500);
+      // #2 节流后的流式增量：再按帧合并，避免逐 chunk 触发全量重渲染。
+      streamBuf += payload.text || '';
+      if (!streamRaf) streamRaf = requestAnimationFrame(flushStream);
       break;
     case 'split_ready':
       // P0.3：拆书完成，等待用户确认拆分后进入诊断
@@ -643,6 +829,8 @@ case 'run_start':
       addLog(`质检未通过（${qcIssues.value.length} 项问题），请决定是否强制导出`, 'err');
       break;
     case 'blueprint_ready':
+      // 已确认过就不再弹（重连重放或轮询竞态会把已关闭的弹窗重新锁上）。
+      if (isGateSettled('blueprint')) break;
       blueprintText.value = payload.blueprint || '';
       showBlueprint.value = true;
       currentPhase.value = 'phase2_waiting';
@@ -666,13 +854,14 @@ case 'run_start':
       pipelineRunning.value = false;
       currentPhase.value = '完成';
       closeAllGates();
-      stopStatusPolling();   // 空闲期不空转轮询；下次 startPipeline 会重新拉起
+      stopStatusPolling(); // 空闲期不空转轮询；下次 startPipeline 会重新拉起
       // 不再断开 SSE：后端 /api/events 会「跟随」current_run_id，
       // 保持连接才能让下一次 run 自动接上；断开等于把流打死且不再重连。
       topTip.value = `全部完成！成品在：${payload.output_dir}\\03_final`;
       addLog(`全部完成！输出目录：${payload.output_dir}`, 'ok');
       stopElapsed();
-      refreshHistory(); refreshOutInfo();   // 历史里立刻显示「已完成」
+      refreshHistory();
+      refreshOutInfo(); // 历史里立刻显示「已完成」
       break;
     case 'stopped':
       pipelineRunning.value = false;
@@ -683,7 +872,8 @@ case 'run_start':
       topTip.value = '流水线已停止，进度已保留；再次点击"开始重构"可从断点继续';
       addLog('流水线已停止', 'warn');
       stopElapsed();
-      refreshHistory(); refreshOutInfo();
+      refreshHistory();
+      refreshOutInfo();
       break;
     case 'error':
       // kind='warning' 是非致命提示（如摘要超长被截断），不应停表、也不该记成错误
@@ -697,7 +887,8 @@ case 'run_start':
       stopStatusPolling();
       topError.value = payload.message || payload.code || '未知错误';
       stopElapsed();
-      refreshHistory(); refreshOutInfo();   // 历史里立刻显示「出错中断 + 原因」
+      refreshHistory();
+      refreshOutInfo(); // 历史里立刻显示「出错中断 + 原因」
       break;
     case 'comparison_done':
       addLog(`左右对照已生成：写入 ${payload.written} 章 / 跳过 ${payload.skipped} 章`, 'ok');
@@ -716,7 +907,10 @@ function closeAllGates() {
 
 // ---------- 文件夹选择 ----------
 async function selectInput() {
-  if (!inTauri) { topError.value = '浏览器开发模式不支持系统选择器，请直接在输入框中粘贴路径'; return; }
+  if (!inTauri) {
+    topError.value = '浏览器开发模式不支持系统选择器，请直接在输入框中粘贴路径';
+    return;
+  }
   try {
     if (inputMode.value === 'single_file') {
       const selected = await open({
@@ -740,7 +934,10 @@ async function selectInput() {
 }
 
 async function selectOutput() {
-  if (!inTauri) { topError.value = '浏览器开发模式不支持系统选择器，请直接在输入框中粘贴路径'; return; }
+  if (!inTauri) {
+    topError.value = '浏览器开发模式不支持系统选择器，请直接在输入框中粘贴路径';
+    return;
+  }
   try {
     const selected = await open({ directory: true });
     if (typeof selected === 'string') outputPath.value = selected;
@@ -755,14 +952,18 @@ function apiBase() {
 }
 
 async function startPipeline() {
+  if (starting.value) return; // 防重复提交：双击会并发起两个 run
   if (!inputPath.value || !outputPath.value || !apiUrl.value || !model.value) {
     alert('请填写完整：输入路径、输出路径、API URL、模型名');
     return;
   }
   if (refactorMode.value === 'fix_gaps' && !diagnoseJson.value.trim()) {
-    alert('「修断层」模式依赖结构化断层清单：请在「优化项」中填写诊断JSON输出目录，诊断后勾选断层才能闭环修复。');
+    alert(
+      '「修断层」模式依赖结构化断层清单：请在「优化项」中填写诊断JSON输出目录，诊断后勾选断层才能闭环修复。',
+    );
     return;
   }
+  starting.value = true;
   const body = {
     input_mode: inputMode.value,
     input_path: inputPath.value,
@@ -779,13 +980,19 @@ async function startPipeline() {
     review_split: reviewSplit.value,
     ai_split: aiSplit.value,
     refactor_gates: { ...gates },
-    forbidden_canon: forbiddenCanon.value.split('\n').map(s => s.trim()).filter(Boolean),
+    forbidden_canon: forbiddenCanon.value
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean),
     name_map: Object.fromEntries(
-      nameMapText.value.split('\n').map(s => s.trim()).filter(Boolean)
-        .map(s => s.split(/[=→：]/).map(p => p.trim()))
+      nameMapText.value
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((s) => s.split(/[=→：]/).map((p) => p.trim()))
         // 旧实现只校验 key 非空，「林晚=」会产出 {"林晚": ""}，
         // 渲染进提示词后等于让模型把人名映射成空串
-        .filter(p => p.length === 2 && p[0] && p[1]),
+        .filter((p) => p.length === 2 && p[0] && p[1]),
     ),
     compare_output: compareOutput.value,
     chapter_snapshots: chapterSnapshots.value,
@@ -809,7 +1016,10 @@ async function startPipeline() {
       body: JSON.stringify(body),
     });
     const data = await res.json().catch(() => null);
-    if (!res.ok) { await checkRes(res, '启动', data); return; }
+    if (!res.ok) {
+      await checkRes(res, '启动', data);
+      return;
+    }
     runId.value = data.run_id;
     // 新一轮 run：这里是最权威的重置时机（前端已经拿到新 run_id）。
     // 不能只依赖 SSE 的 run_start —— 那个事件 emit 得比 SSE 订阅更早，
@@ -817,6 +1027,7 @@ async function startPipeline() {
     confirmedGates.value = new Set();
     finalFiles.value = [];
     topError.value = null;
+    lastPolledError = null;
     eventLog.value = [];
     addLog(`已提交流水线 run_id=${data.run_id.slice(0, 8)}...`);
     startElapsed();
@@ -825,12 +1036,14 @@ async function startPipeline() {
     // 主动拉一次权威状态再决定要不要继续 —— 注意不能写成
     // `if (pipelineRunning.value) startStatusPolling()`：此刻 pipelineRunning 几乎必然
     // 还是 false（run_start 走 SSE、轮询要 5s 后才跑），那样就永远起不来轮询。
-    if (await fetchStatus() && !pipelineRunning.value) stopStatusPolling();
+    if ((await fetchStatus()) && !pipelineRunning.value) stopStatusPolling();
     // SSE 若已断（例如手动停过后端），这里补一次握手
     if (!backendReady.value) reconnectBackend();
     persist();
   } catch (e: any) {
     topError.value = `请求失败：${e.message}`;
+  } finally {
+    starting.value = false;
   }
 }
 
@@ -859,8 +1072,14 @@ async function confirmSplit() {
 const redoMarkers = ref('');
 const redoingSplit = ref(false);
 async function redoSplit() {
-  const markers = redoMarkers.value.split('\n').map((s) => s.trim()).filter(Boolean);
-  if (!markers.length) { topError.value = '请至少填写一个章节标题行（每行一个，需与原文完全一致）'; return; }
+  const markers = redoMarkers.value
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!markers.length) {
+    topError.value = '请至少填写一个章节标题行（每行一个，需与原文完全一致）';
+    return;
+  }
   redoingSplit.value = true;
   try {
     const res = await apiFetch(`${apiBase()}/api/split/redo`, {
@@ -868,7 +1087,8 @@ async function redoSplit() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value, markers }),
     });
-    if (await checkRes(res, '重新拆分')) addLog(`已提交 ${markers.length} 个章节标记，正在重新拆分…`);
+    if (await checkRes(res, '重新拆分'))
+      addLog(`已提交 ${markers.length} 个章节标记，正在重新拆分…`);
   } catch (e: any) {
     topError.value = `请求失败：${e.message}`;
   } finally {
@@ -886,15 +1106,20 @@ function toggleFix(gapId: string) {
  *  旧实现直接发 id（如 "B3G2"），后端 refactor.py 原样拼进提示词，
  *  模型收到的是无意义 token，于是无视勾选、全书自由发挥，且没有任何报错。 */
 function selectedGapDescriptions(): string[] {
-  return fixGaps.value
-    .filter((g: any) => fixSelected.value.includes(g.id))
-    // 三级兜底：模型产出的 gap 不保证有 description/location，
-    // 一律为空的项若被 filter(Boolean) 丢掉，fix_list 会变空 → 退化成「自由改写」，
-    // 而界面上仍显示「已勾选 N 处」。
-    .map((g: any) => {
-      const text = [g.location, g.description].filter(Boolean).join('：');
-      return text || `${g.type || '断层'} @ ${g.batch_id || '?'}${g.severity ? ` [${g.severity}]` : ''} (${g.id})`;
-    });
+  return (
+    fixGaps.value
+      .filter((g: any) => fixSelected.value.includes(g.id))
+      // 三级兜底：模型产出的 gap 不保证有 description/location，
+      // 一律为空的项若被 filter(Boolean) 丢掉，fix_list 会变空 → 退化成「自由改写」，
+      // 而界面上仍显示「已勾选 N 处」。
+      .map((g: any) => {
+        const text = [g.location, g.description].filter(Boolean).join('：');
+        return (
+          text ||
+          `${g.type || '断层'} @ ${g.batch_id || '?'}${g.severity ? ` [${g.severity}]` : ''} (${g.id})`
+        );
+      })
+  );
 }
 
 async function confirmFix() {
@@ -928,7 +1153,7 @@ async function confirmAccept() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ run_id: runId.value }),
     });
-if (await checkRes(res, '验收')) {
+    if (await checkRes(res, '验收')) {
       markGateSettled('accept:' + acceptBatch.value);
       showAccept.value = false;
       addLog(`批次 ${acceptBatch.value} 已验收，继续重构`);
@@ -972,20 +1197,28 @@ async function openFinal() {
   const root = outputPath.value.replace(/[\\/]+$/, '');
   // C4：先列出成品文件，优先直开文档；无可开文件则打开根目录
   try {
-    const res = await apiFetch(`${apiBase()}/api/final_files?output_path=${encodeURIComponent(root)}`);
+    const res = await apiFetch(
+      `${apiBase()}/api/final_files?output_path=${encodeURIComponent(root)}`,
+    );
     if (res.ok) {
       const d = await res.json();
       const files = d.files || [];
       if (files.length) {
         finalFiles.value = files;
         // 单个成品直开；多个则打开成品目录，并在界面上列出清单供逐个点开
-        if (files.length === 1) { await callOpenOutput(files[0].path); return; }
+        if (files.length === 1) {
+          await callOpenOutput(files[0].path);
+          return;
+        }
         await callOpenOutput(`${root}/03_final`);
         addLog(`成品目录含 ${files.length} 个文件，可在上方「成品文件」逐个打开`);
         return;
       }
     }
-  } catch { /* 忽略 */ }
+  } catch (e: any) {
+    // 静默会让人以为「成品不存在」，实际是接口失败；记一条日志便于排查。
+    addLog(`读取成品文件失败：${e?.message || e}（改为直接打开输出目录）`, 'warn');
+  }
   await callOpenOutput(root);
 }
 
@@ -1033,7 +1266,7 @@ async function exportLog() {
     alert('暂无日志可导出');
     return;
   }
-  const text = eventLog.value.map(l => `[${l.ts}] ${l.text}`).join('\n');
+  const text = eventLog.value.map((l) => `[${l.ts}] ${l.text}`).join('\n');
   const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1049,13 +1282,19 @@ async function exportLog() {
 async function openComparisons() {
   if (!outputPath.value) return;
   try {
-    const res = await apiFetch(`${apiBase()}/api/comparisons?output_path=${encodeURIComponent(outputPath.value)}`);
-    if (!res.ok) { alert('获取对照失败'); return; }
+    const res = await apiFetch(
+      `${apiBase()}/api/comparisons?output_path=${encodeURIComponent(outputPath.value)}`,
+    );
+    if (!res.ok) {
+      alert('获取对照失败');
+      return;
+    }
     const d = await res.json();
     comparisonItems.value = d.items || [];
     comparisonSel.value = comparisonItems.value[0]?.name ?? '';
     showComparisons.value = true;
-    if (!comparisonItems.value.length) topError.value = '当前输出目录还没有左右对照文件（需开启「左右对照」并跑完 phase3）';
+    if (!comparisonItems.value.length)
+      topError.value = '当前输出目录还没有左右对照文件（需开启「左右对照」并跑完 phase3）';
   } catch (e: any) {
     topError.value = `请求失败：${e.message}`;
   }
@@ -1079,6 +1318,8 @@ async function confirmBlueprint() {
       }),
     });
     if (await checkRes(res, '确认蓝图')) {
+      // 与 split/accept/fix/qc 一致：确认后落闩锁，防止轮询/重放再次弹窗。
+      markGateSettled('blueprint');
       showBlueprint.value = false;
       addLog('蓝图已确认，继续重构');
     }
@@ -1096,7 +1337,11 @@ async function checkRes(res: Response, action: string, parsed?: any): Promise<bo
   if (res.ok) return true;
   let detail: any = parsed?.detail;
   if (detail === undefined) {
-    try { detail = (await res.json())?.detail; } catch { /* 非 JSON 或已读完 */ }
+    try {
+      detail = (await res.json())?.detail;
+    } catch {
+      /* 非 JSON 或已读完 */
+    }
   }
   // Pydantic 校验错误的 detail 是数组，直接插值会渲染成 [object Object]
   if (Array.isArray(detail)) {
@@ -1134,7 +1379,13 @@ async function control(action: 'pause' | 'resume' | 'stop') {
 }
 
 /** 设置面板里改完模型配置后写回主表单并持久化。 */
-function applyModelFromSettings(v: { model: string; apiUrl: string; apiKey: string; proxy: string; sslVerify: boolean }) {
+function applyModelFromSettings(v: {
+  model: string;
+  apiUrl: string;
+  apiKey: string;
+  proxy: string;
+  sslVerify: boolean;
+}) {
   model.value = v.model;
   apiUrl.value = v.apiUrl;
   apiKey.value = v.apiKey;
@@ -1148,9 +1399,15 @@ function applyContextFromSettings(n: number) {
   persist();
 }
 
-const canStart = computed(() =>
-  backendReady.value && !pipelineRunning.value &&
-  !!inputPath.value && !!outputPath.value && !!apiUrl.value && !!model.value
+const canStart = computed(
+  () =>
+    backendReady.value &&
+    !pipelineRunning.value &&
+    !starting.value &&
+    !!inputPath.value &&
+    !!outputPath.value &&
+    !!apiUrl.value &&
+    !!model.value,
 );
 </script>
 
@@ -1159,12 +1416,26 @@ const canStart = computed(() =>
     <header class="header">
       <h1>文炼工坊 <span class="version">TextForge v8.8</span></h1>
       <div class="status">
-        <button class="status-link" :title="backendReady ? '查看后端设置' : '后端未连接，点击排查/重启'" @click="showSettings = true">
+        <button
+          class="status-link"
+          :title="backendReady ? '查看后端设置' : '后端未连接，点击排查/重启'"
+          @click="showSettings = true"
+        >
           <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
-          {{ backendReady ? '后端已连接' : (errorMsg || '连接中...') }}
+          {{ backendReady ? '后端已连接' : errorMsg || '连接中...' }}
         </button>
-        <button class="gear" title="系统与后端设置" @click="showSettings = true">⚙</button>
-        <button class="theme-toggle" @click="toggleTheme">{{ darkMode ? '☀︎' : '☾' }}</button>
+        <button
+          type="button"
+          class="gear"
+          title="系统与后端设置"
+          aria-label="系统与后端设置"
+          @click="showSettings = true"
+        >
+          ⚙
+        </button>
+        <button type="button" class="theme-toggle" aria-label="切换深浅色主题" @click="toggleTheme">
+          {{ darkMode ? '☀︎' : '☾' }}
+        </button>
       </div>
     </header>
 
@@ -1172,37 +1443,67 @@ const canStart = computed(() =>
       <!-- 全局提示 -->
       <div v-if="topTip" class="banner tip">
         <span>{{ topTip }}</span>
-        <button class="banner-close" @click="topTip = null">×</button>
+        <button type="button" class="banner-close" aria-label="关闭提示" @click="topTip = null">
+          ×
+        </button>
       </div>
       <div v-if="errorMsg" class="banner err">
         <span>⚠ {{ errorMsg }}</span>
         <span class="banner-act">
-          <button class="banner-btn" @click="reconnectBackend">重新连接</button>
-          <button class="banner-btn primary" @click="showSettings = true">打开后端设置</button>
-          <button class="banner-close" @click="errorMsg = ''">×</button>
+          <button type="button" class="banner-btn" @click="reconnectBackend">重新连接</button>
+          <button type="button" class="banner-btn primary" @click="showSettings = true">
+            打开后端设置
+          </button>
+          <button type="button" class="banner-close" aria-label="关闭提示" @click="errorMsg = ''">
+            ×
+          </button>
         </span>
       </div>
       <div v-if="topError" class="banner err">
         <span>⚠ {{ topError }}</span>
-        <button class="banner-close" @click="topError = null">×</button>
+        <button
+          type="button"
+          class="banner-close"
+          aria-label="关闭错误提示"
+          @click="topError = null"
+        >
+          ×
+        </button>
       </div>
       <div v-if="zombieWarn" class="banner warn">
-        <span>⚠ 后端进程超过 90 秒未响应，可能已假死。可尝试「停止」，或检查后端是否仍在运行。</span>
-        <button class="banner-close" @click="zombieWarn = false">×</button>
+        <span
+          >⚠ 后端进程超过 90 秒未响应，可能已假死。可尝试「停止」，或检查后端是否仍在运行。</span
+        >
+        <button
+          type="button"
+          class="banner-close"
+          aria-label="关闭警告"
+          @click="zombieWarn = false"
+        >
+          ×
+        </button>
       </div>
 
       <!-- 配置区 -->
       <section class="panel config" :class="{ disabled: pipelineRunning }">
         <h2>
           运行配置
-          <button class="panel-gear" title="系统与后端设置" @click="showSettings = true">⚙ 后端设置</button>
+          <button class="panel-gear" title="系统与后端设置" @click="showSettings = true">
+            ⚙ 后端设置
+          </button>
         </h2>
 
         <div class="row backend-row">
           <label>后端服务</label>
           <span class="backend-state">
             <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
-            {{ backendReady ? `已连接 :${port ?? '—'}` : (sseAttempts > 0 ? `重连中 (${sseAttempts})` : '未连接') }}
+            {{
+              backendReady
+                ? `已连接 :${port ?? '—'}`
+                : sseAttempts > 0
+                  ? `重连中 (${sseAttempts})`
+                  : '未连接'
+            }}
           </span>
           <button @click="reconnectBackend" :disabled="backendReady">重新连接</button>
           <button class="ghost" @click="showSettings = true">设置</button>
@@ -1254,7 +1555,9 @@ const canStart = computed(() =>
         <div class="row">
           <label>预设</label>
           <select v-model="preset" @change="applyPreset">
-            <option v-for="name in Object.keys(PRESETS)" :key="name" :value="name">{{ name }}</option>
+            <option v-for="name in Object.keys(PRESETS)" :key="name" :value="name">
+              {{ name }}
+            </option>
           </select>
           <label class="rich">选后自动套用温度/上下文/批次间隔</label>
         </div>
@@ -1273,19 +1576,42 @@ const canStart = computed(() =>
           <label>保护门</label>
           <details class="adv gates">
             <summary>重构保护门（默认全关）</summary>
-            <label class="rich"><input type="checkbox" v-model="gates.lock_names" /> 锁人名/设定名</label>
-            <label class="rich"><input type="checkbox" v-model="gates.lock_plot" /> 锁剧情骨架</label>
-            <label class="rich"><input type="checkbox" v-model="gates.inject_forbidden" /> 注入禁改清单</label>
-            <label class="rich"><input type="checkbox" v-model="gates.require_chapter_accept" /> 逐章验收</label>
-            <label class="rich"><input type="checkbox" v-model="gates.skip_stitch_if_smooth" /> 平滑衔接跳过缝合</label>
-            <label class="rich"><input type="checkbox" v-model="gates.qc_block_export" /> 质检拦截导出</label>
+            <label class="rich"
+              ><input type="checkbox" v-model="gates.lock_names" /> 锁人名/设定名</label
+            >
+            <label class="rich"
+              ><input type="checkbox" v-model="gates.lock_plot" /> 锁剧情骨架</label
+            >
+            <label class="rich"
+              ><input type="checkbox" v-model="gates.inject_forbidden" /> 注入禁改清单</label
+            >
+            <label class="rich"
+              ><input type="checkbox" v-model="gates.require_chapter_accept" /> 逐章验收</label
+            >
+            <label class="rich"
+              ><input type="checkbox" v-model="gates.skip_stitch_if_smooth" />
+              平滑衔接跳过缝合</label
+            >
+            <label class="rich"
+              ><input type="checkbox" v-model="gates.qc_block_export" /> 质检拦截导出</label
+            >
           </details>
         </div>
 
         <div v-if="gates.inject_forbidden || refactorMode === 'reskin'" class="row col">
           <label>禁改清单 / 人名映射（配合“保护门·注入禁改清单”与“换皮”模式）</label>
-          <textarea v-model="forbiddenCanon" rows="2" placeholder="禁改清单：每行一条，如&#10;主角不能再死亡&#10;不许改设定名" class="lone-area"></textarea>
-          <textarea v-model="nameMapText" rows="2" placeholder="换皮映射：每行 旧名=新名，如&#10;林晚=苏晴" class="lone-area"></textarea>
+          <textarea
+            v-model="forbiddenCanon"
+            rows="2"
+            placeholder="禁改清单：每行一条，如&#10;主角不能再死亡&#10;不许改设定名"
+            class="lone-area"
+          ></textarea>
+          <textarea
+            v-model="nameMapText"
+            rows="2"
+            placeholder="换皮映射：每行 旧名=新名，如&#10;林晚=苏晴"
+            class="lone-area"
+          ></textarea>
         </div>
 
         <div class="row">
@@ -1295,23 +1621,38 @@ const canStart = computed(() =>
 
         <div class="row">
           <label>拆书确认</label>
-          <label class="rich"><input type="checkbox" v-model="reviewSplit" /> 拆书后先预览章节再继续</label>
-          <label class="rich" title="仅在规则识别不可靠（没认出章节 / 章节长度异常）时才额外调用一次模型，成本很低">
-            <input type="checkbox" v-model="aiSplit" /> 识别不到章节时用 AI 辅助定位边界（多一次模型调用）
+          <label class="rich"
+            ><input type="checkbox" v-model="reviewSplit" /> 拆书后先预览章节再继续</label
+          >
+          <label
+            class="rich"
+            title="仅在规则识别不可靠（没认出章节 / 章节长度异常）时才额外调用一次模型，成本很低"
+          >
+            <input type="checkbox" v-model="aiSplit" /> 识别不到章节时用 AI
+            辅助定位边界（多一次模型调用）
           </label>
         </div>
 
         <details class="adv">
           <summary>优化项：左右对照 / 章快照 / 诊断 JSON</summary>
           <div class="row">
-            <label class="rich"><input type="checkbox" v-model="compareOutput" /> 左右对照（重构后按章生成原文|重构后表格）</label>
+            <label class="rich"
+              ><input type="checkbox" v-model="compareOutput" />
+              左右对照（重构后按章生成原文|重构后表格）</label
+            >
           </div>
           <div class="row">
-            <label class="rich"><input type="checkbox" v-model="chapterSnapshots" /> 章快照（保留重构初稿与缝合终稿）</label>
+            <label class="rich"
+              ><input type="checkbox" v-model="chapterSnapshots" />
+              章快照（保留重构初稿与缝合终稿）</label
+            >
           </div>
           <div class="row">
             <label>诊断JSON输出目录</label>
-            <input v-model="diagnoseJson" placeholder="可选，留空关闭；设置后按批次把结构化断层 JSON 写入该目录" />
+            <input
+              v-model="diagnoseJson"
+              placeholder="可选，留空关闭；设置后按批次把结构化断层 JSON 写入该目录"
+            />
           </div>
         </details>
 
@@ -1319,46 +1660,80 @@ const canStart = computed(() =>
           <label>代理</label>
           <input v-model="proxy" placeholder="可选，如 http://127.0.0.1:7890" />
           <label class="rich"><input type="checkbox" v-model="richText" /> docx富文本</label>
-          <label class="rich" title="仅在使用 https 自签证书的服务端时需要关闭"><input type="checkbox" v-model="sslVerify" /> 校验HTTPS证书</label>
+          <label class="rich" title="仅在使用 https 自签证书的服务端时需要关闭"
+            ><input type="checkbox" v-model="sslVerify" /> 校验HTTPS证书</label
+          >
         </div>
 
         <details class="adv">
           <summary>高级项：各阶段温度</summary>
           <div class="row">
-            <label>诊断</label> <input v-model.number="tDiagnose" type="number" min="0" max="2" step="0.1" />
-            <label class="t">蓝图</label> <input v-model.number="tBlueprint" type="number" min="0" max="2" step="0.1" />
+            <label>诊断</label>
+            <input v-model.number="tDiagnose" type="number" min="0" max="2" step="0.1" />
+            <label class="t">蓝图</label>
+            <input v-model.number="tBlueprint" type="number" min="0" max="2" step="0.1" />
           </div>
           <div class="row">
-            <label>重构</label> <input v-model.number="tRefactor" type="number" min="0" max="2" step="0.1" />
-            <label class="t">缝合</label> <input v-model.number="tStitch" type="number" min="0" max="2" step="0.1" />
+            <label>重构</label>
+            <input v-model.number="tRefactor" type="number" min="0" max="2" step="0.1" />
+            <label class="t">缝合</label>
+            <input v-model.number="tStitch" type="number" min="0" max="2" step="0.1" />
           </div>
           <div class="row">
-            <label>批次间隔(秒)</label> <input v-model.number="batchInterval" type="number" min="0" max="300" step="0.5" />
+            <label>批次间隔(秒)</label>
+            <input v-model.number="batchInterval" type="number" min="0" max="300" step="0.5" />
           </div>
         </details>
         <details class="adv">
           <summary>分阶段模型（可选，留空用全局模型）</summary>
-          <p class="ph-note">地址与全局<strong>不同主机</strong>时，全局 API Key 不会带过去（防泄露）；需要鉴权请在对应「密钥」里单独填。</p>
+          <p class="ph-note">
+            地址与全局<strong>不同主机</strong>时，全局 API Key
+            不会带过去（防泄露）；需要鉴权请在对应「密钥」里单独填。
+          </p>
           <div class="row">
             <label>诊断</label> <input v-model="mDiagnose" placeholder="诊断用模型" />
             <label class="t">地址</label> <input v-model="uDiagnose" placeholder="(留空=全局)" />
           </div>
-          <div class="row"><label class="rich-k">密钥</label> <input v-model="kDiagnose" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
+          <div class="row">
+            <label class="rich-k">密钥</label>
+            <input
+              v-model="kDiagnose"
+              type="password"
+              placeholder="(留空=不同主机时不带全局 Key)"
+            />
+          </div>
           <div class="row">
             <label>蓝图</label> <input v-model="mBlueprint" placeholder="蓝图用模型" />
             <label class="t">地址</label> <input v-model="uBlueprint" placeholder="(留空=全局)" />
           </div>
-          <div class="row"><label class="rich-k">密钥</label> <input v-model="kBlueprint" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
+          <div class="row">
+            <label class="rich-k">密钥</label>
+            <input
+              v-model="kBlueprint"
+              type="password"
+              placeholder="(留空=不同主机时不带全局 Key)"
+            />
+          </div>
           <div class="row">
             <label>重构</label> <input v-model="mRefactor" placeholder="重构用模型" />
             <label class="t">地址</label> <input v-model="uRefactor" placeholder="(留空=全局)" />
           </div>
-          <div class="row"><label class="rich-k">密钥</label> <input v-model="kRefactor" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
+          <div class="row">
+            <label class="rich-k">密钥</label>
+            <input
+              v-model="kRefactor"
+              type="password"
+              placeholder="(留空=不同主机时不带全局 Key)"
+            />
+          </div>
           <div class="row">
             <label>缝合</label> <input v-model="mStitch" placeholder="缝合用模型" />
             <label class="t">地址</label> <input v-model="uStitch" placeholder="(留空=全局)" />
           </div>
-          <div class="row"><label class="rich-k">密钥</label> <input v-model="kStitch" type="password" placeholder="(留空=不同主机时不带全局 Key)" /></div>
+          <div class="row">
+            <label class="rich-k">密钥</label>
+            <input v-model="kStitch" type="password" placeholder="(留空=不同主机时不带全局 Key)" />
+          </div>
         </details>
 
         <div class="row col">
@@ -1366,9 +1741,7 @@ const canStart = computed(() =>
           <textarea v-model="authorStyle" rows="2"></textarea>
         </div>
 
-        <button class="start-btn" :disabled="!canStart" @click="startPipeline">
-          开始重构
-        </button>
+        <button class="start-btn" :disabled="!canStart" @click="startPipeline">开始重构</button>
       </section>
 
       <!-- 进度区 -->
@@ -1378,23 +1751,52 @@ const canStart = computed(() =>
           <span v-if="currentPhase" class="phase">{{ currentPhase }}</span>
           <span v-if="isPaused" class="badge paused">已暂停</span>
           <span v-if="pipelineRunning" class="badge running">运行中</span>
-          <button v-if="outputPath && port" class="open-btn" @click="openOutput">打开输出目录</button>
-          <button v-if="outputPath && port" class="open-btn ghost" @click="openFinal">打开成品</button>
-          <button v-if="outputPath && port" class="open-btn ghost" @click="openComparisons">对照预览</button>
-          <button v-if="outputPath && port" class="open-btn ghost" @click="openVersions">成品版本</button>
-          <button v-if="port" class="open-btn ghost" @click="showHistory = true; refreshHistory()">
+          <button v-if="outputPath && port" class="open-btn" @click="openOutput">
+            打开输出目录
+          </button>
+          <button v-if="outputPath && port" class="open-btn ghost" @click="openFinal">
+            打开成品
+          </button>
+          <button v-if="outputPath && port" class="open-btn ghost" @click="openComparisons">
+            对照预览
+          </button>
+          <button v-if="outputPath && port" class="open-btn ghost" @click="openVersions">
+            成品版本
+          </button>
+          <button
+            v-if="port"
+            class="open-btn ghost"
+            @click="
+              showHistory = true;
+              refreshHistory();
+            "
+          >
             任务历史<template v-if="historyPendingCount"> · {{ historyPendingCount }}</template>
           </button>
-          <button v-if="outputPath && port" class="open-btn ghost" :disabled="pipelineRunning || clearingOutput"
-                  @click="clearOutputDir">{{ clearingOutput ? '清空中…' : '清空输出目录' }}</button>
+          <button
+            v-if="outputPath && port"
+            class="open-btn ghost"
+            :disabled="pipelineRunning || clearingOutput"
+            @click="clearOutputDir"
+          >
+            {{ clearingOutput ? '清空中…' : '清空输出目录' }}
+          </button>
         </div>
-        <p v-if="outInfo && outInfo.exists && outInfo.artifacts && outInfo.artifacts.length" class="out-status">
+        <p
+          v-if="outInfo && outInfo.exists && outInfo.artifacts && outInfo.artifacts.length"
+          class="out-status"
+        >
           <template v-if="outInfo.resumable">
-            检测到<strong>未完成</strong>的进度：{{ outInfo.novel_name || '本书' }}
-            · 共 {{ outInfo.total_chapters }} 章 · 已完成批次 {{ outInfo.batches_done }}/{{ outInfo.batches_total }}
-            （阶段 {{ outInfo.current_phase }}）—— 点开始将<strong>断点续跑</strong>，已完成的批次不会重做。
+            检测到<strong>未完成</strong>的进度：{{ outInfo.novel_name || '本书' }} · 共
+            {{ outInfo.total_chapters }} 章 · 已完成批次 {{ outInfo.batches_done }}/{{
+              outInfo.batches_total
+            }}
+            （阶段 {{ outInfo.current_phase }}）——
+            点开始将<strong>断点续跑</strong>，已完成的批次不会重做。
           </template>
-          <template v-else-if="outInfo.finished">该目录含已完成的成品，点开始会重新生成同名文件（旧文件自动备份）。</template>
+          <template v-else-if="outInfo.finished"
+            >该目录含已完成的成品，点开始会重新生成同名文件（旧文件自动备份）。</template
+          >
           <template v-else>该目录已含 TextForge 产物。</template>
           <br />
           如要彻底重来，请点「清空输出目录」（只删 TextForge 自己生成的文件，不影响你的其它文件）。
@@ -1423,17 +1825,23 @@ const canStart = computed(() =>
 
         <div class="tree-head" v-if="chapterRows.length">
           <button class="tree-toggle" @click="showChapterTree = !showChapterTree">
-            {{ showChapterTree ? '▾' : '▸' }} 章节概览（{{ chapterRows.filter(c => c.status === 'reconstructed').length }}/{{ chapterRows.length }} 已重构）
+            {{ showChapterTree ? '▾' : '▸' }} 章节概览（{{
+              chapterRows.filter((c) => c.status === 'reconstructed').length
+            }}/{{ chapterRows.length }} 已重构）
           </button>
         </div>
         <div v-if="showChapterTree && chapterRows.length" class="tree-box">
           <div v-for="c in chapterRows" :key="c.id" class="tree-row">
             <span class="split-id">{{ c.label }}</span>
-            <span class="badge" :class="c.status === 'reconstructed' ? 'running' : ''">{{ c.status === 'reconstructed' ? '已重构' : '待处理' }}</span>
+            <span class="badge" :class="c.status === 'reconstructed' ? 'running' : ''">{{
+              c.status === 'reconstructed' ? '已重构' : '待处理'
+            }}</span>
           </div>
         </div>
 
-        <div v-if="streamingText" class="stream-box"><b class="stream-title">流式输出</b>{{ streamingText }}</div>
+        <div v-if="streamingText" class="stream-box">
+          <b class="stream-title">流式输出</b>{{ streamingText }}
+        </div>
 
         <div class="log-head">
           <b>事件日志</b>
@@ -1444,11 +1852,21 @@ const canStart = computed(() =>
         <div class="bar chapter-row-bar" v-if="finalFiles.length">
           <span class="bar-label">成品文件</span>
           <div class="final-list">
-            <button v-for="f in finalFiles" :key="f.path" class="min-btn" @click="callOpenOutput(f.path)">{{ f.name }}</button>
+            <button
+              v-for="f in finalFiles"
+              :key="f.path"
+              class="min-btn"
+              @click="callOpenOutput(f.path)"
+            >
+              {{ f.name }}
+            </button>
           </div>
         </div>
         <div ref="logBoxRef" class="log-box">
-          <div v-for="(line, i) in eventLog" :key="i" class="log-line" :class="`log-${line.level}`"><span class="log-ts">{{ line.ts }}</span>{{ line.text }}</div>
+          <div v-for="(line, i) in eventLog" :key="i" class="log-line" :class="`log-${line.level}`">
+            <span class="log-ts">{{ line.ts }}</span
+            >{{ line.text }}
+          </div>
           <div v-if="!eventLog.length" class="log-empty">暂无事件</div>
         </div>
       </section>
@@ -1457,83 +1875,118 @@ const canStart = computed(() =>
     <!-- 拆书确认弹窗 -->
     <GateModal v-if="showSplit" title="请确认拆书结果">
       <p class="hint">共拆分出 {{ splitChapters.length }} 章。确认后进入诊断。</p>
-        <p v-if="splitDetection" class="hint" :class="splitDetection.needs_review ? 'err' : 'ok'">
-          识别方式：{{ splitDetection.mode }}
-          <template v-if="splitDetection.confidence">· 置信度 {{ splitDetection.confidence }}</template>
-          <template v-if="splitDetection.reason">· {{ splitDetection.reason }}</template>
-        </p>
-        <div class="sum-list">
-          <div v-for="(c, i) in splitChapters" :key="i" class="split-row">
-            <span class="split-id">{{ c.title || c.filename }}</span>
-            <span v-if="c.is_virtual" class="badge paused">虚拟段</span>
-            <span v-if="c.is_empty" class="badge err2">空章</span>
-          </div>
+      <p v-if="splitDetection" class="hint" :class="splitDetection.needs_review ? 'err' : 'ok'">
+        识别方式：{{ splitDetection.mode }}
+        <template v-if="splitDetection.confidence"
+          >· 置信度 {{ splitDetection.confidence }}</template
+        >
+        <template v-if="splitDetection.reason">· {{ splitDetection.reason }}</template>
+      </p>
+      <div class="sum-list">
+        <div v-for="(c, i) in splitChapters" :key="i" class="split-row">
+          <span class="split-id">{{ c.title || c.filename }}</span>
+          <span v-if="c.is_virtual" class="badge paused">虚拟段</span>
+          <span v-if="c.is_empty" class="badge err2">空章</span>
         </div>
-        <!-- 兜底：规则与 AI 都搞不定的创新排版，让用户直接给出章节标题行 -->
-        <details class="redo-split">
-          <summary>拆分不对？按自定义章节标记重新拆分</summary>
-          <p class="hint">每行填一个章节标题，需与原文该行<strong>完全一致</strong>（含标点空格）。程序按这些行切分，正文不会改写。</p>
-          <textarea v-model="redoMarkers" rows="4" placeholder="楔子&#10;风起于青萍之末&#10;尾声"></textarea>
-          <button :disabled="redoingSplit" @click="redoSplit">
-            {{ redoingSplit ? '重拆中…' : '按此标记重新拆分' }}
-          </button>
-        </details>
-        <template #actions>
-          <span></span>
-          <button :disabled="confirmingSplit" @click="confirmSplit">
-            {{ confirmingSplit ? '确认中…' : '确认拆分，继续' }}
-          </button>
-        </template>
+      </div>
+      <!-- 兜底：规则与 AI 都搞不定的创新排版，让用户直接给出章节标题行 -->
+      <details class="redo-split">
+        <summary>拆分不对？按自定义章节标记重新拆分</summary>
+        <p class="hint">
+          每行填一个章节标题，需与原文该行<strong>完全一致</strong>（含标点空格）。程序按这些行切分，正文不会改写。
+        </p>
+        <textarea
+          v-model="redoMarkers"
+          rows="4"
+          placeholder="楔子&#10;风起于青萍之末&#10;尾声"
+        ></textarea>
+        <button :disabled="redoingSplit" @click="redoSplit">
+          {{ redoingSplit ? '重拆中…' : '按此标记重新拆分' }}
+        </button>
+      </details>
+      <template #actions>
+        <span></span>
+        <button :disabled="confirmingSplit" @click="confirmSplit">
+          {{ confirmingSplit ? '确认中…' : '确认拆分，继续' }}
+        </button>
+      </template>
     </GateModal>
 
     <!-- 断层勾选确认弹窗 -->
     <GateModal v-if="showFixReview" title="修复断层：请勾选需修复项">
-        <p class="hint">共诊断出 {{ fixGaps.length }} 处断层，默认全选。确认后将按勾选项执行修复（其余内容保持原样）。</p>
-        <label class="sum-toggle"><input type="checkbox"
+      <p class="hint">
+        共诊断出
+        {{ fixGaps.length }} 处断层，默认全选。确认后将按勾选项执行修复（其余内容保持原样）。
+      </p>
+      <label class="sum-toggle"
+        ><input
+          type="checkbox"
           :checked="fixGaps.length > 0 && fixSelected.length === fixGaps.length"
-          @change="fixGaps.length === fixSelected.length ? fixSelected = [] : fixSelected = fixGaps.map((g:any)=>g.id)" />
-          全选 / 全不选</label>
-        <div class="sum-list">
-          <label v-for="g in fixGaps" :key="g.id" class="fix-row">
-            <input type="checkbox" :checked="fixSelected.includes(g.id)" @change="toggleFix(g.id)" />
-            <span class="split-id">{{ g.location || g.batch_id }}</span>
-            <span class="badge" :class="g.severity === 'high' ? 'badge-err' : (g.severity === 'medium' ? 'badge-warn' : '')">{{ g.severity }}</span>
-            <span class="fix-desc">{{ g.description }}</span>
-          </label>
-        </div>
-        <template #actions>
-          <span></span>
-          <button :disabled="confirmingFix" @click="confirmFix">确认修复（{{ fixSelected.length }} 处）</button>
-        </template>
+          @change="
+            fixGaps.length === fixSelected.length
+              ? (fixSelected = [])
+              : (fixSelected = fixGaps.map((g: any) => g.id))
+          "
+        />
+        全选 / 全不选</label
+      >
+      <div class="sum-list">
+        <label v-for="g in fixGaps" :key="g.id" class="fix-row">
+          <input type="checkbox" :checked="fixSelected.includes(g.id)" @change="toggleFix(g.id)" />
+          <span class="split-id">{{ g.location || g.batch_id }}</span>
+          <span
+            class="badge"
+            :class="
+              g.severity === 'high' ? 'badge-err' : g.severity === 'medium' ? 'badge-warn' : ''
+            "
+            >{{ g.severity }}</span
+          >
+          <span class="fix-desc">{{ g.description }}</span>
+        </label>
+      </div>
+      <template #actions>
+        <span></span>
+        <button :disabled="confirmingFix" @click="confirmFix">
+          确认修复（{{ fixSelected.length }} 处）
+        </button>
+      </template>
     </GateModal>
 
     <!-- 逐章验收确认弹窗 -->
     <GateModal v-if="showAccept" :title="`验收重构稿：批次 ${acceptBatch}`">
-        <p class="hint">以下为本批已产出的章节（预览为开头 80 字）。验收通过后继续下一批；不通过请停止后调整或重跑。</p>
-        <div class="sum-list">
-          <div v-for="c in acceptChapters" :key="c.id" class="split-row accept-row">
-            <span class="split-id">{{ c.id }}</span>
-            <span class="fix-desc">{{ c.preview }}</span>
-            <button class="min-btn" :disabled="regenerating.has(c.id)" @click="regenChapter(c)">{{ regenerating.has(c.id) ? '重写中…' : '重写此章' }}</button>
-          </div>
+      <p class="hint">
+        以下为本批已产出的章节（预览为开头 80 字）。验收通过后继续下一批；不通过请停止后调整或重跑。
+      </p>
+      <div class="sum-list">
+        <div v-for="c in acceptChapters" :key="c.id" class="split-row accept-row">
+          <span class="split-id">{{ c.id }}</span>
+          <span class="fix-desc">{{ c.preview }}</span>
+          <button class="min-btn" :disabled="regenerating.has(c.id)" @click="regenChapter(c)">
+            {{ regenerating.has(c.id) ? '重写中…' : '重写此章' }}
+          </button>
         </div>
-        <template #actions>
-          <span></span>
-          <button :disabled="confirmingAccept" @click="confirmAccept">验收通过，继续</button>
-        </template>
+      </div>
+      <template #actions>
+        <span></span>
+        <button :disabled="confirmingAccept" @click="confirmAccept">验收通过，继续</button>
+      </template>
     </GateModal>
 
     <!-- 质检拦截决策弹窗 -->
     <GateModal v-if="showQcBlock" :title="`质检未通过（${qcIssues.length} 项）`">
-        <p class="hint">以下问题按规则检出不满足导出条件。可选择「强制导出」忽略并继续，或「停止」保留进度待修正后重跑。</p>
-        <div class="sum-list">
-          <div v-for="(it, i) in qcIssues" :key="i" class="split-row"><span class="fix-desc">{{ it }}</span></div>
+      <p class="hint">
+        以下问题按规则检出不满足导出条件。可选择「强制导出」忽略并继续，或「停止」保留进度待修正后重跑。
+      </p>
+      <div class="sum-list">
+        <div v-for="(it, i) in qcIssues" :key="i" class="split-row">
+          <span class="fix-desc">{{ it }}</span>
         </div>
-        <template #actions>
-          <span></span>
-          <button class="danger" @click="control('stop')">停止</button>
-          <button class="primary" :disabled="forcingExport" @click="forceExport">强制导出</button>
-        </template>
+      </div>
+      <template #actions>
+        <span></span>
+        <button class="danger" @click="control('stop')">停止</button>
+        <button class="primary" :disabled="forcingExport" @click="forceExport">强制导出</button>
+      </template>
     </GateModal>
 
     <!-- 左右对照预览弹窗 -->
@@ -1543,10 +1996,14 @@ const canStart = computed(() =>
         <div class="row" v-if="comparisonItems.length">
           <label>章节</label>
           <select v-model="comparisonSel">
-            <option v-for="it in comparisonItems" :key="it.name" :value="it.name">{{ it.name }}</option>
+            <option v-for="it in comparisonItems" :key="it.name" :value="it.name">
+              {{ it.name }}
+            </option>
           </select>
         </div>
-        <pre class="comp-preview">{{ (comparisonItems.find(i => i.name === comparisonSel) || {}).text }}</pre>
+        <pre class="comp-preview">{{
+          (comparisonItems.find((i) => i.name === comparisonSel) || {}).text
+        }}</pre>
         <div class="modal-actions">
           <span></span>
           <button @click="showComparisons = false">关闭</button>
@@ -1556,27 +2013,27 @@ const canStart = computed(() =>
 
     <!-- 蓝图确认弹窗 -->
     <GateModal v-if="showBlueprint" title="请检查并确认蓝图">
-        <p class="hint">可直接编辑后确认，蓝图将作为后续重构的系统提示词。</p>
-        <textarea v-model="blueprintText" rows="16" class="blueprint-area"></textarea>
+      <p class="hint">可直接编辑后确认，蓝图将作为后续重构的系统提示词。</p>
+      <textarea v-model="blueprintText" rows="16" class="blueprint-area"></textarea>
 
-        <label class="sum-toggle" :class="{ off: !showSummaries }">
-          <input type="checkbox" v-model="showSummaries" />
-          查看本步诊断摘要（生成蓝图的输入）
-        </label>
-        <div v-if="showSummaries" class="sum-list">
-          <div v-if="!summaries.length" class="sum-empty">暂无诊断摘要</div>
-          <details v-for="(s, i) in summaries" :key="i" class="sum-item">
-            <summary>{{ s.name }}</summary>
-            <div class="sum-preview">{{ s.preview }}</div>
-          </details>
-        </div>
+      <label class="sum-toggle" :class="{ off: !showSummaries }">
+        <input type="checkbox" v-model="showSummaries" />
+        查看本步诊断摘要（生成蓝图的输入）
+      </label>
+      <div v-if="showSummaries" class="sum-list">
+        <div v-if="!summaries.length" class="sum-empty">暂无诊断摘要</div>
+        <details v-for="(s, i) in summaries" :key="i" class="sum-item">
+          <summary>{{ s.name }}</summary>
+          <div class="sum-preview">{{ s.preview }}</div>
+        </details>
+      </div>
 
-        <template #actions>
-          <span class="count">{{ blueprintText.length }} 字</span>
-          <button @click="confirmBlueprint" :disabled="confirmingBlueprint">
-            {{ confirmingBlueprint ? '确认中...' : '确认蓝图' }}
-          </button>
-        </template>
+      <template #actions>
+        <span class="count">{{ blueprintText.length }} 字</span>
+        <button @click="confirmBlueprint" :disabled="confirmingBlueprint">
+          {{ confirmingBlueprint ? '确认中...' : '确认蓝图' }}
+        </button>
+      </template>
     </GateModal>
 
     <!-- 任务历史（跨会话） -->
@@ -1628,7 +2085,7 @@ const canStart = computed(() =>
   display: flex;
   flex-direction: column;
   height: 100vh;
-  font-family: "Microsoft YaHei", system-ui, sans-serif;
+  font-family: 'Microsoft YaHei', system-ui, sans-serif;
   background: #f5f6f8;
   color: #1f2328;
 }
@@ -1640,12 +2097,33 @@ const canStart = computed(() =>
   background: #2d3748;
   color: #fff;
 }
-.header h1 { font-size: 18px; margin: 0; }
-.version { font-size: 12px; opacity: 0.7; font-weight: normal; }
-.status { font-size: 13px; display: flex; align-items: center; gap: 6px; }
-.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.dot.ok { background: #48bb78; }
-.dot.err { background: #fc8181; }
+.header h1 {
+  font-size: 18px;
+  margin: 0;
+}
+.version {
+  font-size: 12px;
+  opacity: 0.7;
+  font-weight: normal;
+}
+.status {
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot.ok {
+  background: #48bb78;
+}
+.dot.err {
+  background: #fc8181;
+}
 
 .main {
   flex: 1;
@@ -1659,55 +2137,123 @@ const canStart = computed(() =>
   background: #fff;
   border-radius: 8px;
   padding: 16px 20px;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
   overflow-y: auto;
 }
-.panel h2 { font-size: 15px; margin: 0 0 14px; color: #2d3748; display: flex; align-items: center; }
-.panel-gear {
-  margin-left: auto; padding: 3px 12px; font-size: 12px;
-  background: #fff; border: 1px solid #cbd5e0; color: #4a5568;
-  border-radius: 5px; cursor: pointer;
+.panel h2 {
+  font-size: 15px;
+  margin: 0 0 14px;
+  color: #2d3748;
+  display: flex;
+  align-items: center;
 }
-.panel-gear:hover { background: #edf2f7; }
-.panel.config.disabled { opacity: 0.55; pointer-events: none; }
-.panel.progress { display: flex; flex-direction: column; }
+.panel-gear {
+  margin-left: auto;
+  padding: 3px 12px;
+  font-size: 12px;
+  background: #fff;
+  border: 1px solid #cbd5e0;
+  color: #4a5568;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.panel-gear:hover {
+  background: #edf2f7;
+}
+.panel.config.disabled {
+  opacity: 0.55;
+  pointer-events: none;
+}
+.panel.progress {
+  display: flex;
+  flex-direction: column;
+}
 
 /* 后端服务行 */
 .backend-row {
-  background: #f7fafc; border: 1px solid #e2e8f0; border-radius: 6px;
-  padding: 8px 10px; margin-bottom: 12px;
+  background: #f7fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
 }
-.backend-state { flex: 1; display: flex; align-items: center; gap: 6px; font-size: 13px; color: #2d3748; }
+.backend-state {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: #2d3748;
+}
 .backend-row button {
-  padding: 4px 12px; border: 1px solid #d1d5db; background: #fff;
-  border-radius: 5px; cursor: pointer; font-size: 12px;
+  padding: 4px 12px;
+  border: 1px solid #d1d5db;
+  background: #fff;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
 }
-.backend-row button:disabled { opacity: 0.4; cursor: not-allowed; }
-.backend-row button.ghost { border-color: #3182ce; color: #3182ce; }
+.backend-row button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.backend-row button.ghost {
+  border-color: #3182ce;
+  color: #3182ce;
+}
 
 /* 顶栏：状态可点击 + 齿轮入口 */
 .status-link {
-  display: flex; align-items: center; gap: 6px;
-  background: transparent; border: none; color: #fff;
-  font-size: 13px; cursor: pointer; padding: 2px 4px; border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
   max-width: 340px;
 }
-.status-link:hover { background: rgba(255, 255, 255, 0.12); }
-.gear {
-  background: transparent; border: 1px solid rgba(255, 255, 255, 0.4);
-  color: #fff; border-radius: 5px; font-size: 15px; cursor: pointer;
-  width: 28px; height: 24px; line-height: 1;
+.status-link:hover {
+  background: rgba(255, 255, 255, 0.12);
 }
-.gear:hover { background: rgba(255, 255, 255, 0.12); }
+.gear {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  color: #fff;
+  border-radius: 5px;
+  font-size: 15px;
+  cursor: pointer;
+  width: 28px;
+  height: 24px;
+  line-height: 1;
+}
+.gear:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
 
 /* 断连横幅里的操作按钮 */
-.banner-act { display: flex; align-items: center; gap: 6px; }
-.banner-btn {
-  padding: 3px 10px; font-size: 12px; cursor: pointer;
-  border: 1px solid currentColor; background: transparent;
-  color: inherit; border-radius: 4px;
+.banner-act {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
-.banner-btn.primary { background: #822727; border-color: #822727; color: #fff; }
+.banner-btn {
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  border: 1px solid currentColor;
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+}
+.banner-btn.primary {
+  background: #822727;
+  border-color: #822727;
+  color: #fff;
+}
 
 .banner {
   grid-column: 1 / -1;
@@ -1718,23 +2264,71 @@ const canStart = computed(() =>
   border-radius: 6px;
   font-size: 13px;
 }
-.banner.tip { background: #c6f6d5; color: #22543d; border: 1px solid #9ae6b4; }
-.banner.err { background: #fed7d7; color: #822727; border: 1px solid #feb2b2; }
-.banner.warn { background: #fefcbf; color: #975a16; border: 1px solid #f6e05e; }
+.banner.tip {
+  background: #c6f6d5;
+  color: #22543d;
+  border: 1px solid #9ae6b4;
+}
+.banner.err {
+  background: #fed7d7;
+  color: #822727;
+  border: 1px solid #feb2b2;
+}
+.banner.warn {
+  background: #fefcbf;
+  color: #975a16;
+  border: 1px solid #f6e05e;
+}
 .banner-close {
-  background: transparent; border: none; font-size: 16px; cursor: pointer;
-  color: inherit; padding: 0 4px;
+  background: transparent;
+  border: none;
+  font-size: 16px;
+  cursor: pointer;
+  color: inherit;
+  padding: 0 4px;
 }
 
-
-.bar-fill.recon { background: #38a169; }
-.bar-fill.chapter { background: #805ad5; }
-.tree-head { margin-bottom: 6px; }
-.tree-toggle { background: transparent; border: none; color: #4a5568; font-size: 13px; font-weight: 600; cursor: pointer; padding: 4px 0; }
-.tree-box { max-height: 150px; overflow-y: auto; border: 1px solid #e2e8f0; border-radius: 5px; padding: 6px 10px; margin-bottom: 10px; background: #f7fafc; }
-.tree-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; font-size: 12px; }
-html.dark .tree-box { background: #232b39; border-color: #4a5568; }
-html.dark .tree-toggle { color: #a0aec0; }
+.bar-fill.recon {
+  background: #38a169;
+}
+.bar-fill.chapter {
+  background: #805ad5;
+}
+.tree-head {
+  margin-bottom: 6px;
+}
+.tree-toggle {
+  background: transparent;
+  border: none;
+  color: #4a5568;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 0;
+}
+.tree-box {
+  max-height: 150px;
+  overflow-y: auto;
+  border: 1px solid #e2e8f0;
+  border-radius: 5px;
+  padding: 6px 10px;
+  margin-bottom: 10px;
+  background: #f7fafc;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+}
+html.dark .tree-box {
+  background: #232b39;
+  border-color: #4a5568;
+}
+html.dark .tree-toggle {
+  color: #a0aec0;
+}
 
 .row {
   display: flex;
@@ -1742,11 +2336,33 @@ html.dark .tree-toggle { color: #a0aec0; }
   gap: 8px;
   margin-bottom: 10px;
 }
-.row.col { flex-direction: column; align-items: stretch; }
-.row label { width: 80px; font-size: 13px; color: #4a5568; flex-shrink: 0; }
-.row label.fmt, .row label.ctx, .row label.t { width: auto; margin-left: 12px; }
-.row label.rich { width: auto; display: flex; align-items: center; gap: 4px; cursor: pointer; }
-.row label.rich input { width: auto; margin: 0; }
+.row.col {
+  flex-direction: column;
+  align-items: stretch;
+}
+.row label {
+  width: 80px;
+  font-size: 13px;
+  color: #4a5568;
+  flex-shrink: 0;
+}
+.row label.fmt,
+.row label.ctx,
+.row label.t {
+  width: auto;
+  margin-left: 12px;
+}
+.row label.rich {
+  width: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.row label.rich input {
+  width: auto;
+  margin: 0;
+}
 .row select {
   flex: 1;
   padding: 6px 10px;
@@ -1762,13 +2378,41 @@ html.dark .tree-toggle { color: #a0aec0; }
   border-radius: 5px;
   font-size: 13px;
 }
-.row label.t + input, .row label.rich + input { flex: 1; }
-.row label.rich-k { width: auto; margin-left: 12px; font-size: 12px; color: #718096; }
-.ph-note { font-size: 12px; color: #718096; margin: 4px 0 8px; line-height: 1.5; }
-.adv { border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px 12px; margin-bottom: 10px; }
-.adv summary { font-size: 13px; color: #4a5568; cursor: pointer; }
-.adv.gates { display: flex; flex-direction: column; flex: 1; }
-.adv.gates .rich { margin: 3px 0; }
+.row label.t + input,
+.row label.rich + input {
+  flex: 1;
+}
+.row label.rich-k {
+  width: auto;
+  margin-left: 12px;
+  font-size: 12px;
+  color: #718096;
+}
+.ph-note {
+  font-size: 12px;
+  color: #718096;
+  margin: 4px 0 8px;
+  line-height: 1.5;
+}
+.adv {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+}
+.adv summary {
+  font-size: 13px;
+  color: #4a5568;
+  cursor: pointer;
+}
+.adv.gates {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+.adv.gates .rich {
+  margin: 3px 0;
+}
 .row textarea {
   width: 100%;
   padding: 6px 10px;
@@ -1777,7 +2421,9 @@ html.dark .tree-toggle { color: #a0aec0; }
   font-size: 13px;
   resize: vertical;
 }
-.lone-area + .lone-area { margin-top: 6px; }
+.lone-area + .lone-area {
+  margin-top: 6px;
+}
 .row button {
   padding: 6px 14px;
   border: 1px solid #d1d5db;
@@ -1786,7 +2432,9 @@ html.dark .tree-toggle { color: #a0aec0; }
   cursor: pointer;
   font-size: 13px;
 }
-.row button:hover { background: #f0f4f8; }
+.row button:hover {
+  background: #f0f4f8;
+}
 
 .start-btn {
   width: 100%;
@@ -1799,7 +2447,10 @@ html.dark .tree-toggle { color: #a0aec0; }
   font-size: 14px;
   cursor: pointer;
 }
-.start-btn:disabled { background: #a0aec0; cursor: not-allowed; }
+.start-btn:disabled {
+  background: #a0aec0;
+  cursor: not-allowed;
+}
 
 .phase-bar {
   display: flex;
@@ -1807,9 +2458,17 @@ html.dark .tree-toggle { color: #a0aec0; }
   gap: 10px;
   margin-bottom: 12px;
 }
-.phase { font-size: 14px; font-weight: 600; color: #2d3748; }
+.phase {
+  font-size: 14px;
+  font-weight: 600;
+  color: #2d3748;
+}
 
-.controls { display: flex; gap: 8px; margin-bottom: 12px; }
+.controls {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
 .controls button {
   padding: 5px 14px;
   border: 1px solid #d1d5db;
@@ -1818,8 +2477,14 @@ html.dark .tree-toggle { color: #a0aec0; }
   cursor: pointer;
   font-size: 13px;
 }
-.controls button.danger { color: #c53030; border-color: #feb2b2; }
-.controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+.controls button.danger {
+  color: #c53030;
+  border-color: #feb2b2;
+}
+.controls button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
 
 .stream-box {
   max-height: 72px;
@@ -1835,7 +2500,10 @@ html.dark .tree-toggle { color: #a0aec0; }
   word-break: break-all;
   color: #2d3748;
 }
-.stream-title { color: #3182ce; margin-right: 6px; }
+.stream-title {
+  color: #3182ce;
+  margin-right: 6px;
+}
 
 .log-box {
   flex: 1;
@@ -1845,20 +2513,54 @@ html.dark .tree-toggle { color: #a0aec0; }
   color: #e2e8f0;
   border-radius: 6px;
   padding: 10px 12px;
-  font-family: "Consolas", monospace;
+  font-family: 'Consolas', monospace;
   font-size: 12px;
   line-height: 1.6;
 }
-.log-line { white-space: pre-wrap; word-break: break-all; }
-.log-line .log-ts { color: #718096; margin-right: 8px; }
-.log-ok { color: #9ae6b4; }
-.log-warn { color: #fefcbf; }
-.log-err { color: #fc8181; }
-.log-accent { color: #90cdf4; }
-.log-head { display: flex; align-items: center; gap: 8px; color: #4a5568; font-size: 12px; margin-bottom: 6px; }
-.log-count { color: #718096; }
-.min-btn { margin-left: auto; padding: 2px 10px; background: transparent; border: 1px solid #cbd5e0; border-radius: 4px; color: #4a5568; font-size: 12px; cursor: pointer; }
-.min-btn:hover { background: #edf2f7; }
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.log-line .log-ts {
+  color: #718096;
+  margin-right: 8px;
+}
+.log-ok {
+  color: #9ae6b4;
+}
+.log-warn {
+  color: #fefcbf;
+}
+.log-err {
+  color: #fc8181;
+}
+.log-accent {
+  color: #90cdf4;
+}
+.log-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #4a5568;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+.log-count {
+  color: #718096;
+}
+.min-btn {
+  margin-left: auto;
+  padding: 2px 10px;
+  background: transparent;
+  border: 1px solid #cbd5e0;
+  border-radius: 4px;
+  color: #4a5568;
+  font-size: 12px;
+  cursor: pointer;
+}
+.min-btn:hover {
+  background: #edf2f7;
+}
 
 .blueprint-area {
   flex: 1;
@@ -1871,31 +2573,100 @@ html.dark .tree-toggle { color: #a0aec0; }
   min-height: 300px;
 }
 .sum-toggle {
-  display: flex; align-items: center; gap: 6px;
-  font-size: 12px; color: #4a5568; cursor: pointer; margin: 10px 0 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: #4a5568;
+  cursor: pointer;
+  margin: 10px 0 4px;
 }
-.sum-toggle input { width: auto; margin: 0; }
-.sum-empty { color: #718096; }
-.split-id { flex: 1; color: #2d3748; word-break: break-all; }
-.redo-split { margin-top: 10px; }
-.redo-split summary { cursor: pointer; color: #4a5568; font-size: 13px; }
-.redo-split textarea { width: 100%; margin-top: 8px; padding: 6px 8px; font-family: inherit;
-  font-size: 13px; border: 1px solid #cbd5e0; border-radius: 4px; box-sizing: border-box; }
-.redo-split button { margin-top: 8px; }
-.fix-row { display: flex; align-items: center; gap: 6px; padding: 3px 0; cursor: pointer; }
-.fix-row input { width: auto; margin: 0; }
-.fix-desc { color: #4a5568; word-break: break-all; }
-.accept-row { display: flex; align-items: center; gap: 6px; }
-.accept-row .fix-desc { flex: 1; }
-.accept-row .min-btn { margin-left: auto; flex: 0 0 auto; }
-.sum-item summary { cursor: pointer; color: #2d3748; margin-bottom: 2px; }
-.sum-preview { color: #4a5568; white-space: pre-wrap; word-break: break-all; }
-.count { font-size: 12px; color: #718096; }
+.sum-toggle input {
+  width: auto;
+  margin: 0;
+}
+.sum-empty {
+  color: #718096;
+}
+.split-id {
+  flex: 1;
+  color: #2d3748;
+  word-break: break-all;
+}
+.redo-split {
+  margin-top: 10px;
+}
+.redo-split summary {
+  cursor: pointer;
+  color: #4a5568;
+  font-size: 13px;
+}
+.redo-split textarea {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 13px;
+  border: 1px solid #cbd5e0;
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+.redo-split button {
+  margin-top: 8px;
+}
+.fix-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  cursor: pointer;
+}
+.fix-row input {
+  width: auto;
+  margin: 0;
+}
+.fix-desc {
+  color: #4a5568;
+  word-break: break-all;
+}
+.accept-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.accept-row .fix-desc {
+  flex: 1;
+}
+.accept-row .min-btn {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+.sum-item summary {
+  cursor: pointer;
+  color: #2d3748;
+  margin-bottom: 2px;
+}
+.sum-preview {
+  color: #4a5568;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.count {
+  font-size: 12px;
+  color: #718096;
+}
 .comp-preview {
-  margin-top: 10px; max-height: 60vh; overflow: auto;
-  background: #1a202c; color: #e2e8f0; border-radius: 6px;
-  padding: 10px 12px; font-family: "Consolas", monospace; font-size: 12px;
-  white-space: pre-wrap; word-break: break-all;
+  margin-top: 10px;
+  max-height: 60vh;
+  overflow: auto;
+  background: #1a202c;
+  color: #e2e8f0;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: 'Consolas', monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .theme-toggle {
@@ -1908,37 +2679,114 @@ html.dark .tree-toggle { color: #a0aec0; }
   font-size: 14px;
   cursor: pointer;
 }
-.theme-toggle:hover { background: rgba(255, 255, 255, 0.12); }
+.theme-toggle:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
 
-.final-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.final-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 /* .min-btn 默认 margin-left:auto（为「导出/清空」右对齐设计），在列表里要归零 */
-.final-list .min-btn { margin-left: 0; }
-.chapter-row-bar { align-items: center; }
+.final-list .min-btn {
+  margin-left: 0;
+}
+.chapter-row-bar {
+  align-items: center;
+}
 
 /* 深色主题（html.dark）最小覆盖 */
-html.dark .app { background: #171923; color: #e2e8f0; }
-html.dark .panel { background: #1f2733; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
-html.dark .panel h2 { color: #e2e8f0; }
-html.dark .panel-gear { background: #2d3748; border-color: #4a5568; color: #e2e8f0; }
-html.dark .backend-row { background: #232b39; border-color: #4a5568; }
-html.dark .backend-state { color: #e2e8f0; }
-html.dark .backend-row button { background: #2d3748; color: #e2e8f0; border-color: #4a5568; }
-html.dark .row label,
-html.dark .phase, html.dark .phase-bar .open-btn { color: #e2e8f0; }
-html.dark input, html.dark select, html.dark textarea {
-  background: #1a202c; color: #e2e8f0; border-color: #4a5568;
+html.dark .app {
+  background: #171923;
+  color: #e2e8f0;
 }
-html.dark .stats { background: #232b39; color: #a0aec0; }
-html.dark .stat b { color: #e2e8f0; }
-html.dark .bar-track { background: #2d3748; }
-html.dark .bar, html.dark .bar-num, html.dark .bar-label { color: #a0aec0; }
-html.dark .adv { border-color: #4a5568; }
-html.dark .adv summary, html.dark .log-count, html.dark .sum-empty { color: #a0aec0; }
-html.dark .stream-box { background: #1a202c; border-color: #4a5568; color: #e2e8f0; }
-html.dark .sum-list { background: #232b39; border-color: #4a5568; }
-html.dark .split-id, html.dark .sum-item summary { color: #e2e8f0; }
-html.dark .fix-desc, html.dark .sum-preview { color: #a0aec0; }
-html.dark .modal { background: #1f2733; }
-html.dark .controls button, html.dark .row button { background: #2d3748; color: #e2e8f0; border-color: #4a5568; }
-html.dark .start-btn:disabled { background: #4a5568; }
+html.dark .panel {
+  background: #1f2733;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+html.dark .panel h2 {
+  color: #e2e8f0;
+}
+html.dark .panel-gear {
+  background: #2d3748;
+  border-color: #4a5568;
+  color: #e2e8f0;
+}
+html.dark .backend-row {
+  background: #232b39;
+  border-color: #4a5568;
+}
+html.dark .backend-state {
+  color: #e2e8f0;
+}
+html.dark .backend-row button {
+  background: #2d3748;
+  color: #e2e8f0;
+  border-color: #4a5568;
+}
+html.dark .row label,
+html.dark .phase,
+html.dark .phase-bar .open-btn {
+  color: #e2e8f0;
+}
+html.dark input,
+html.dark select,
+html.dark textarea {
+  background: #1a202c;
+  color: #e2e8f0;
+  border-color: #4a5568;
+}
+html.dark .stats {
+  background: #232b39;
+  color: #a0aec0;
+}
+html.dark .stat b {
+  color: #e2e8f0;
+}
+html.dark .bar-track {
+  background: #2d3748;
+}
+html.dark .bar,
+html.dark .bar-num,
+html.dark .bar-label {
+  color: #a0aec0;
+}
+html.dark .adv {
+  border-color: #4a5568;
+}
+html.dark .adv summary,
+html.dark .log-count,
+html.dark .sum-empty {
+  color: #a0aec0;
+}
+html.dark .stream-box {
+  background: #1a202c;
+  border-color: #4a5568;
+  color: #e2e8f0;
+}
+html.dark .sum-list {
+  background: #232b39;
+  border-color: #4a5568;
+}
+html.dark .split-id,
+html.dark .sum-item summary {
+  color: #e2e8f0;
+}
+html.dark .fix-desc,
+html.dark .sum-preview {
+  color: #a0aec0;
+}
+html.dark .modal {
+  background: #1f2733;
+}
+html.dark .controls button,
+html.dark .row button {
+  background: #2d3748;
+  color: #e2e8f0;
+  border-color: #4a5568;
+}
+html.dark .start-btn:disabled {
+  background: #4a5568;
+}
 </style>

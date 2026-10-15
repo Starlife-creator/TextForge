@@ -31,7 +31,7 @@ export async function waitForPort(): Promise<number> {
     const result = await invoke<PortResult>('get_backend_port');
     if (result.status === 'Ready' || result.status === 'DevMode') return result.data;
     if (result.status === 'Error') throw new Error(result.data);
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise((r) => setTimeout(r, 500));
   }
   throw new Error('后端启动超时，请打开「⚙ 系统与后端设置」查看日志');
 }
@@ -48,6 +48,7 @@ export async function fetchBackendInfo(): Promise<BackendInfo | null> {
 
 /** 重启后端（release）。开发模式由 Rust 侧返回明确的操作提示。 */
 export async function invokeRestartBackend(): Promise<string> {
-  if (!isTauri()) throw new Error('浏览器开发模式无法重启后端，请在终端手动执行 python backend/main.py');
+  if (!isTauri())
+    throw new Error('浏览器开发模式无法重启后端，请在终端手动执行 python backend/main.py');
   return invoke<string>('restart_backend');
 }

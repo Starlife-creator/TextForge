@@ -10,18 +10,35 @@
  * 注意遮罩点击关闭**默认关闭**：闸门弹窗要求显式选择，确认/拒绝不能靠误点遮罩。
  * 需要时可开 maskClose。
  */
-withDefaults(defineProps<{
-  title: string;
-  wide?: boolean;
-  maskClose?: boolean;
-}>(), { wide: false, maskClose: false });
+import { onMounted, ref } from 'vue';
+
+withDefaults(
+  defineProps<{
+    title: string;
+    wide?: boolean;
+    maskClose?: boolean;
+  }>(),
+  { wide: false, maskClose: false },
+);
 
 const emit = defineEmits<{ (e: 'close'): void }>();
+const root = ref<HTMLElement | null>(null);
+// 打开即聚焦容器：键盘/读屏用户不至于落在遮罩后面的页面上。
+// 刻意**不**响应 Escape：闸门要求显式选择，不存在「按 Esc 不了了之」。
+onMounted(() => root.value?.focus());
 </script>
 
 <template>
   <div class="modal-mask" @click.self="maskClose && emit('close')">
-    <div class="modal" :class="{ 'modal-wide': wide }">
+    <div
+      ref="root"
+      class="modal"
+      :class="{ 'modal-wide': wide }"
+      role="dialog"
+      aria-modal="true"
+      :aria-label="title"
+      tabindex="-1"
+    >
       <h3>{{ title }}</h3>
       <slot />
       <div v-if="$slots.actions" class="modal-actions">

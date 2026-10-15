@@ -4,7 +4,7 @@
 用户只能靠改文件 + 看 console 排查。这里把「后端自身」和「模型服务」
 两类配置全部暴露为 HTTP 接口，供前端「系统与后端设置」面板调用。
 """
-import os, sys, time, platform, json, asyncio
+import os, sys, time, platform, json, asyncio, subprocess
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Body, Query
 import httpx
@@ -40,17 +40,26 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _port_file() -> dict:
+    """读取 port.json（一次），供 _port/_pid/system_info 共用，避免每个请求读多遍。"""
+    try:
+        data = json.loads(PORT_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+
+
 def _port() -> int:
     try:
-        return int(json.loads(PORT_FILE.read_text(encoding="utf-8")).get("port") or 0)
-    except (OSError, ValueError, json.JSONDecodeError):
+        return int(_port_file().get("port") or 0)
+    except (TypeError, ValueError):
         return 0
 
 
 def _pid() -> int:
     try:
-        return int(json.loads(PORT_FILE.read_text(encoding="utf-8")).get("pid") or 0)
-    except (OSError, ValueError, json.JSONDecodeError):
+        return int(_port_file().get("pid") or 0)
+    except (TypeError, ValueError):
         return 0
 
 
@@ -60,14 +69,15 @@ def _pid() -> int:
 async def system_info():
     """后端运行信息：端口 / PID / 运行时长 / 关键文件位置。"""
     try:
-        log_size = LOG_PATH.stat().st_size if LOG_PATH.exists() else 0
-        log_mtime = LOG_PATH.stat().st_mtime if LOG_PATH.exists() else 0
+        st = LOG_PATH.stat()
+        log_size, log_mtime, log_exists = st.st_size, st.st_mtime, True
     except OSError:
-        log_size, log_mtime = 0, 0
+        log_size, log_mtime, log_exists = 0, 0, False
+    pf = _port_file()
     return {
         "version": VERSION,
         "pid": os.getpid(),
-        "port": _port(),
+        "port": int(pf.get("port") or 0),
         "started_at": START_TIME,
         "uptime_sec": round(time.time() - START_TIME, 1),
         "python": sys.version.split()[0],
@@ -79,7 +89,7 @@ async def system_info():
         "port_file": str(PORT_FILE),
         "port_file_exists": PORT_FILE.exists(),
         "log_path": str(LOG_PATH),
-        "log_exists": LOG_PATH.exists(),
+        "log_exists": log_exists,
         "log_size": log_size,
         "log_mtime": log_mtime,
         "pipeline_running": state.pipeline_running,
@@ -142,9 +152,9 @@ async def system_open(payload: dict = Body(...)):
         if sys.platform == "win32":
             os.startfile(str(p))          # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            os.system(f'open "{p}"')
+            subprocess.Popen(["open", str(p)])
         else:
-            os.system(f'xdg-open "{p}"')
+            subprocess.Popen(["xdg-open", str(p)])
     except Exception as e:
         raise HTTPException(500, f"打开失败: {e}")
     logger.info(f"[system] 打开 {target}: {p}")
@@ -198,12 +208,20 @@ def _models_candidates(api_url: str) -> list[str]:
     return out
 
 
-@router.get("/api/system/models")
-async def system_models(api_url: str = Query(...), api_key: str = Query("")):
-    """探测模型列表。由后端代发，绕开浏览器 CORS —— LM Studio 默认拒绝带 Origin 的跨源请求。"""
+@router.post("/api/system/models")
+async def system_models(payload: dict = Body(...)):
+    """探测模型列表。由后端代发，绕开浏览器 CORS —— LM Studio 默认拒绝带 Origin 的跨源请求。
+
+    api_url/api_key 走 POST body 而非 query string：query 会落进访问日志、浏览器历史、
+    Referer 与各种中间代理，等于把密钥写在明信片上（redact 过滤器也管不到 URL）。
+    """
+    api_url = (payload.get("api_url") or "").strip()
+    api_key = (payload.get("api_key") or "").strip()
+    if not api_url:
+        raise HTTPException(422, "缺少 api_url")
     headers = {"Accept": "application/json"}
-    if api_key.strip():
-        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     tried, errors = [], []
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=8.0, read=15.0, write=8.0, pool=8.0),
                                  follow_redirects=True) as client:
@@ -299,16 +317,23 @@ async def _detect_context(api_url, model, api_key, proxy, ssl_verify):
     return {"limit": learned, "source": "overflow" if learned else None}
 
 
-@router.get("/api/system/context_probe")
-async def system_context_probe(api_url: str = Query(...), model: str = Query(""),
-                               api_key: str = Query(""), configured: int = Query(0)):
+@router.post("/api/system/context_probe")
+async def system_context_probe(payload: dict = Body(...)):
     """探测真实上下文窗口，并与用户配置值对比，给出是否「填大了」的结论。
 
     仅做自检与提示，绝不阻止用户开始任务 —— 探测失败时如实返回 detected=None。
+    api_key 走 body：理由同 system_models（避免密钥进入 URL/日志）。
     """
-    if not api_url.strip():
+    api_url = (payload.get("api_url") or "").strip()
+    model = (payload.get("model") or "").strip()
+    api_key = (payload.get("api_key") or "").strip()
+    try:
+        configured = int(payload.get("configured") or 0)
+    except (TypeError, ValueError):
+        configured = 0
+    if not api_url:
         raise HTTPException(422, "缺少 api_url")
-    ctx = await _detect_context(api_url.strip(), model.strip(), api_key.strip(),
+    ctx = await _detect_context(api_url, model, api_key,
                                 None, True)
     detected, source = ctx["limit"], ctx["source"]
     mismatch = None

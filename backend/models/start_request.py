@@ -15,7 +15,7 @@ class StartRequest(BaseModel):
     api_url: str
     api_key: str = ""
     model: str
-    context_window: int = Field(ge=8000)
+    context_window: int = Field(ge=8000, le=10_000_000)
     author_style: str = "出版级文学重构，文笔凝练，注重画面感"
     novel_name: Optional[str] = None
     rich_text: bool = False
@@ -37,11 +37,11 @@ class StartRequest(BaseModel):
         "qc_block_export": False,
     })
     # P0.2 可选的禁改清单（仅非 full_rewrite 注入）
-    forbidden_canon: List[str] = Field(default_factory=list)
+    forbidden_canon: List[str] = Field(default_factory=list, max_length=5000)
     # P1.3 reskin 人名/设定映射表 {旧名: 新名}
     name_map: Dict[str, str] = Field(default_factory=dict)
     # P1.5 fix_gaps 时勾选的断层清单（诊断输出的断层 id/描述）
-    fix_list: List[str] = Field(default_factory=list)
+    fix_list: List[str] = Field(default_factory=list, max_length=5000)
     # P1.4 诊断输出路径（可选，与 batch_XX.txt 并存）
     diagnose_json: Optional[str] = None
     # P1.6 左右对照：phase3 后按章生成「原文 | 重构后」Markdown 对照（默认关）
@@ -57,6 +57,6 @@ class StartRequest(BaseModel):
     #   chapter_markers：用户自定义的章节标题行（精确匹配），优先级最高，
     #     用于规则与 AI 都搞不定的「创新排版」——这是最终兜底手段。
     ai_split: bool = True
-    chapter_markers: List[str] = Field(default_factory=list)
+    chapter_markers: List[str] = Field(default_factory=list, max_length=10000)
     # P4.1 分阶段模型：值可为模型名 str，或 dict{model, api_url?, api_key?}（A2 多服务商）
     models: Dict[str, Union[str, Dict[str, str]]] = Field(default_factory=dict)

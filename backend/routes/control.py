@@ -53,7 +53,7 @@ async def split_confirm(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
         except (json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase0_confirm':
@@ -82,7 +82,7 @@ async def split_redo(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
         except (json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase0_confirm':
@@ -106,7 +106,7 @@ async def fix_confirm(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
         except (json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase1_fixreview':
@@ -146,7 +146,7 @@ async def export_force(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
         except (json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase3_qc':
@@ -172,7 +172,7 @@ async def regen_chapter(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
         except (json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase3_accept':
@@ -203,7 +203,7 @@ async def accept(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
         except (json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase3_accept':
@@ -230,7 +230,7 @@ async def blueprint_confirm(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8'))
+            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
         except (json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         # 只在 phase2_waiting 阶段允许确认

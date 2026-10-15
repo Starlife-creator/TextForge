@@ -1,10 +1,36 @@
 from fastapi import APIRouter
 from pathlib import Path
+from collections import OrderedDict
 import json, logging
 from routes import state
 
 router = APIRouter()
 logger = logging.getLogger("textforge")
+
+# progress.json 在缝合阶段可达数十 MB，而 /api/status 被前端每 5s 轮询一次。
+# 缓存「按 (mtime_ns, size) 解析后的 progress」：文件没变直接复用，免去每轮
+# 全量 json.loads；文件一变（atomic_write_json 会换 mtime）立即失效。
+# 用 LRU 封顶（每个值是一份完整 dict，可达数十 MB），避免浏览历史、轮询过
+# 许多输出目录时无限累积内存。纯同步、只在事件循环里访问，故无需加锁。
+_MAX_PROGRESS_CACHE = 8
+_PROGRESS_CACHE: "OrderedDict[str, tuple[tuple[int, int], dict]]" = OrderedDict()
+
+
+def _read_progress_cached(path: Path) -> dict:
+    st = path.stat()
+    key = str(path)
+    stamp = (st.st_mtime_ns, st.st_size)
+    cached = _PROGRESS_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        _PROGRESS_CACHE.move_to_end(key)
+        return cached[1]
+    data = json.loads(path.read_text(encoding='utf-8-sig'))  # utf-8-sig: 容忍 BOM
+    _PROGRESS_CACHE[key] = (stamp, data)
+    _PROGRESS_CACHE.move_to_end(key)
+    while len(_PROGRESS_CACHE) > _MAX_PROGRESS_CACHE:
+        _PROGRESS_CACHE.popitem(last=False)
+    return data
+
 
 @router.get("/api/status")
 async def status(output_path: str | None = None):
@@ -21,7 +47,7 @@ async def status(output_path: str | None = None):
         return {"pipeline_running": state.pipeline_running, "paused": paused,
                 "run_id": state.current_run_id, "has_progress": False}
     try:
-        progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))  # utf-8-sig: 容忍 BOM
+        progress = _read_progress_cached(progress_path)
     except (json.JSONDecodeError, OSError) as e:
         return {"pipeline_running": state.pipeline_running, "paused": paused,
                 "has_progress": True, "progress_error": f"progress.json 无法读取: {e}"}

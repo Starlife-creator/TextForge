@@ -665,8 +665,9 @@ try:
     # 上下文窗口探测：mock 上报 4096，应用配置 32768 → 必须提示「填大了」
     PROBE_N = 4096
     put(f"{L}/", {"context_report": {"n_ctx": PROBE_N}})
-    probe = get(f"{B}/api/system/context_probe?api_url={L}/v1/chat/completions"
-                f"&model=mock-model&configured=32768")
+    probe = post(f"{B}/api/system/context_probe",
+                 {"api_url": f"{L}/v1/chat/completions",
+                  "model": "mock-model", "configured": 32768})
     check("探测到服务端真实上下文窗口", probe.get("detected") == PROBE_N, str(probe))
     check("配置大于实测时给出提示", bool(probe.get("mismatch")), str(probe)[:160])
 

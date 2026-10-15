@@ -59,7 +59,11 @@ async function call<T>(port: number, path: string, init?: RequestInit): Promise<
   const res = await apiFetch(`http://127.0.0.1:${port}${path}`, init);
   const text = await res.text();
   let body: any = null;
-  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
+  try {
+    body = text ? JSON.parse(text) : null;
+  } catch {
+    body = text;
+  }
   if (!res.ok) {
     const detail = body?.detail ?? body ?? res.status;
     throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
@@ -93,16 +97,28 @@ export function shutdownBackend(port: number, force: boolean) {
 }
 
 export async function fetchModels(port: number, apiUrl: string, apiKey = '') {
-  const q = new URLSearchParams({ api_url: apiUrl, api_key: apiKey });
-  const res = await apiFetch(`http://127.0.0.1:${port}/api/system/models?${q}`);
+  // api_key 走 POST body，不进 URL：query 会落进访问日志/浏览器历史/代理，
+  // 等于把密钥暴露在明信片上。
+  const res = await apiFetch(`http://127.0.0.1:${port}/api/system/models`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_url: apiUrl, api_key: apiKey }),
+  });
   const body = await res.json().catch(() => null);
   if (!res.ok || !body) throw new Error(`模型探测失败：HTTP ${res.status}`);
   return body as ModelListResult;
 }
 
-export function checkLlm(port: number, payload: {
-  api_url: string; model: string; api_key?: string; proxy?: string; ssl_verify?: boolean;
-}) {
+export function checkLlm(
+  port: number,
+  payload: {
+    api_url: string;
+    model: string;
+    api_key?: string;
+    proxy?: string;
+    ssl_verify?: boolean;
+  },
+) {
   return call<LlmCheckResult>(port, '/api/system/llm_check', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -141,16 +157,10 @@ export interface HistoryItem {
   running?: boolean;
 }
 
-async function req<T>(port: number, path: string, init?: RequestInit): Promise<T> {
-  const res = await apiFetch(`http://127.0.0.1:${port}${path}`, init);
-  const text = await res.text();
-  let body: any = null;
-  try { body = text ? JSON.parse(text) : null; } catch { body = text; }
-  if (!res.ok) {
-    const d = body && typeof body === 'object' ? (body.detail ?? body) : body;
-    throw new Error(typeof d === 'string' ? d : JSON.stringify(d ?? `HTTP ${res.status}`));
-  }
-  return body as T;
+// 与上面的 call 行为一致（文本→JSON、规范化 detail）。保留 req 作为语义别名，
+// 避免两处解析逻辑各自漂移 —— 此前两者的错误分支就有细微差异。
+function req<T>(port: number, path: string, init?: RequestInit): Promise<T> {
+  return call<T>(port, path, init);
 }
 
 export function fetchHistory(port: number) {
@@ -180,11 +190,14 @@ export function fetchVersions(port: number, outputPath: string) {
 
 export function restoreVersion(port: number, outputPath: string, versionId: string) {
   return req<{ restored: string; snapshot_before_restore: string | null }>(
-    port, '/api/versions/restore', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ output_path: outputPath, version_id: versionId }),
-  });
+    port,
+    '/api/versions/restore',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ output_path: outputPath, version_id: versionId }),
+    },
+  );
 }
 
 export function clearOutput(port: number, outputPath: string) {
@@ -201,12 +214,19 @@ export function inspectOutput(port: number, outputPath: string) {
 }
 
 /** 探测服务端真实上下文窗口，并与用户配置值对比（仅自检，不影响能否启动）。 */
-export async function probeContext(port: number, apiUrl: string, model: string,
-                                   configured: number, apiKey = '') {
-  const q = new URLSearchParams({
-    api_url: apiUrl, model, api_key: apiKey, configured: String(configured),
+export async function probeContext(
+  port: number,
+  apiUrl: string,
+  model: string,
+  configured: number,
+  apiKey = '',
+) {
+  // api_key 走 body，理由同 fetchModels。
+  const res = await apiFetch(`http://127.0.0.1:${port}/api/system/context_probe`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_url: apiUrl, model, api_key: apiKey, configured }),
   });
-  const res = await apiFetch(`http://127.0.0.1:${port}/api/system/context_probe?${q}`);
   const body = await res.json().catch(() => null);
   if (!res.ok || !body) throw new Error(`上下文探测失败：HTTP ${res.status}`);
   return body as ContextProbeResult;

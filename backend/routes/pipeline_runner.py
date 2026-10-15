@@ -26,10 +26,12 @@ async def run_pipeline(req, run_id: str):
     # 那会在长时段运行里造成上百 GB 的原地覆写。界面从 /api/status 读内存值，
     # 比读盘更准（没有 fsync 延迟），僵死告警不受影响。
     state.last_heartbeat = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    hb = asyncio.create_task(_heartbeat_loop(progress_path))
+    hb_ref: list = []  # 心跳登记历史用的内存引用，_load_or_init_progress 后填入
+    hb = asyncio.create_task(_heartbeat_loop(progress_path, hb_ref))
     try:
         # v8.8 修正：断点恢复。若存在未完成的 progress.json，恢复而非覆盖。
         progress = _load_or_init_progress(req, run_id, progress_path)
+        hb_ref.append(progress)
         # v8.8：run_start 不携带 total_chapters（phase0 前尚不知道），由 phase0_done 携带
         sse_emit("run_start", {"run_id": run_id, "input_mode": req.input_mode, "resumed": progress["resumed"]}, run_id)
         logger.info(f"[run_pipeline] progress phase={progress['current_phase']} resumed={progress['resumed']}")
@@ -132,7 +134,7 @@ async def run_pipeline(req, run_id: str):
                 logger.exception("[run_pipeline] finally 写 progress.json 失败")
 
 
-async def _heartbeat_loop(progress_path: Path, interval: float = 15.0):
+async def _heartbeat_loop(progress_path: Path, progress_ref: list | None = None, interval: float = 15.0):
     """后台心跳：run 在跑就刷新心跳 + 登记任务历史。
 
     心跳时间戳**只写内存**（state.last_heartbeat），不再重写 progress.json。
@@ -143,16 +145,16 @@ async def _heartbeat_loop(progress_path: Path, interval: float = 15.0):
     超 90s 则报警），不参与任何恢复决策，因此完全不必落盘 ——
     界面从 /api/status 拿到的是内存值，反而更准（没有 fsync 延迟）。
     阶段推进、批次完成等**真正的状态变化**仍照常写 progress.json。
+
+    历史登记不再重读 progress.json：用 progress_ref（run_pipeline 载入后填入的
+    单元素列表）拿内存引用，避免每 15s 全量解析几十 MB JSON 还持锁。
     """
     while True:
         await asyncio.sleep(interval)
         try:
             state.last_heartbeat = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            async with state.progress_lock:
-                if not progress_path.exists():
-                    continue
-                progress = json.loads(progress_path.read_text(encoding='utf-8'))
-                _history_record(progress_path, progress)
+            if progress_ref:
+                _history_record(progress_path, progress_ref[0])
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -389,5 +391,7 @@ async def log_error(progress_path: Path, error, progress: dict | None = None):
             disk.setdefault("error_logs", []).append(entry)
             disk["error_logs"] = disk["error_logs"][-100:]
             atomic_write_json(progress_path, disk)
-    except Exception:
-        pass
+    except Exception as e:
+        # 不能静默：写盘失败时 run_pipeline 的 finally 会用内存副本覆盖 progress.json，
+        # 届时错误原因会彻底丢失，界面只显示「失败」却无因。
+        logger.warning(f"[log_error] 错误事件落盘失败（原因可能丢失）: {e}")

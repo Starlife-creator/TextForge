@@ -26,22 +26,25 @@ dist-ssr
 # Python / åç«¯ï¼ˆvenv å¯é‡å»ºï¼Œä¾èµ–è§ backend/requirements.txtï¼‰
 backend/venv/
 backend/build/
+backend/dist/
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.pytest_cache/
 
-# Rust / Tauri ¹¹½¨²úÎï
+# Rust / Tauri æ„å»ºäº§ç‰©
 src-tauri/target/
-src-tauri/binaries/
+# åªå¿½ç•¥ sidecar äºŒè¿›åˆ¶æœ¬ä½“ï¼›ä¿ç•™ src-tauri/binaries/.gitkeep
+#ï¼ˆå†™æˆå¿½ç•¥æ•´ä¸ªç›®å½•ä¼šè®©å­ç›®å½•é‡Œçš„ `!/binaries/.gitkeep` åæ‚”è§„åˆ™å¤±æ•ˆï¼‰
+src-tauri/binaries/*
 
-# ±ãĞ¯°ü±¾µØ×é×°Ôİ´æÇø
+# ä¾¿æºåŒ…ç»„è£…æš‚å­˜ç›®å½•
 .portable-stage/
 
 backend/*.spec
 
-
-# ±¾µØ×é×°µÄ±ãĞ¯°ü£¨¹¹½¨²úÎï£¬²»Èë¿â£©
+# ä¸çº³å…¥ç‰ˆæœ¬æ§åˆ¶çš„ä¾¿æºåŒ…äº§ç‰©ï¼ˆå¯é‡å»ºï¼‰
 /TextForge/
 /TextForge_*_portable_x64.zip
 /SHA256SUMS.txt
