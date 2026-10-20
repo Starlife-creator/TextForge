@@ -122,7 +122,7 @@ def assess_confidence(text: str, matches: list, mode: str) -> dict:
     from core.splitter import _chapter_number
     nums = [x for x in (_chapter_number(m) for m in matches) if x is not None]
     if len(nums) >= 3:
-        odd = sum(1 for a, b in zip(nums, nums[1:]) if b < a and b != 1)
+        odd = sum(1 for a, b in zip(nums, nums[1:], strict=False) if b < a and b != 1)
         if odd >= 1:
             return {"level": "low",
                     "reason": f"章节编号出现 {odd} 处异常回退，疑似误识别/漏识别",

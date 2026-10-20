@@ -7,14 +7,17 @@ import { connectSSE, disconnectSSE, type SSEHandlers } from './api/sse';
 import SettingsModal from './components/SettingsModal.vue';
 import GateModal from './components/GateModal.vue';
 import RunStats from './components/RunStats.vue';
+import QualityModal from './components/QualityModal.vue';
 import { apiFetch, initAuth } from './api/client';
 import {
   fetchHistory,
   forgetHistory,
   fetchVersions,
   restoreVersion,
+  fetchQualityReport,
   type HistoryItem,
   type VersionInfo,
+  type QualityReport,
 } from './api/system';
 
 // 版本号单一来源：package.json（经 vite define 注入，见 vite.config.ts）
@@ -591,6 +594,34 @@ async function doRestore(v: VersionInfo) {
   }
 }
 
+// ---------- 成品质量报告 ----------
+const showQuality = ref(false);
+const qualityReport = ref<QualityReport | null>(null);
+const qualityBusy = ref(false);
+const qualityError = ref<string | null>(null);
+
+// 报告状态同时出现在按钮上：不必打开弹窗就知道这次成品有没有硬性问题。
+// 数据来自 /api/output/inspect 的轻量 quality 字段，不额外拉整份报告。
+const qualityLabel = computed(() => {
+  const s = outInfo.value?.quality?.status;
+  return s === 'good' ? '通过' : s === 'warn' ? '留意' : s === 'bad' ? '有问题' : '';
+});
+
+async function openQuality() {
+  if (!port.value || !outputPath.value) return;
+  showQuality.value = true;
+  qualityBusy.value = true;
+  qualityError.value = null;
+  try {
+    qualityReport.value = await fetchQualityReport(port.value, outputPath.value);
+  } catch (e: any) {
+    qualityReport.value = null;
+    qualityError.value = e?.message || String(e);
+  } finally {
+    qualityBusy.value = false;
+  }
+}
+
 async function refreshOutInfo() {
   if (!port.value || !outputPath.value) {
     outInfo.value = null;
@@ -843,6 +874,14 @@ function handleSSEEvent(event: string, payload: any) {
       qcIssues.value = payload.issues || [];
       showQcBlock.value = true;
       addLog(`质检未通过（${qcIssues.value.length} 项问题），请决定是否强制导出`, 'err');
+      break;
+    case 'blueprint_progress':
+      // 长书在 phase2 会先把逐批摘要在本地分卷压缩，期间没有流式正文，
+      // 不显示进度的话看起来像卡住了。
+      currentPhase.value = `阶段2：压缩全书摘要 ${payload.done}/${payload.total}`;
+      if (payload.done === payload.total) {
+        addLog(`蓝图摘要第 ${payload.round} 轮压缩完成（${payload.total} 段）`);
+      }
       break;
     case 'blueprint_ready':
       // 已确认过就不再弹（重连重放或轮询竞态会把已关闭的弹窗重新锁上）。
@@ -1781,6 +1820,9 @@ const canStart = computed(
           <button v-if="outputPath && port" class="open-btn ghost" @click="openVersions">
             成品版本
           </button>
+          <button v-if="outputPath && port" class="open-btn ghost" @click="openQuality">
+            质量报告<template v-if="qualityLabel"> · {{ qualityLabel }}</template>
+          </button>
           <button
             v-if="port"
             class="open-btn ghost"
@@ -2077,6 +2119,15 @@ const canStart = computed(
       :busy="versionBusy"
       @restore="doRestore"
       @close="showVersions = false"
+    />
+
+    <!-- 成品质量报告（结构性检查，不替代人工通读） -->
+    <QualityModal
+      v-if="showQuality"
+      :report="qualityReport"
+      :busy="qualityBusy"
+      :error="qualityError"
+      @close="showQuality = false"
     />
 
     <!-- 系统与后端设置 -->

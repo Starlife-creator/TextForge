@@ -64,6 +64,19 @@ def _summarize(output_path: str) -> dict:
             "resumable": bool(phase) and not is_completed(prog),
             "error_logs": (prog.get("error_logs") or [])[-5:],
         })
+    # 质量报告只取头部信息：inspect 会被界面频繁调用，没必要每次把整份
+    # 逐章明细都读进来；完整报告由 /api/output/quality 按需拉取。
+    quality_file = p / "_diagnostics" / "quality_report.json"
+    if quality_file.is_file():
+        try:
+            q = json.loads(quality_file.read_text(encoding="utf-8"))
+            info["quality"] = {
+                "status": q.get("status"),
+                "generated_at": q.get("generated_at"),
+                "headline": q.get("headline"),
+            }
+        except (OSError, json.JSONDecodeError) as e:
+            info["quality_error"] = str(e)[:200]
     return info
 
 
@@ -73,6 +86,22 @@ async def output_inspect(output_path: str = Query(...)):
     if not output_path.strip():
         raise HTTPException(422, "缺少 output_path")
     return _summarize(output_path.strip())
+
+
+@router.get("/api/output/quality")
+async def output_quality(output_path: str = Query(...)):
+    """读取最近一次成品的质量报告。
+
+    没有报告是正常状态（旧版本产出的成品、或报告生成失败），返回 404 让界面
+    明确显示「尚无报告」，而不是拿一个空对象伪装成合格。
+    """
+    if not output_path.strip():
+        raise HTTPException(422, "缺少 output_path")
+    from core.quality import read_quality_report
+    report = read_quality_report(output_path.strip())
+    if report is None:
+        raise HTTPException(404, "尚无质量报告（完成一次重构后生成）")
+    return report
 
 
 def _special_dirs(home: Path) -> set:

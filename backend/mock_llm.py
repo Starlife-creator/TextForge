@@ -14,7 +14,8 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8299
 BREAK = "===CHAPTER_BREAK==="
 
 # 统计各阶段调用次数，便于测试断言
-STATS = {"diagnose": 0, "blueprint": 0, "refactor": 0, "stitch": 0, "total": 0}
+STATS = {"diagnose": 0, "blueprint": 0, "blueprint_map": 0,
+         "refactor": 0, "stitch": 0, "total": 0}
 # 故障注入
 FAIL = {"phase": None, "times": 0, "status": 500, "body": "injected",
         "extra_breaks": 0, "skip": 0, "arm_after": 0}
@@ -38,6 +39,8 @@ def classify(user: str) -> str:
     """
     if "===PREV_END===" in user or "===NEXT_START===" in user:
         return "stitch"                      # 缝合提示词独有标记
+    if "【蓝图分卷摘要任务】" in user:
+        return "blueprint_map"               # phase2 分层压缩独有标记
     if "拆书助手" in user or "候选行：" in user:
         return "split"                       # AI 拆章提示词独有标记
     if "===CHAPTER_BREAK===" in user or "章节之间用" in user:
@@ -91,6 +94,9 @@ def chapter_count(user: str) -> int:
 
 
 def make_text(user: str, phase: str) -> str:
+    if phase == "blueprint_map":
+        # 必须短于输入，否则压缩不收敛、phase2 会退化成抽样。
+        return "分卷脉络：本段主线推进、人物状态变化与未回收伏笔已压缩（mock）。\n"
     if phase == "blueprint":
         return ("《全流程优化建议书》\n"
                 "1. 全书主线脉络：主角从迷茫走向担当，最终完成救赎。\n"

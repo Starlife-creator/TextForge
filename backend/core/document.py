@@ -26,15 +26,15 @@ def write_text_docx(text: str, output_path: str):
     if written == 0:
         # 跳过空段之后，全空白输入会产出一个零段落的空 docx，必须留痕
         logger.warning(f"[docx] 输入全为空白，生成的是空文档: {output_path}")
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=output_path.parent, prefix=output_path.stem + "_", suffix=".docx")
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=out.parent, prefix=out.stem + "_", suffix=".docx")
     try:
         # 原实现先 os.close(fd) 再 doc.save(tmp)：fdopen 失败时 fd 泄漏，
         # 且 Windows 上对已关闭句柄 unlink 会失败，留下孤儿临时文件
         with os.fdopen(fd, 'wb') as f:
             doc.save(f)
-        os.replace(tmp, output_path)
+        os.replace(tmp, out)
     except Exception:
         try:
             if os.path.exists(tmp):

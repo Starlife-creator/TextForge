@@ -1,4 +1,4 @@
-import asyncio, re, hashlib, unicodedata, time, logging, json, shutil
+import asyncio, re, hashlib, unicodedata, logging, json, shutil
 from collections import deque
 from pathlib import Path
 from docx import Document
@@ -240,7 +240,7 @@ def _split_virtual_chapters(chapters, split_dir: Path, chars: float) -> tuple[li
     for ch in chapters:
         text = (split_dir / f"{ch['id']}.txt").read_text(encoding='utf-8', newline='')
         if len(text) >= trigger:
-            segments = _split_by_paragraph(text, max_virtual)
+            segments = _split_by_paragraph(text, int(max_virtual))
             for i, seg in enumerate(segments):
                 # 数字后缀而非字母：同一章切出>26段时 chr(ord('a')+i) 会生成非法 id
                 vid = f"{ch['id']}_{i}"
@@ -264,7 +264,7 @@ def _split_virtual_chapters(chapters, split_dir: Path, chars: float) -> tuple[li
 
 def _segments_from_rule_matches(text: str, matches) -> list:
     """把规则命中的标题位置切成 [(标题, 正文)]。首标题之前的正文归入「序章」。"""
-    segs = []
+    segs: list[tuple[str, str]] = []
     if not matches:
         return segs
     starts = [m.start() for m in matches]
@@ -280,7 +280,7 @@ def _segments_from_rule_matches(text: str, matches) -> list:
 
 def _chapters_from_segments(segs) -> list:
     """[(标题, 正文)] → chapters。filename 只用清理后的标题（短、可排序）。"""
-    chapters = []
+    chapters: list[dict] = []
     for title, body in segs:
         cleaned = _clean_heading(title)
         chapters.append({"id": str(len(chapters) + 1),
@@ -469,7 +469,6 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
     summaries_dir = output_path / "01_summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
     
-    chars = req.context_window * 1.5
     # 单批正文上限按 token 算，并先扣掉蓝图/风格/规则等随行脚手架（见 core.budget）。
     # 旧实现 batch_limit = chars*0.40 只给正文定额，漏算脚手架，实测会发出
     # 远超模型窗口的请求（16038 token vs 本地 8448）→ 直接 400 整批报废。
@@ -691,7 +690,7 @@ def _build_overlap(chapters, prev_chapter_ids, output_path, overlap_limit):
         merged.append((key, "".join(t for _, t in parts)))
     
     result_parts, total = [], 0
-    for key, text in reversed(merged):
+    for _key, text in reversed(merged):
         if total + estimate_tokens(text) > overlap_limit and result_parts:
             break
         result_parts.insert(0, text)

@@ -132,10 +132,10 @@ def fe_handle(events, initial=None):
           "currentPhase": "", "elapsedStarted": False}
     if initial:
         st.update(initial)
-    for ev, data in events:
-        if ev == "run_id":
+    for etype, data in events:
+        if etype == "run_id":
             run_id = data["run_id"]
-        elif ev == "run_start":
+        elif etype == "run_start":
             if data.get("_replay"):
                 st["reconnectLogged"] += 1
                 continue

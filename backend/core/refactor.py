@@ -1,4 +1,4 @@
-import asyncio, json, re, time, logging, html, hashlib
+import asyncio, re, logging, html, hashlib
 from collections import deque
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
@@ -6,7 +6,7 @@ from routes import state
 from routes.events import sse_emit
 from core.stitch import stitch_pipeline
 from core.api_client import (call_with_retry, RetryableBusinessError,
-                             ContextOverflowError, pick_model, pick_endpoint)
+                             ContextOverflowError, pick_endpoint)
 from core.budget import output_token_reserve
 from core.batching import split_batch_in_progress as _split_batch_in_progress
 from utils.tokens import estimate_tokens

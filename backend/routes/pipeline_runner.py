@@ -9,6 +9,7 @@ from core.refactor import phase3_refactor_stitch
 from core.finalize import phase4_finalize
 from utils.atomic import atomic_write_json
 from utils.version import VERSION
+from core.prompt_version import PROMPT_VERSION
 
 logger = logging.getLogger("textforge")
 
@@ -91,7 +92,7 @@ async def run_pipeline(req, run_id: str):
     except RateLimitError as e:
         logger.error(f"[run_pipeline] 429 限流重试用尽 retry_after={e.retry_after}")
         sse_emit("error", {"kind": "rate_limit", "code": 429,
-            "message": f"API 持续限流（429），请稍后再试或降低并发。"}, run_id)
+            "message": "API 持续限流（429），请稍后再试或降低并发。"}, run_id)
         await log_error(progress_path, e, progress)
     except RetryableBusinessError as e:
         # v8.8 修正：重试后用尽的业务格式错误，保留进度以便下次恢复
@@ -232,6 +233,11 @@ def _config_drift(existing: dict, req) -> list[str]:
             str(existing["input_path"]) != str(req.input_path):
         diffs.append(f"输入路径已变更（{existing['input_path']} → {req.input_path}）")
 
+    # 提示词版本只影响尚未生成的阶段；旧 progress 没有该字段时无法判断，跳过。
+    prev_pv = existing.get("prompt_version")
+    if prev_pv and str(prev_pv) != PROMPT_VERSION:
+        diffs.append(f"提示词版本：{prev_pv} → {PROMPT_VERSION}")
+
     # 其余会影响产出的字段：只比较旧 progress 里确实存在的键
     for key, label in (
         ("input_format", "输入格式"),
@@ -370,7 +376,7 @@ async def wait_fix_review(req, progress, progress_path, run_id):
 def _collect_diagnosed_gaps(diag_path: str) -> list:
     """读取 diagnose_json 目录下诊断批次文件的 gaps，汇总为前端可选清单。"""
     diag_dir = Path(diag_path)
-    gaps = []
+    gaps: list[dict] = []
     if not diag_dir.is_dir():
         return gaps
     for f in sorted(diag_dir.glob("diagnose_*.json")):
@@ -404,7 +410,8 @@ def init_progress(req, run_id):
         Path(req.input_path).parent.name if req.input_mode == "single_file" else Path(req.input_path).name
     ) or "重构终稿"
     return {
-        "schema_version": VERSION, "run_id": run_id, "input_mode": req.input_mode,
+        "schema_version": VERSION, "prompt_version": PROMPT_VERSION, "run_id": run_id,
+        "input_mode": req.input_mode,
         "input_format": req.input_format, "input_path": req.input_path, "output_path": req.output_path,
         "api_config": {"api_url": req.api_url, "model": req.model, "context_window": req.context_window},
         "novel_name": novel_name, "rich_text": req.rich_text,

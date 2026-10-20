@@ -2,7 +2,7 @@ from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 from utils.sort import natural_sort_key
 from core.document import write_text_docx
-import shutil, datetime, json, logging
+import shutil, datetime, logging
 
 logger = logging.getLogger("textforge")
 
@@ -128,7 +128,7 @@ def phase4_finalize(output_path: Path, progress: dict, req):
         # 逐章文件名必须去非法字符 + 去重：多文件模式允许 txt/md/docx 混放，
         # 「001.txt」与「001.md」会生成同一个 重构_001.{fmt}，后者静默覆盖前者。
         used = set()
-        for ch, text in zip(original_chapters, merged_texts):
+        for ch, text in zip(original_chapters, merged_texts, strict=False):
             stem = _safe_filename(Path(ch['filename']).stem)
             out_name = f"重构_{stem}.{output_format}"
             if out_name in used:
@@ -144,6 +144,24 @@ def phase4_finalize(output_path: Path, progress: dict, req):
     
     _cleanup_backups(backup_dir)
     write_stitch_report(output_path, progress)
+    # 质量报告是「可核查的成品说明」，但它只是诊断产物：生成失败绝不能
+    # 让已经写完的成品变成一次失败运行。
+    try:
+        from core.quality import build_quality_report, write_quality_report
+        report = build_quality_report(
+            chapters=original_chapters, texts=merged_texts,
+            progress=progress, req=req, output_path=output_path,
+        )
+        report_path = write_quality_report(output_path, report)
+        progress["quality_report"] = {
+            "status": report["status"],
+            "path": str(report_path),
+            "generated_at": report["generated_at"],
+            "issues_by_severity": report["summary"]["issues_by_severity"],
+        }
+        logger.info(f"[finalize] 质量报告 -> {report_path} status={report['status']}")
+    except Exception as e:
+        logger.warning(f"[finalize] 质量报告生成失败（不影响成品）: {e}")
     logger.info(f"[finalize] 输出完成 -> {final_dir}")
 
 def _write_with_backup(output_file: Path, texts: list, ext: str, backup_dir: Path):

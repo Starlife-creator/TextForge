@@ -1,5 +1,4 @@
 import socket, sys, os, time
-from pathlib import Path
 
 IS_DEBUG = os.environ.get("TEXTFORGE_DEBUG", "0") == "1"
 

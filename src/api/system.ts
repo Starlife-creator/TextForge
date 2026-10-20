@@ -175,6 +175,83 @@ export function forgetHistory(port: number, outputPath: string) {
   });
 }
 
+// ---------- 成品质量报告（_diagnostics/quality_report.json） ----------
+
+export type QualityStatus = 'good' | 'warn' | 'bad';
+export type QualitySeverity = 'bad' | 'warn';
+
+export interface QualityIssue {
+  severity: QualitySeverity;
+  code: string;
+  chapter_id: string | null;
+  message: string;
+  evidence: string;
+}
+
+export interface QualityChapterRow {
+  id: string;
+  title: string;
+  original_chars: number;
+  reconstructed_chars: number;
+  ratio: number | null;
+  status: 'ok' | 'warn' | 'bad' | 'skipped';
+  issue_codes: string[];
+}
+
+export interface QualityDuplicate {
+  a: string;
+  b: string;
+  shared_shingles: number;
+  containment: number;
+}
+
+export interface QualityReport {
+  schema: number;
+  generated_at: string;
+  status: QualityStatus;
+  headline: string;
+  summary: {
+    chapters: number;
+    chapters_reconstructed: number;
+    chapters_skipped_empty: number;
+    chapters_with_issues: number;
+    total_original_chars: number;
+    total_reconstructed_chars: number;
+    length_ratio: number | null;
+    duplicate_pairs: number;
+    empty_chapters: number;
+    residual_markers: number;
+    placeholder_hits: number;
+    forbidden_hits: number;
+    old_name_hits: number;
+    issues_by_severity: Record<QualitySeverity, number>;
+  };
+  issues: QualityIssue[];
+  issues_truncated: boolean;
+  chapters: QualityChapterRow[];
+  duplicates: QualityDuplicate[];
+  config: {
+    novel_name?: string | null;
+    model?: string | null;
+    context_window?: number | null;
+    input_mode?: string | null;
+    input_format?: string | null;
+    refactor_mode?: string | null;
+    refactor_gates?: Record<string, boolean>;
+    prompt_version?: string | null;
+    forbidden_canon_count?: number;
+    name_map_count?: number;
+    forbidden_check?: string;
+  };
+  usage: { prompt_tokens?: number | string; completion_tokens?: number | string };
+  caveat: string;
+}
+
+export function fetchQualityReport(port: number, outputPath: string) {
+  const q = new URLSearchParams({ output_path: outputPath });
+  return req<QualityReport>(port, `/api/output/quality?${q}`);
+}
+
 export interface VersionInfo {
   id: string;
   mtime: number;

@@ -39,7 +39,6 @@ def validate_request_paths(req) -> tuple[Path, Path]:
             raise PathValidationError("输入文件夹中没有 txt/md/docx 文档")
 
     # 输出目录：规范化比较，防止多文件模式输出写进输入目录造成递归污染
-    norm_input = _norm(input_path)
     # 多文件模式输入是目录；单文件模式以其所在目录作为比较基准
     input_base = input_path if req.input_mode == "multi_file" else input_path.parent
     norm_base = _norm(input_base)

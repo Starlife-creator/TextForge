@@ -146,6 +146,7 @@ def _append_log_text(text: str) -> None:
 def _refresh_log_tail(path: Path):
     """把磁盘上的新增字节追加进缓存；返回缓存对象（调用方需持有 _LOG_LOCK）。"""
     st = path.stat()
+    ident: tuple
     if st.st_ino:
         # Windows 上 st_ctime 是创建时间，append 不会变，可用来识别日志轮转；
         # Unix 上 ctime 会随 append 变化，只能依赖 inode。

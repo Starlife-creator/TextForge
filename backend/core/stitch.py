@@ -1,4 +1,4 @@
-import json, re, hashlib, unicodedata, logging
+import asyncio, json, re, hashlib, unicodedata, logging
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 
@@ -241,7 +241,12 @@ def _record_anchors(progress: dict, patches: list, output_path: Path | None = No
     anchors_path = output_path / "_diagnostics" / "stitch_anchors.jsonl"
     anchors_path.parent.mkdir(parents=True, exist_ok=True)
     # 用集合记录本次新增的锚点键，避免同批次内重复写入
-    new_keys = {k for p in patches if (k := _anchor_key(p)) not in known or known.add(k) is None}
+    new_keys = set()
+    for p in patches:
+        k = _anchor_key(p)
+        if k not in known:
+            known.add(k)
+            new_keys.add(k)
     if new_keys:
         with open(anchors_path, "a", encoding="utf-8") as f:
             for p in patches:

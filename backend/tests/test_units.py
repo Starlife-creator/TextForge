@@ -127,3 +127,34 @@ def test_event_stream_unsubscribes_on_early_close():
     finally:
         state.current_run_id = old_run
         events._subscribers.pop(rid, None)
+
+def _pipeline_req(**kw):
+    from types import SimpleNamespace
+    base = dict(
+        model="m", api_url="http://127.0.0.1:1234", context_window=8000,
+        input_path="in.txt", input_mode="single_file", input_format="txt",
+        refactor_mode="full_rewrite", refactor_gates={}, forbidden_canon=[],
+        name_map={}, models={}, diagnose_json=None, fix_list=[],
+        output_path="out", novel_name=None, rich_text=False,
+    )
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
+def test_config_drift_reports_prompt_version_change():
+    from core.prompt_version import PROMPT_VERSION
+    from routes.pipeline_runner import _config_drift
+    diffs = _config_drift({"prompt_version": "old-version", "api_config": {}}, _pipeline_req())
+    assert any("提示词版本" in d and PROMPT_VERSION in d for d in diffs)
+
+
+def test_config_drift_skips_old_progress_without_prompt_version():
+    from routes.pipeline_runner import _config_drift
+    assert _config_drift({"api_config": {}}, _pipeline_req()) == []
+
+
+def test_init_progress_records_prompt_version():
+    from core.prompt_version import PROMPT_VERSION
+    from routes.pipeline_runner import init_progress
+    progress = init_progress(_pipeline_req(), "run-1")
+    assert progress["prompt_version"] == PROMPT_VERSION

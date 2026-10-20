@@ -3,7 +3,7 @@
 这是四轮静态审查都覆盖不到的一类问题：成品 docx 到底对不对。
 用 mock_llm.py 起本地 OpenAI 兼容端点，全程走真实 HTTP，不打桩被测代码。
 """
-import io, json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request
+import json, os, re, shutil, subprocess, sys, tempfile, threading, time, urllib.request
 from pathlib import Path
 
 # 控制台编码：本地 Windows 常是 GBK，GitHub runner 是 cp1252，
@@ -428,6 +428,18 @@ try:
           not any("缝合" in p.name for p in outs), str([p.name for p in outs]))
     check("_diagnostics 里有缝合报告",
           (outd / "_diagnostics" / "缝合补丁报告.json").exists())
+    qpath = outd / "_diagnostics" / "quality_report.json"
+    check("_diagnostics 里有质量报告", qpath.exists())
+    quality = json.loads(qpath.read_text(encoding="utf-8")) if qpath.exists() else {}
+    check("质量报告覆盖全部章节",
+          quality.get("summary", {}).get("chapters") == 6
+          and quality.get("status") in ("good", "warn", "bad"),
+          str(quality.get("summary")))
+    qr = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(outd))}")
+    check("/api/output/quality 返回同一份报告",
+          qr.get("summary", {}).get("chapters") == 6, str(qr.get("summary")))
+    inspect = get(f"{B}/api/output/inspect?output_path={urllib.request.quote(str(outd))}")
+    check("inspect 带出质量状态", inspect.get("quality", {}).get("status") == quality.get("status"))
     check("03_final 只有交付物（无非 txt/md/docx 文件）",
           all(p.suffix.lower() in (".txt", ".md", ".docx") for p in outs if p.is_file()),
           str([p.name for p in outs]))

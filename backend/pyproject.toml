@@ -1,26 +1,17 @@
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-select = [
-    "E",   # pycodestyle errors
-    "W",   # pycodestyle warnings
-    "F",   # pyflakes
-    "I",   # isort
-    "UP",  # pyupgrade
-    "B",   # flake8-bugbear
-    "C4",  # flake8-comprehensions
-    "T20", # print statements
-]
+
+[tool.ruff.lint]
+# 只保留能抓真实缺陷的规则：语法错误、pyflakes（未定义/未使用）、bugbear。
+# 既有代码大量使用单行多语句、且在 setup_logging 之后才导入路由，
+# 风格类规则（E4/E7/I/UP）一开就会在历史代码上永久变红，失去信号价值。
+select = ["E9", "F", "B"]
 ignore = [
-    "E501",  # line too long (handled by formatter)
-    "B008",  # function call in default argument
-    "T201",  # print statements allowed in scripts
+    "B008",  # FastAPI 依赖注入的默认参数
+    "B904",  # 旧代码的 raise ... from 风格，单独治理
 ]
-[tool.ruff.per-file-ignores]
-"tests/*" = ["S101", "T201"]
-"backend/regression_test.py" = ["T201", "S101"]
-"backend/test_*.py" = ["T201", "S101"]
-"backend/mock_llm.py" = ["T201"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"

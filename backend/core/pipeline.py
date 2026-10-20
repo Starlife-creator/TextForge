@@ -1,8 +1,9 @@
-import asyncio, json, time, logging
+import asyncio, logging
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
 from routes.events import sse_emit
+from core.prompt_version import PROMPT_VERSION
 
 logger = logging.getLogger("textforge")
 
@@ -36,40 +37,52 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
                 atomic_write_json(progress_path, progress)
             return
 
-    summaries_dir = output_path / "01_summaries"
-    summary_files = sorted(summaries_dir.glob("batch_*.txt"))
-    all_summaries = "\n\n---\n\n".join(f.read_text(encoding='utf-8') for f in summary_files)
-    
+    # 提示词版本随 run 落盘：续跑时若与上次不同，_config_drift 会提示
+    # 「前几批用旧提示词、后几批用新提示词」，而不是静默混用。
+    progress['prompt_version'] = PROMPT_VERSION
+
     chars = req.context_window * 1.5
-    max_total = chars * 0.60
     blueprint_max = min(5000, max(2000, int(chars * 0.05)))
-    
-    if len(all_summaries) > max_total:
-        all_summaries = all_summaries[:int(max_total)]
-        sse_emit("error", {"kind": "warning", "code": "summaries_truncated",
-            "message": f"摘要超长，已截断到 {int(max_total)} 字"}, run_id)
-    
-    prompt = f"""你是一位顶尖的小说架构师和文学总编。请将这些碎片信息汇总，生成一份高度凝练的"全流程优化建议书"。
+
+    from core.blueprint import build_blueprint_context
+    from core.api_client import call_with_retry, make_httpx_client, pick_endpoint
+    ep = pick_endpoint(req, "blueprint")
+    async with make_httpx_client(req, api_url=ep["api_url"], api_key=ep["api_key"]) as client:
+        async def map_call(prompt_text: str, target_chars: int) -> str:
+            # 分卷压缩不往前端推流：用户要看的是最终蓝图，不是中间产物
+            payload = {"model": ep["model"], "messages": [{"role": "user", "content": prompt_text}],
+                "temperature": req.temperatures.blueprint,
+                "max_tokens": max(256, int(target_chars * 2)), "stream": True}
+            map_result, map_usage, _ = await call_with_retry(
+                client, ep["api_url"], payload, None, run_id)
+            _add_usage(progress, map_usage)
+            return map_result
+
+        all_summaries, _ctx_meta = await build_blueprint_context(
+            output_path=output_path, req=req, progress=progress, map_call=map_call,
+            prompt_version=PROMPT_VERSION, model=ep["model"],
+            emit=lambda ev, data: sse_emit(ev, data, run_id),
+        )
+
+        prompt = f"""你是一位顶尖的小说架构师和文学总编。请将这些碎片信息汇总，生成一份高度凝练的"全流程优化建议书"。
 这份建议书将作为后续AI重构的系统提示词，因此必须控制在 {blueprint_max} 字以内。
 请输出以下四个部分：
 1. 全书主线脉络（起承转合四大阶段的核心剧情走向）
 2. 主角人物弧光（主角的性格起点、关键转变节点、最终归宿）
 3. 核心逻辑漏洞与缝合方案（列出最需要修复的3-5个跨章节逻辑断层）
 4. 全书基调与重构方向（文风、节奏、去AI味的具体要求）
+只依据下面提供的材料，不要编造材料中没有的情节或设定。
 
 【作者特殊风格要求】
 {req.author_style}
 
-【所有章节摘要】
+【全书章节摘要（按时间顺序；如为分卷脉络，仍覆盖全书首尾）】
 {all_summaries}
 """
-    
-    from core.api_client import call_with_retry, make_httpx_client, pick_endpoint
-    ep = pick_endpoint(req, "blueprint")
-    async with make_httpx_client(req, api_url=ep["api_url"], api_key=ep["api_key"]) as client:
         payload = {"model": ep["model"], "messages": [{"role": "user", "content": prompt}],
             "temperature": req.temperatures.blueprint, "max_tokens": blueprint_max * 2, "stream": True}
         result, usage, _ = await call_with_retry(client, ep["api_url"], payload, sse_emit, run_id)
+        _add_usage(progress, usage)
     
     atomic_write_text(story_bible, result)
     # 顺序至关重要：**先清标志，再落盘 phase2_waiting**。
@@ -95,3 +108,17 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
     progress['current_phase'] = 'phase3-1'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
+
+
+def _add_usage(progress: dict, usage: dict | None) -> None:
+    """把本次调用消耗并进 progress.usage（phase2 原先完全没记账）。"""
+    if not isinstance(usage, dict):
+        return
+    acc = progress.setdefault(
+        "usage", {"prompt_tokens": 0, "completion_tokens": 0, "estimated": False}
+    )
+    for key in ("prompt_tokens", "completion_tokens"):
+        try:
+            acc[key] = int(acc.get(key, 0) or 0) + int(usage.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            pass

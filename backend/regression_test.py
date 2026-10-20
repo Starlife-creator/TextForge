@@ -10,7 +10,7 @@
   7. 缝合锚点去重、虚拟章 output_file 推导
   8. 自然排序、逐章成品去重、docx 段尾空行
 """
-import asyncio, json, os, shutil, sys, tempfile, time
+import asyncio, json, os, shutil, sys, tempfile
 from pathlib import Path
 
 # 控制台编码：本地 Windows 常是 GBK，GitHub runner 是 cp1252，
@@ -231,7 +231,6 @@ check("docx 段尾无多余换行", texts == ["第一段第一行\n第一段第�
 check("docx 跳过空段", all(t.strip() for t in texts), str(texts))
 
 # ---------- 11. 逐章成品去重 ----------
-import core.finalize as F
 src_fin = (Path(__file__).parent / "core" / "finalize.py").read_text(encoding="utf-8")
 check("finalize.py 含成品名去重逻辑", "used = set()" in src_fin)
 
@@ -240,7 +239,7 @@ class _Req:
     api_url = "http://127.0.0.1:1234/v1/chat/completions"
     api_key = "SECRET-CLOUD-KEY"
     model = "m"
-from core.api_client import pick_endpoint, _same_provider
+from core.api_client import pick_endpoint
 
 _SAME_HOST_CASES = [
     ("http://127.0.0.1:1234/v1/chat/completions", "http://127.0.0.1:1234/api/v1/chat/completions", "同 host 不同路径"),
@@ -371,7 +370,7 @@ for d in (tmp, _logdir):
     shutil.rmtree(d, ignore_errors=True)
 
 # ---------- 分隔符契约：提示词必须写明章数，且重试必须带纠正信息 ----------
-from core.refactor import _build_refactor_prompt, _common_tail, _break_feedback
+from core.refactor import _build_refactor_prompt, _break_feedback
 
 _p4 = _build_refactor_prompt("full_rewrite", "BP", "风格", "正文", n_chapters=4)
 check("提示词写明本批共 4 章", "共 **4 章**" in _p4, _p4[-400:])
@@ -454,7 +453,7 @@ check("契约错误最多重试 1 次后放弃", _calls["n"] == 2, f"调用 {_ca
 AC._stream_call = _real_stream
 
 # ---------- 章节识别：9 种真实排版必须命中，正文提及不得误报 ----------
-from core.splitter import detect_chapters, CHAPTER_PATTERN
+from core.splitter import detect_chapters
 
 _CN = ['一', '二', '三', '四']
 _detect_cases = {
@@ -478,7 +477,7 @@ _detect_cases = {
     "──破折线──":     "\n".join(f"\u2500\u2500第{n}章\u2500\u2500" for n in _CN),
     "破折号分隔":      "\n".join(f"第{n}章——初入" for n in _CN),
     "无分隔紧接":      "\n".join(f"第{n}章初入" for n in _CN),
-    "回卷篇折多单位":  "\n".join(f"第{n}{u} 初入" for n, u in zip(_CN, ["回", "卷", "篇", "折"])),
+    "回卷篇折多单位":  "\n".join(f"第{n}{u} 初入" for n, u in zip(_CN, ["回", "卷", "篇", "折"], strict=False)),
     "英文 Chapter":    "\n".join(f"Chapter {i} Title" for i in range(1, 5)),
 }
 for _name, _text in _detect_cases.items():
@@ -668,7 +667,6 @@ check("多项漂移全部检出", len(_d4) == 4, str(_d4))
 # ---------- 重新拆分必须清掉按旧章节绑定的下游产物 ----------
 # 场景：跑了一半（有批次/重构稿/缝合锚点）→ 用户在预览门改用自定义标记重拆。
 # 若不清，下游会拿着旧章节 id 去改新章节文件（缝合错位）。
-import core.splitter as _sp
 from core.splitter import resplit_single_file
 
 class _FakeReq:

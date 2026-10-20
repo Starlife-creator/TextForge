@@ -90,7 +90,7 @@ async def _event_stream(run_id: str | None = None):
     客户端恰好在这几个 yield 断开时（GeneratorExit）不会执行 unsubscribe，
     队列会永远留在 _subscribers 里。
     """
-    q = asyncio.Queue(maxsize=1000)
+    q: asyncio.Queue = asyncio.Queue(maxsize=1000)
     bound: str | None = run_id or None
     try:
         while True:
