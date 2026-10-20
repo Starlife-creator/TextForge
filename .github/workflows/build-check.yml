@@ -88,9 +88,9 @@ jobs:
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-  # ------------------------------------------------------------ 后端单元/回归
+  # ------------------------------------------------------------ 后端单元/回归/代码质量
   backend-unit:
-    name: 后端单测 / 回归 / 事件流
+    name: 后端单测 / 回归 / 事件流 / 代码质量
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -102,7 +102,7 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: backend/requirements-dev.txt
 
       - name: 准备虚拟环境
         shell: bash
@@ -111,8 +111,21 @@ jobs:
           python -m venv venv
           source venv/Scripts/activate
           pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
+          pip install -r requirements-dev.txt
+
+      - name: 后端 Lint (ruff)
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          ruff check .
+
+      - name: 后端类型检查 (mypy)
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          mypy --config-file mypy.ini .
 
       - name: pytest
         shell: bash

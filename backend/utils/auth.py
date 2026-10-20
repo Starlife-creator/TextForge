@@ -17,10 +17,11 @@
 
 这样：别的本地进程读不到 token；恶意网页更读不到。
 
-## 为什么没配置时放行
-TEXTFORGE_TOKEN 未设置 = 开发/测试模式，直接放行。否则单元测试和 e2e
-（它们直接起 python main.py、不经过外壳）会被 401 拦死。
-生产路径上外壳一定会注入，不存在「忘了配就裸奔」。
+## 为什么没配置时默认拒绝
+TEXTFORGE_TOKEN 未设置 = 生产默认拒绝（安全优先）。仅当显式设置
+TEXTFORGE_DEV=1 时放行（开发/测试模式）。这样便携包里的 backend.exe
+被手动双击启动时也会拒绝匿名请求，避免任意本地网页/进程调用 API。
+单元测试和 e2e 通过显式设置 TEXTFORGE_DEV=1 绕过鉴权。
 """
 
 import hmac
@@ -34,12 +35,15 @@ HEADER = "X-TextForge-Token"
 _EXEMPT = {"/api/health"}
 
 
-def expected_token():
-    """当前期望的 token；None 表示未启用鉴权（开发/测试）。"""
+def expected_token() -> str | None:
+    """当前期望的 token；None 表示未配置（生产模式下将拒绝请求）。"""
     return os.environ.get(ENV_KEY) or None
 
 
 def is_enforced() -> bool:
+    """是否启用鉴权：生产默认开启，仅当 TEXTFORGE_DEV=1 时关闭。"""
+    if os.environ.get("TEXTFORGE_DEV") == "1":
+        return False
     return expected_token() is not None
 
 

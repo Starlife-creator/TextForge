@@ -1,8 +1,9 @@
 from fastapi import APIRouter
 from pathlib import Path
 from collections import OrderedDict
-import json, logging
+import json, logging, os
 from routes import state
+from utils.progress_io import is_completed
 
 router = APIRouter()
 logger = logging.getLogger("textforge")
@@ -14,6 +15,10 @@ logger = logging.getLogger("textforge")
 # 许多输出目录时无限累积内存。纯同步、只在事件循环里访问，故无需加锁。
 _MAX_PROGRESS_CACHE = 8
 _PROGRESS_CACHE: "OrderedDict[str, tuple[tuple[int, int], dict]]" = OrderedDict()
+
+# 摘要预览缓存：按 (mtime_ns, size) 缓存前 200 字预览
+_MAX_SUMMARY_CACHE = 32
+_SUMMARY_CACHE: "OrderedDict[str, tuple[tuple[int, int], str]]" = OrderedDict()
 
 
 def _read_progress_cached(path: Path) -> dict:
@@ -30,6 +35,24 @@ def _read_progress_cached(path: Path) -> dict:
     while len(_PROGRESS_CACHE) > _MAX_PROGRESS_CACHE:
         _PROGRESS_CACHE.popitem(last=False)
     return data
+
+
+def _get_summary_preview(path: Path) -> str:
+    """返回文件前 200 字预览，带 LRU 缓存（按 mtime_ns+size 失效）。"""
+    st = path.stat()
+    key = str(path)
+    stamp = (st.st_mtime_ns, st.st_size)
+    cached = _SUMMARY_CACHE.get(key)
+    if cached is not None and cached[0] == stamp:
+        _SUMMARY_CACHE.move_to_end(key)
+        return cached[1]
+    txt = path.read_text(encoding='utf-8', errors='replace')
+    preview = txt[:200]
+    _SUMMARY_CACHE[key] = (stamp, preview)
+    _SUMMARY_CACHE.move_to_end(key)
+    while len(_SUMMARY_CACHE) > _MAX_SUMMARY_CACHE:
+        _SUMMARY_CACHE.popitem(last=False)
+    return preview
 
 
 @router.get("/api/status")
@@ -55,10 +78,14 @@ async def status(output_path: str | None = None):
     batches = progress.get("batches", [])
     # #2 章级进度：按逻辑章（虚拟章组折叠到父章）统计总数与已重构数
     logic_ids = _logic_chapter_ids(progress.get("chapters", []))
-    reconstructed = sum(
-        1 for oid in logic_ids
-        if (Path(target) / "02_workspace/reconstructed" / f"chapter_{oid}.txt").exists()
-    )
+    # 一次性扫描 reconstructed 目录，避免逐章 Path.exists() 产生 O(n) 个 stat 调用
+    recon_dir = Path(target) / "02_workspace/reconstructed"
+    recon_files = set()
+    if recon_dir.is_dir():
+        for entry in os.scandir(recon_dir):
+            if entry.name.startswith("chapter_") and entry.name.endswith(".txt"):
+                recon_files.add(entry.name[:-4])  # 去掉 .txt
+    reconstructed = sum(1 for oid in logic_ids if f"chapter_{oid}" in recon_files)
     data = {
         "pipeline_running": state.pipeline_running,
         "paused": paused,
@@ -74,6 +101,8 @@ async def status(output_path: str | None = None):
         "total_logic_chapters": len(logic_ids),
         "reconstructed_chapters": reconstructed,
         "resumed": progress.get("resumed", False),
+        # 前端据此在 done 事件丢失时靠轮询收尾；finished_at 不能作为完成判据
+        "completed": is_completed(progress),
         "blueprint_confirmed": progress.get("blueprint_confirmed", False),
         "usage": progress.get("usage", {}),
         "last_heartbeat": state.last_heartbeat or progress.get("last_heartbeat"),
@@ -96,15 +125,14 @@ async def status(output_path: str | None = None):
     if summaries_dir.is_dir():
         prev = []
         for f in sorted(summaries_dir.glob("batch_*.txt")):
-            txt = f.read_text(encoding='utf-8', errors='replace')
-            prev.append({"name": f.name, "preview": txt[:200]})
+            prev.append({"name": f.name, "preview": _get_summary_preview(f)})
         if prev:
             data["summaries"] = prev
 
     # B3：刷新后恢复等待态
-    data["resume"] = _build_resume(progress, target)
+    data["resume"] = _build_resume(progress, target, recon_files)
     # A3：章节概览（逻辑章折叠到父章，去重）
-    data["chapters_summary"] = _chapter_summary(progress, target)
+    data["chapters_summary"] = _chapter_summary(progress, recon_files)
     return data
 
 
@@ -128,7 +156,7 @@ def _read_diag_gaps(diag_path):
     return gaps
 
 
-def _build_resume(progress, target):
+def _build_resume(progress, target, recon_files: set[str] | None = None):
     """按当前等待阶段返回可重开弹窗所需的前端数据，否则 None。
 
     必须覆盖**所有**会无限等待的闸门阶段：wait_split_confirm 是无界 while，
@@ -150,8 +178,11 @@ def _build_resume(progress, target):
             for b in progress.get("batches", []):
                 if b.get("batch_id") == pend:
                     for cid in b.get("chapter_ids", []):
-                        pf = Path(target) / "02_workspace/reconstructed" / f"chapter_{cid}.txt"
-                        preview = pf.read_text(encoding="utf-8", errors="replace")[:80] if pf.exists() else ""
+                        # 使用 recon_files 缓存避免逐文件 stat
+                        preview = ""
+                        if recon_files is not None and f"chapter_{cid}" in recon_files:
+                            pf = Path(target) / "02_workspace/reconstructed" / f"chapter_{cid}.txt"
+                            preview = pf.read_text(encoding="utf-8", errors="replace")[:80]
                         chapters.append({"id": cid, "preview": preview})
                     break
         return {"key": "accept", "batch_id": pend, "chapters": chapters}
@@ -177,7 +208,7 @@ def _logic_chapter_ids(chapters) -> list:
     return ids
 
 
-def _chapter_summary(progress, target) -> list:
+def _chapter_summary(progress, recon_files: set[str] | None = None) -> list:
     """A3：逻辑章概览 [{id, label, status}]。status ∈ pending|reconstructed。"""
     seen = set()
     rows = []
@@ -191,7 +222,7 @@ def _chapter_summary(progress, target) -> list:
         if not out_id or out_id in seen:
             continue
         seen.add(out_id)
-        recon = (Path(target) / "02_workspace/reconstructed" / f"chapter_{out_id}.txt").exists()
+        recon = recon_files is not None and f"chapter_{out_id}" in recon_files
         rows.append({
             "id": out_id,
             "label": ch.get("title") or ch.get("filename") or str(out_id),
@@ -217,15 +248,26 @@ async def final_files(output_path: str):
 
 
 @router.get("/api/comparisons")
-async def comparisons(output_path: str):
-    """C1：列出 00_comparison 左右对照 md 文件及其原文（前端转义渲染）。"""
+async def comparisons(output_path: str, name: str | None = None):
+    """C1：列出 00_comparison 左右对照 md 文件及其原文（前端转义渲染）。
+
+    支持按需加载：
+    - 不带 name：返回文件列表（不含正文），供前端下拉选择
+    - 带 name：返回单个文件的完整正文
+    """
     comp_dir = Path(output_path) / "00_comparison"
     if not comp_dir.is_dir():
+        return {"items": []} if name is None else {"items": []}
+
+    if name is not None:
+        # 单文件懒加载
+        f = comp_dir / name
+        if f.is_file() and f.suffix.lower() == ".md" and f.name.startswith("chapter_"):
+            return {"items": [{"name": f.name, "text": f.read_text(encoding='utf-8', errors='replace')}]}
         return {"items": []}
+
+    # 列表模式：只返回文件名和大小，不读正文
     items = []
     for f in sorted(comp_dir.glob("chapter_*.comparison.md")):
-        items.append({
-            "name": f.name,
-            "text": f.read_text(encoding='utf-8', errors='replace'),
-        })
+        items.append({"name": f.name, "size": f.stat().st_size})
     return {"items": items}

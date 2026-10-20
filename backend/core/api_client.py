@@ -326,9 +326,11 @@ async def _stream_call(client, api_url, payload, sse_emit_fn, run_id):
     return text, usage
 
 def _process_sse_line(line, full_text, usage):
-    if not line or not line.startswith("data: "):
+    # SSE 规范允许冒号后不带空格（`data:{...}`）；只认 `data: ` 会把这类
+    # 完全合法的服务端响应当成空内容，最终抛 EmptyContentError。
+    if not line or not line.startswith("data:"):
         return None
-    data = line[6:]
+    data = line[5:].lstrip(" ")
     if data == "[DONE]":
         return None
     try:

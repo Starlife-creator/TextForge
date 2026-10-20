@@ -10,6 +10,8 @@ from pathlib import Path
 from core.splitter import _parse_diag_json
 from core.refactor import _render_gate_rules, _iter_output_chapter_ids, _run_qc
 from core.stitch import _is_hard_break
+from core.api_client import _process_sse_line
+from utils.progress_io import is_completed
 
 
 def test_parse_diag_json_fenced():
@@ -67,3 +69,61 @@ def test_is_hard_break():
     assert _is_hard_break("Chapter 12\n正文")
     assert _is_hard_break("---\n正文")
     assert not _is_hard_break("他推开门走了进去。\n\n大厅里空无一人。")
+
+
+def test_is_completed_explicit_flag_wins():
+    # 失败/停止：finished_at 有值、phase4 有值，但 completed=false，不能算完成
+    assert not is_completed({"completed": False, "finished_at": "2026-01-01T00:00:00Z",
+                             "current_phase": "phase4"})
+    assert is_completed({"completed": True, "finished_at": "2026-01-01T00:00:00Z",
+                         "current_phase": "phase4"})
+
+
+def test_is_completed_legacy_fallback():
+    # 旧 progress 没有 completed 字段：沿用 phase4 + finished_at 判定
+    assert is_completed({"finished_at": "2026-01-01T00:00:00Z", "current_phase": "phase4"})
+    assert not is_completed({"finished_at": "2026-01-01T00:00:00Z", "current_phase": "phase3"})
+    assert not is_completed({"current_phase": "phase4"})
+
+
+def test_sse_data_without_space():
+    full, usage = [], {}
+    chunk = _process_sse_line('data:{"choices":[{"delta":{"content":"你好"}}]}', full, usage)
+    assert chunk == "你好" and "".join(full) == "你好"
+    assert _process_sse_line("data:[DONE]", full, usage) is None
+
+
+def test_sse_data_with_space_and_usage():
+    full, usage = [], {}
+    line = ('data: {"choices":[{"delta":{"content":"A"}}],'
+            '"usage":{"prompt_tokens":3,"completion_tokens":2}}')
+    assert _process_sse_line(line, full, usage) == "A"
+    assert usage == {"prompt_tokens": 3, "completion_tokens": 2}
+
+
+def test_event_stream_unsubscribes_on_early_close():
+    """客户端在 run_id/replay 的 yield 处断开时，订阅也必须被移除。
+
+    这正是原实现的泄漏窗口：注册在 try/finally 之外，GeneratorExit 不会触发
+    unsubscribe，队列会永久留在 _subscribers 里。
+    """
+    import asyncio
+    from routes import events, state
+
+    old_run = state.current_run_id
+    rid = "test-unsubscribe"
+    state.current_run_id = rid
+
+    async def scenario():
+        agen = events._event_stream(rid)
+        first = await anext(agen)
+        assert "event: run_id" in first
+        assert rid in events._subscribers
+        await agen.aclose()
+        assert rid not in events._subscribers
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        state.current_run_id = old_run
+        events._subscribers.pop(rid, None)

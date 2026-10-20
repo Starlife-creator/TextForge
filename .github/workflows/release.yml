@@ -47,8 +47,62 @@ jobs:
       - name: Lint
         run: npm run lint
 
+  # 后端测试门：确保 release 前后端也通过测试
+  backend-test:
+    name: 后端发布前测试
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: 准备虚拟环境
+        shell: bash
+        run: |
+          cd backend
+          python -m venv venv
+          source venv/Scripts/activate
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: 后端 Lint (ruff)
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          ruff check .
+
+      - name: 后端类型检查 (mypy)
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          mypy --config-file mypy.ini .
+
+      - name: pytest
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          python -m pytest tests -q
+
+      - name: 回归 / 事件流
+        shell: bash
+        run: |
+          cd backend
+          source venv/Scripts/activate
+          python regression_test.py
+          python test_event_stream.py
+
   build-release:
-    needs: test
+    needs: [test, backend-test]
     runs-on: windows-latest
     timeout-minutes: 90
     steps:

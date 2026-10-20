@@ -27,12 +27,33 @@ def write_stitch_report(output_path: Path, progress: dict):
     写到 `_diagnostics/` 而不是 `03_final/`：03_final 是交付目录，
     混进 .json 报告会让「打开成品」把报告当章节列出来（/api/final_files 只能
     靠扩展名过滤，那对 .txt 报告无效）。诊断产物应该和成品分开。
+
+    优先从 stitch_anchors.jsonl 读取完整锚点（含原文/替换文全文）；
+    若不存在则回退到 progress.json 的轻量引用（不含原文/替换文）。
     """
+    import json as _json  # 本地导入确保可用
     diag_dir = output_path / "_diagnostics"
     diag_dir.mkdir(parents=True, exist_ok=True)
-    anchors = progress.get("stitch_anchors", [])
+
+    # 1) 尝试从 JSONL 读取完整锚点（用于生成完整报告）
+    anchors_path = diag_dir / "stitch_anchors.jsonl"
+    full_anchors = []
+    if anchors_path.exists():
+        try:
+            with open(anchors_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        full_anchors.append(_json.loads(line))
+        except (OSError, _json.JSONDecodeError):
+            pass
+
+    # 2) 回退：用 progress 中的轻量引用（无原文/替换文全文）
+    if not full_anchors:
+        full_anchors = progress.get("stitch_anchors", [])
+
     txt_lines = ["缝合补丁报告", "=" * 60, ""]
-    for a in anchors:
+    for a in full_anchors:
         txt_lines.append(f"[{a.get('source', 'unknown')}] {a['file']}")
         txt_lines.append(f"  偏移: {a.get('start')} - {a.get('end')}")
         txt_lines.append(f"  原文: {(a.get('original') or '')[:100]}...")
@@ -40,7 +61,7 @@ def write_stitch_report(output_path: Path, progress: dict):
         txt_lines.append(f"  已应用: {a.get('applied', False)}")
         txt_lines.append("")
     atomic_write_text(diag_dir / "缝合补丁报告.txt", "\n".join(txt_lines))
-    atomic_write_json(diag_dir / "缝合补丁报告.json", {"anchors": anchors})
+    atomic_write_json(diag_dir / "缝合补丁报告.json", {"anchors": full_anchors})
 
 def _safe_filename(name: str) -> str:
     for ch in '<>:"/\\|?*': name = name.replace(ch, '_')

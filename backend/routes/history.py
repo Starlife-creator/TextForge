@@ -22,6 +22,7 @@ from fastapi import APIRouter, Body, HTTPException, Query
 from routes import state
 from utils.appdir import ensure_data_dir
 from utils.atomic import atomic_write_json
+from utils.progress_io import is_completed
 
 logger = logging.getLogger("textforge")
 router = APIRouter()
@@ -98,7 +99,7 @@ def _meta_from_progress(progress: dict) -> dict:
         "total_chapters": len(progress.get("chapters") or []),
         "batches_done": sum(1 for b in batches if b.get("status") == "phase3_done"),
         "batches_total": len(batches),
-        "finished": bool(progress.get("finished_at")),
+        "finished": is_completed(progress),
         "finished_at": progress.get("finished_at"),
         "chapter_detection": progress.get("chapter_detection"),
         "config_drift": progress.get("config_drift") or [],

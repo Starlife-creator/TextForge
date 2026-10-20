@@ -77,36 +77,47 @@ async def events(run_id: str | None = None):
     3) 事件按 seq 过滤 + 改绑时清空队列 —— 否则上一轮 run 的残留事件会被当成
        新 run 的事件应用（例如旧的 error 会把新 run 的轮询停掉并弹红条）。
     """
+    return StreamingResponse(_event_stream(run_id), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                 "Connection": "keep-alive"})
+
+
+async def _event_stream(run_id: str | None = None):
+    """SSE 生成器（独立出来便于测试「断开后订阅必须移除」）。
+
+    关键：**注册订阅之后的所有 yield 都必须在 try/finally 内**。
+    原实现先注册、再 yield run_id/replay，而 try/finally 只包住后面的 while；
+    客户端恰好在这几个 yield 断开时（GeneratorExit）不会执行 unsubscribe，
+    队列会永远留在 _subscribers 里。
+    """
     q = asyncio.Queue(maxsize=1000)
+    bound: str | None = run_id or None
+    try:
+        while True:
+            if bound is None:
+                started = last_beat = time.monotonic()
+                while not state.current_run_id:
+                    if time.monotonic() - started > MAX_WAIT_SEC:
+                        yield _fmt("error", {"kind": "unknown", "code": "no_run",
+                                              "message": "等待 run_id 超时"})
+                        return
+                    await asyncio.sleep(POLL_SEC)
+                    if time.monotonic() - last_beat >= HEARTBEAT_SEC:
+                        last_beat = time.monotonic()
+                        yield ": waiting\n\n"
+                bound = state.current_run_id
 
-    async def gen():
-        nonlocal run_id
-        bound: str | None = run_id or None
-        try:
+            # 快照重放缓冲 → 丢弃队列中已重放的部分 → 再注册订阅。
+            # 顺序保证不会漏（入缓冲先于入队）也不会重（seq 过滤）。
+            replay = list(_recent.get(bound) or ())
+            seen_seq = replay[-1]["seq"] if replay else 0
             while True:
-                if bound is None:
-                    started = last_beat = time.monotonic()
-                    while not state.current_run_id:
-                        if time.monotonic() - started > MAX_WAIT_SEC:
-                            yield _fmt("error", {"kind": "unknown", "code": "no_run",
-                                                  "message": "等待 run_id 超时"})
-                            return
-                        await asyncio.sleep(POLL_SEC)
-                        if time.monotonic() - last_beat >= HEARTBEAT_SEC:
-                            last_beat = time.monotonic()
-                            yield ": waiting\n\n"
-                    bound = state.current_run_id
-
-                # 快照重放缓冲 → 丢弃队列中已重放的部分 → 再注册订阅。
-                # 顺序保证不会漏（入缓冲先于入队）也不会重（seq 过滤）。
-                replay = list(_recent.get(bound) or ())
-                seen_seq = replay[-1]["seq"] if replay else 0
-                while True:
-                    try:
-                        q.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                _subscribers.setdefault(bound, []).append(q)
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            _subscribers.setdefault(bound, []).append(q)
+            try:
                 yield _fmt("run_id", {"run_id": bound})
                 for item in replay:
                     # 必须由服务端标记「这是重放」。
@@ -118,37 +129,32 @@ async def events(run_id: str | None = None):
 
                 switched = False
                 last_beat = time.monotonic()
-                try:
-                    while not switched:
-                        try:
-                            item = await asyncio.wait_for(q.get(), timeout=POLL_SEC)
-                        except asyncio.TimeoutError:
-                            if time.monotonic() - last_beat >= HEARTBEAT_SEC:
-                                last_beat = time.monotonic()
-                                yield ": heartbeat\n\n"
-                            switched = state.current_run_id != bound
-                            continue
-                        # 必须先判切换、再投送。反过来的话，队列里上一轮 run 的
-                        # 残留事件（比如一条 error）会在发现切换之前被 yield 出去，
-                        # 被前端当成新 run 的事件处理 —— 停掉新 run 的轮询并弹红条。
-                        if state.current_run_id != bound:
-                            switched = True
-                            break
-                        if item["seq"] <= seen_seq:
-                            continue          # 已在重放阶段投送过
-                        if item["run_id"] != bound:
-                            continue          # 理论上到不了这里，防御性保留
-                        seen_seq = item["seq"]
-                        yield _fmt(item["event"], item["data"])
-                finally:
-                    _unsubscribe(bound, q)
+                while not switched:
+                    try:
+                        item = await asyncio.wait_for(q.get(), timeout=POLL_SEC)
+                    except asyncio.TimeoutError:
+                        if time.monotonic() - last_beat >= HEARTBEAT_SEC:
+                            last_beat = time.monotonic()
+                            yield ": heartbeat\n\n"
+                        switched = state.current_run_id != bound
+                        continue
+                    # 必须先判切换、再投送。反过来的话，队列里上一轮 run 的
+                    # 残留事件（比如一条 error）会在发现切换之前被 yield 出去，
+                    # 被前端当成新 run 的事件处理 —— 停掉新 run 的轮询并弹红条。
+                    if state.current_run_id != bound:
+                        switched = True
+                        break
+                    if item["seq"] <= seen_seq:
+                        continue          # 已在重放阶段投送过
+                    if item["run_id"] != bound:
+                        continue          # 理论上到不了这里，防御性保留
+                    seen_seq = item["seq"]
+                    yield _fmt(item["event"], item["data"])
+            finally:
+                _unsubscribe(bound, q)
 
-                if not switched:
-                    return
-                bound = None  # 跟随新的 current_run_id
-        except asyncio.CancelledError:
-            return
-
-    return StreamingResponse(gen(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                 "Connection": "keep-alive"})
+            if not switched:
+                return
+            bound = None  # 跟随新的 current_run_id
+    except asyncio.CancelledError:
+        return

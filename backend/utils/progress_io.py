@@ -47,3 +47,20 @@ def try_read_progress(path: Path):
     if not p.exists():
         return None
     return read_progress(p)
+
+
+def is_completed(progress: dict) -> bool:
+    """判断一次 run 是否真正走完了 phase4。
+
+    不能再用 `bool(finished_at)`：finally 在失败/停止时也会写这个时间戳，
+    否则历史会把中断任务显示成「已完成」。`completed` 只允许在
+    phase4_finalize 成功返回后置 true。
+
+    旧版本 progress 没有该字段：回退到「phase4 + finished_at」以保持兼容。
+    旧数据里 phase4 中途失败的情况无法区分，但新 run 一律以显式字段为准。
+    """
+    if not isinstance(progress, dict):
+        return False
+    if "completed" in progress:
+        return bool(progress.get("completed"))
+    return bool(progress.get("finished_at")) and progress.get("current_phase") == "phase4"

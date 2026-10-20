@@ -2,9 +2,9 @@
 REM ============================================================
 REM TextForge 后端 Sidecar 构建脚本（Windows x86_64）
 REM
-REM 前置：backend\venv 中已安装 pyinstaller（pip install pyinstaller）
+REM 前置：backend\venv 中已安装 requirements-dev.txt 中的所有依赖（含 pyinstaller）
 REM 产物：src-tauri\binaries\backend-x86_64-pc-windows-msvc.exe
-REM       src-tauri\binaries\backend-onedir\  （exe 同级的 _internal，供便携包组装）
+REM       src-tauri\binaries\backend-ondir\  （exe 同级的 _internal，供便携包组装）
 REM ============================================================
 setlocal
 cd /d "%~dp0"
@@ -12,8 +12,8 @@ cd /d "%~dp0"
 echo [1/4] 检查 PyInstaller...
 venv\Scripts\python.exe -m PyInstaller --version >nul 2>&1
 if errorlevel 1 (
-    echo PyInstaller 未安装，正在安装...
-    venv\Scripts\pip.exe install pyinstaller || goto :fail
+    echo PyInstaller 未安装，正在从 requirements-dev.txt 安装...
+    venv\Scripts\pip.exe install -r requirements-dev.txt || goto :fail
 )
 
 REM ---- 为什么用 --onedir 而不是 --onefile ----

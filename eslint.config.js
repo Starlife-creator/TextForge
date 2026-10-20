@@ -27,6 +27,8 @@ export default defineConfigWithVueTs(
       // 后端返回的是动态 JSON，接口层大量使用 any 是有意为之；类型安全由
       // `vue-tsc --noEmit`（npm run build 里）把关，这里不重复报错。
       '@typescript-eslint/no-explicit-any': 'off',
+      // 允许以下划线开头的变量/参数（如 `_showSettings`）被标记为故意未使用
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
     },
   },
   {

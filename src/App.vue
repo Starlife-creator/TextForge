@@ -661,7 +661,20 @@ async function fetchStatus(): Promise<boolean> {
     // 没有 else。后端进程一死，fetch 抛异常被空 catch 吞掉，pipelineRunning 就永远
     // 卡在 true → canStart 恒 false → .panel.config.disabled 的 pointer-events:none
     // 把整个配置面板冻住，只能刷新页面。
+    const wasRunning = pipelineRunning.value;
     pipelineRunning.value = !!s.pipeline_running;
+    // done 事件可能因网络抖动丢失；状态里的 completed 是权威终态。
+    // 只在本轮确实认为「还在跑」时收尾，避免页面加载一个已完成目录时反复弹提示。
+    if (s.completed && wasRunning) {
+      currentPhase.value = '完成';
+      closeAllGates();
+      stopStatusPolling();
+      topTip.value = `全部完成！成品在：${outputPath.value}\\03_final`;
+      addLog('全部完成（已从状态轮询确认）', 'ok');
+      stopElapsed();
+      refreshHistory();
+      refreshOutInfo();
+    }
     // B4：僵尸检测。后端已改为后台任务每 10s 刷新心跳（覆盖 LLM 调用期间），
     // 所以 90s 阈值现在是真的「进程卡死」，不会再在跑大批次时误报。
     zombieWarn.value = !!(

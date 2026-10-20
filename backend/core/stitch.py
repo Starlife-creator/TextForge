@@ -1,4 +1,4 @@
-import re, hashlib, unicodedata, logging
+import json, re, hashlib, unicodedata, logging
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 
@@ -202,23 +202,55 @@ def merge_virtual_chapters(virtuals_sorted, output_path, progress):
     return rel
 
 def _anchor_key(p: dict) -> tuple:
-    """缝合锚点的唯一标识：文件 + 原文指纹 + 替换文指纹。"""
-    return (p.get("file"), (p.get("original") or "")[:200], (p.get("replacement") or "")[:200])
+    """缝合锚点的唯一标识：文件 + 原文哈希。
 
-def _record_anchors(progress: dict, patches: list) -> None:
+    使用 before_hash 而非原文片段，因为 progress.json 仅保存轻量引用（含 before_hash，
+    不含 original/replacement 全文），且哈希更稳定、防碰撞。
+    """
+    return (p.get("file"), p.get("before_hash"))
+
+def _record_anchors(progress: dict, patches: list, output_path: Path | None = None) -> None:
     """记录缝合锚点，按指纹去重。
 
-    原实现无条件 extend，而锚点内容是从**当前文件内容**重新计算的，恢复后会整段重算。
-    崩溃在 extend 之后 / 落盘之前时，恢复会再追加一次同样的锚点；每个锚点内嵌
-    原文与替换文全文，progress.json 会随崩溃次数膨胀，缝合报告也随之出现重复行。
+    锚点完整内容（原文/替换文）写入单独的 JSONL 文件（追加模式），
+    progress.json 仅保留轻量引用（文件、范围、哈希、是否已应用、来源），
+    避免 progress.json 膨胀到数十 MB 导致每轮写盘放大。
+
+    output_path 为 None 时仅更新进度内存（测试/回归兼容），不落盘 JSONL。
     """
+    # 1) 进度里只存轻量引用，用于去重
     anchors = progress.setdefault('stitch_anchors', [])
     known = {_anchor_key(a) for a in anchors}
     for p in patches:
         k = _anchor_key(p)
         if k not in known:
             known.add(k)
-            anchors.append(p)
+            # 轻量引用：不含 original/replacement 全文
+            anchors.append({
+                "file": p.get("file"),
+                "start": p.get("start"),
+                "end": p.get("end"),
+                "before_hash": p.get("before_hash"),
+                "applied": p.get("applied", False),
+                "source": p.get("source", "unknown"),
+            })
+
+    # 2) 完整锚点追加到 JSONL（仅去重后的新锚点）
+    if output_path is None:
+        return
+    anchors_path = output_path / "_diagnostics" / "stitch_anchors.jsonl"
+    anchors_path.parent.mkdir(parents=True, exist_ok=True)
+    # 用集合记录本次新增的锚点键，避免同批次内重复写入
+    new_keys = {k for p in patches if (k := _anchor_key(p)) not in known or known.add(k) is None}
+    if new_keys:
+        with open(anchors_path, "a", encoding="utf-8") as f:
+            for p in patches:
+                k = _anchor_key(p)
+                if k in new_keys:
+                    f.write(json.dumps(p, ensure_ascii=False) + "\n")
+                    new_keys.remove(k)
+                    if not new_keys:
+                        break
 
 async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_fn, run_id, chars):
     from routes import state
@@ -239,7 +271,7 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
             if state.stop_requested: raise asyncio.CancelledError()
             patches = await apply_virtual_stitch(virtuals_sorted[i], virtuals_sorted[i + 1],
                 client, payload_base, sse_emit_fn, run_id, chars)
-            _record_anchors(progress, patches)
+            _record_anchors(progress, patches, output_path)
             patches_by_file = {}
             for p in patches: patches_by_file.setdefault(p['file'], []).append(p)
             apply_stitches(output_path, patches_by_file)
@@ -264,7 +296,7 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
         # v8.8：去掉 is_cross_batch_pair 跳过——虚拟章边界必须缝合
         patches = await apply_batch_stitch(completed_batches[i], completed_batches[i + 1],
             client, payload_base, sse_emit_fn, run_id, chars)
-        _record_anchors(progress, patches)
+        _record_anchors(progress, patches, output_path)
         patches_by_file = {}
         for p in patches: patches_by_file.setdefault(p['file'], []).append(p)
         apply_stitches(output_path, patches_by_file)

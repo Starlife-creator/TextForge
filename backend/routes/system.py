@@ -4,7 +4,8 @@
 用户只能靠改文件 + 看 console 排查。这里把「后端自身」和「模型服务」
 两类配置全部暴露为 HTTP 接口，供前端「系统与后端设置」面板调用。
 """
-import os, sys, time, platform, json, asyncio, subprocess
+import codecs
+import os, sys, time, platform, json, asyncio, subprocess, threading
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Body, Query
 import httpx
@@ -40,10 +41,26 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _path(name: str) -> Path:
+    """解析模块级路径，兼容两种用法：
+
+    - 生产：没有同名全局变量，按当前环境动态解析（便携包/APPDATA 可能变化）。
+    - 测试：回归脚本会把 S.LOG_PATH 等改成临时目录，此时优先用显式赋值。
+
+    不能直接写 `LOG_PATH` —— 模块级 __getattr__（PEP 562）只对
+    `system.LOG_PATH` 这种属性访问生效，**不会**被函数内的全局变量查找触发，
+    否则生产环境会直接 NameError。
+    """
+    value = globals().get(name)
+    if value is not None:
+        return Path(value)
+    return _app_paths()[name]
+
+
 def _port_file() -> dict:
     """读取 port.json（一次），供 _port/_pid/system_info 共用，避免每个请求读多遍。"""
     try:
-        data = json.loads(PORT_FILE.read_text(encoding="utf-8"))
+        data = json.loads(_path("PORT_FILE").read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
@@ -68,8 +85,9 @@ def _pid() -> int:
 @router.get("/api/system/info")
 async def system_info():
     """后端运行信息：端口 / PID / 运行时长 / 关键文件位置。"""
+    log_path = _path("LOG_PATH")
     try:
-        st = LOG_PATH.stat()
+        st = log_path.stat()
         log_size, log_mtime, log_exists = st.st_size, st.st_mtime, True
     except OSError:
         log_size, log_mtime, log_exists = 0, 0, False
@@ -85,10 +103,10 @@ async def system_info():
         "cwd": os.getcwd(),
         "platform": f"{platform.system()} {platform.release()}",
         "debug": os.environ.get("TEXTFORGE_DEBUG", "0") == "1",
-        "app_dir": str(APP_DIR),
-        "port_file": str(PORT_FILE),
-        "port_file_exists": PORT_FILE.exists(),
-        "log_path": str(LOG_PATH),
+        "app_dir": str(_path("APP_DIR")),
+        "port_file": str(_path("PORT_FILE")),
+        "port_file_exists": _path("PORT_FILE").exists(),
+        "log_path": str(log_path),
         "log_exists": log_exists,
         "log_size": log_size,
         "log_mtime": log_mtime,
@@ -105,6 +123,85 @@ def _sub_counts():
     return dict(_subscribers)
 
 
+# 日志增量缓存：只保留「已完成行 + 当前未换行的尾部」。
+# 原实现每 3s 把最大 10MB 的日志整份读入再切片，面板打开时是纯无效读盘；
+# 现在只在文件增长时读取新增字节，行游标/总行数都从内存缓存取。
+_LOG_LOCK = threading.Lock()
+_LOG_TAIL: dict = {
+    "path": None, "ident": None, "size": 0, "mtime": 0,
+    "lines": [], "pending": "", "decoder": None,
+}
+
+
+def _append_log_text(text: str) -> None:
+    if not text:
+        return
+    parts = (_LOG_TAIL["pending"] + text).split("\n")
+    _LOG_TAIL["pending"] = parts.pop()
+    lines = _LOG_TAIL["lines"]
+    for p in parts:
+        lines.append(p[:-1] if p.endswith("\r") else p)
+
+
+def _refresh_log_tail(path: Path):
+    """把磁盘上的新增字节追加进缓存；返回缓存对象（调用方需持有 _LOG_LOCK）。"""
+    st = path.stat()
+    if st.st_ino:
+        # Windows 上 st_ctime 是创建时间，append 不会变，可用来识别日志轮转；
+        # Unix 上 ctime 会随 append 变化，只能依赖 inode。
+        ident = (st.st_dev, st.st_ino, st.st_ctime_ns) if os.name == "nt" else (st.st_dev, st.st_ino)
+    else:
+        ident = (st.st_dev, None)
+    rebuild = (
+        _LOG_TAIL["path"] != str(path)
+        or _LOG_TAIL["ident"] != ident
+        or st.st_size < _LOG_TAIL["size"]
+        or (st.st_size == _LOG_TAIL["size"] and st.st_mtime_ns != _LOG_TAIL["mtime"])
+        or st.st_mtime_ns < _LOG_TAIL["mtime"]
+    )
+    if rebuild:
+        _LOG_TAIL.update({
+            "path": str(path), "ident": ident, "size": 0, "mtime": st.st_mtime_ns,
+            "lines": [], "pending": "",
+            "decoder": codecs.getincrementaldecoder("utf-8")("replace"),
+        })
+        with open(path, "rb") as f:
+            data = f.read()
+        _append_log_text(_LOG_TAIL["decoder"].decode(data, final=False))
+        _LOG_TAIL["size"] = len(data)
+    elif st.st_size > _LOG_TAIL["size"]:
+        with open(path, "rb") as f:
+            f.seek(_LOG_TAIL["size"])
+            data = f.read()
+        _append_log_text(_LOG_TAIL["decoder"].decode(data, final=False))
+        _LOG_TAIL["size"] += len(data)
+    _LOG_TAIL["mtime"] = st.st_mtime_ns
+    return _LOG_TAIL
+
+
+def _read_log_slice(path: Path, lines: int, offset: int) -> dict:
+    with _LOG_LOCK:
+        state = _refresh_log_tail(path)
+        complete, pending = state["lines"], state["pending"]
+        total = len(complete) + (1 if pending else 0)
+        start = min(offset, total)
+        end = min(start + lines, total)
+        out = []
+        if start < len(complete):
+            out.extend(complete[start:min(end, len(complete))])
+        # Only include pending if we haven't exhausted all lines yet
+        if start < total and end > len(complete) and pending:
+            out.append(pending)
+        return {
+            "path": str(path),
+            "lines": out,
+            "total": total,
+            "offset": end,
+            "size": state["size"],
+            "exists": True,
+        }
+
+
 @router.get("/api/system/logs")
 async def system_logs(lines: int = Query(200, ge=10, le=5000), offset: int = Query(0, ge=0)):
     """按行增量读取 backend.log。
@@ -112,26 +209,18 @@ async def system_logs(lines: int = Query(200, ge=10, le=5000), offset: int = Que
     offset 是**已消费行数**（从文件头数起）：
       offset=0 → 从头取 lines 行（首次加载 / 重新加载）
       offset=N → 只返回第 N 行之后的增量
+
+    实现：只缓存/解析新增字节，避免每次轮询全量读取。文件被轮转（inode 变化）
+    或截断时自动重建缓存。
     """
-    if not LOG_PATH.exists():
-        return {"path": str(LOG_PATH), "lines": [], "total": 0, "offset": 0, "exists": False}
+    log_path = _path("LOG_PATH")
+    if not log_path.exists():
+        return {"path": str(log_path), "lines": [], "total": 0, "offset": 0, "exists": False}
     try:
-        # 10MB 上限，直接全量读入内存后切片；日志量级下开销可忽略
-        raw = LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+        # 纯文件 I/O 放线程池：日志最多 10MB，不应阻塞事件循环/SSE 心跳
+        return await asyncio.to_thread(_read_log_slice, log_path, lines, offset)
     except OSError as e:
         raise HTTPException(500, f"读取日志失败: {e}")
-    total = len(raw)
-    # 注意：这里必须是 min(offset, total)。写成 total - offset 时，
-    # offset=0（首次加载）会得到 start=total → 返回空数组，日志面板永远显示「暂无日志」。
-    start = min(offset, total)
-    return {
-        "path": str(LOG_PATH),
-        "lines": raw[start:start + lines],
-        "total": total,
-        "offset": start + min(len(raw) - start, lines),
-        "size": LOG_PATH.stat().st_size,
-        "exists": True,
-    }
 
 
 @router.post("/api/system/open")
@@ -139,11 +228,11 @@ async def system_open(payload: dict = Body(...)):
     """在系统文件管理器打开 TextForge 目录或日志文件。"""
     target = payload.get("target") or "app_dir"
     if target == "app_dir":
-        p = APP_DIR
+        p = _path("APP_DIR")
     elif target == "logs_dir":
-        p = LOG_DIR
+        p = _path("LOG_DIR")
     elif target == "log_file":
-        p = LOG_PATH
+        p = _path("LOG_PATH")
     else:
         raise HTTPException(422, f"未知 target: {target}")
     if not p.exists():

@@ -43,7 +43,7 @@ def _summarize(output_path: str) -> dict:
     pf = p / "progress.json"
     if pf.exists():
         try:
-            from utils.progress_io import read_progress
+            from utils.progress_io import is_completed, read_progress
             prog = read_progress(pf)
         except Exception as e:
             # 读不了就如实告知，绝不假装"什么都没有"
@@ -57,9 +57,11 @@ def _summarize(output_path: str) -> dict:
             "total_chapters": len(prog.get("chapters", []) or []),
             "batches_total": len(batches),
             "batches_done": sum(1 for b in batches if b.get("status") == "phase3_done"),
-            "finished": bool(prog.get("finished_at")),
-            # 可续跑：有阶段标记且尚未跑完 phase4（与 _load_or_init_progress 的判据一致）
-            "resumable": bool(phase) and phase != "phase4",
+            "finished": is_completed(prog),
+            # 可续跑：有阶段标记且真正完成前（与 _load_or_init_progress 的判据一致）。
+            # 不能用 phase != 'phase4'：phase4 在 finalize 之前写入，渲染失败时
+            # 仍应允许续跑，而不是让用户从头再跑一遍。
+            "resumable": bool(phase) and not is_completed(prog),
             "error_logs": (prog.get("error_logs") or [])[-5:],
         })
     return info

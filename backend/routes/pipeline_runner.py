@@ -66,10 +66,14 @@ async def run_pipeline(req, run_id: str):
         state.pipeline_running = False
         try:
             progress["pipeline_running"] = False
+            # 到这里 phase4_finalize 已成功返回，才是真正完成
+            progress["completed"] = True
             progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
             logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
+            # 记录历史必须在 done 事件之前，确保前端/测试拉取历史时已是完成态
+            _history_record(progress_path, progress)
         except Exception:
             logger.exception("[run_pipeline] 完成前写 progress.json 失败")
         sse_emit("done", {"output_dir": req.output_path, "novel_name": progress["novel_name"]}, run_id)
@@ -119,6 +123,8 @@ async def run_pipeline(req, run_id: str):
             state.pipeline_running = False   # 幂等；正常路径已在发 done 前复位
             state.current_output_path = None
             state.pipeline_task = None
+            # 安全：清理内存中的 API Key，避免运行结束后长期留在内存
+            state.current_req = None
         else:
             logger.info(f"[run_pipeline] run_id={run_id} 已被更新的 run 接管，跳过全局状态清理")
         # progress.json 始终要写：它属于本轮自己的输出目录
@@ -129,8 +135,9 @@ async def run_pipeline(req, run_id: str):
                 async with state.progress_lock:
                     atomic_write_json(progress_path, progress)
                 logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
-                # 任务历史：终态（完成/失败/中止）刷新一次，保证历史列表显示最新批次进度
-                _history_record(progress_path, progress)
+                # 完成态已在 try 块中记录历史；失败/中止态需要在此补记
+                if not progress.get("completed"):
+                    _history_record(progress_path, progress)
             except Exception:
                 logger.exception("[run_pipeline] finally 写 progress.json 失败")
 
@@ -149,13 +156,36 @@ async def _heartbeat_loop(progress_path: Path, progress_ref: list | None = None,
 
     历史登记不再重读 progress.json：用 progress_ref（run_pipeline 载入后填入的
     单元素列表）拿内存引用，避免每 15s 全量解析几十 MB JSON 还持锁。
+
+    仅在关键状态变化时写入历史：计算关键字段的签名，仅当签名变化时才落盘，
+    避免每 15s 重复写入相同的 runs.json（附带 fsync）。
     """
+    import hashlib
+    last_sig: str | None = None
+
+    def _history_signature(progress: dict) -> str:
+        """计算历史关键字段的签名，仅这些字段变化才触发落盘。"""
+        # 用 _meta_from_progress 中的字段，排除 last_error（可能波动）和时间戳
+        key_fields = (
+            progress.get("current_phase"),
+            progress.get("batches_done"),
+            progress.get("batches_total"),
+            progress.get("finished"),
+            progress.get("finished_at"),
+            progress.get("chapter_detection"),
+            tuple(sorted(progress.get("config_drift", []))),
+        )
+        return hashlib.md5(json.dumps(key_fields, ensure_ascii=False).encode()).hexdigest()
+
     while True:
         await asyncio.sleep(interval)
         try:
             state.last_heartbeat = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             if progress_ref:
-                _history_record(progress_path, progress_ref[0])
+                sig = _history_signature(progress_ref[0])
+                if sig != last_sig:
+                    _history_record(progress_path, progress_ref[0])
+                    last_sig = sig
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -170,11 +200,23 @@ def _history_record(progress_path: Path, progress: dict) -> None:
     except Exception as e:
         logger.warning(f"[history] 记录失败（忽略）: {e}")
 
+def _cfg_brief(value) -> str:
+    """把配置值压成一行短文本，避免把整份人名映射/模型表塞进提示。"""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    else:
+        text = str(value)
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
 def _config_drift(existing: dict, req) -> list[str]:
     """续跑时配置是否与上次不同。返回人类可读的差异描述（空列表=一致）。
 
     必须提示而不是静默沿用：前几批是用旧模型/旧窗口生成的，后几批用新配置，
     会出现「同一本书前后风格/精度不一致」，而用户完全不知情。
+
+    不能只比模型/地址/窗口：重构档位、保护门、禁用设定、人名映射、分阶段模型
+    同样会改变后续批次的产出。旧 progress 没有的字段直接跳过，保持兼容。
     """
     old = (existing.get("api_config") or {})
     diffs = []
@@ -189,6 +231,23 @@ def _config_drift(existing: dict, req) -> list[str]:
     if existing.get("input_path") and req.input_path and \
             str(existing["input_path"]) != str(req.input_path):
         diffs.append(f"输入路径已变更（{existing['input_path']} → {req.input_path}）")
+
+    # 其余会影响产出的字段：只比较旧 progress 里确实存在的键
+    for key, label in (
+        ("input_format", "输入格式"),
+        ("input_mode", "输入模式"),
+        ("refactor_mode", "重构档位"),
+        ("refactor_gates", "保护门设置"),
+        ("forbidden_canon", "禁用设定"),
+        ("name_map", "人名映射"),
+        ("models", "分阶段模型"),
+        ("diagnose_json", "断层清单路径"),
+    ):
+        if key not in existing:
+            continue
+        prev, cur = existing.get(key), getattr(req, key, None)
+        if _cfg_brief(prev) != _cfg_brief(cur):
+            diffs.append(f"{label}：{_cfg_brief(prev)} → {_cfg_brief(cur)}")
     return diffs
 
 
@@ -199,17 +258,20 @@ def _load_or_init_progress(req, run_id, progress_path):
     失败（文件被占用 / 杀软扫描 / 崩溃半截文件）直接重建并覆盖用户的进度，
     表现为"重开像什么都没保存"。现在读不了就明确报错并停下，交由用户处理。
     """
-    from utils.progress_io import ProgressUnreadable, try_read_progress
+    from utils.progress_io import ProgressUnreadable, is_completed, try_read_progress
     try:
         existing = try_read_progress(progress_path)
     except ProgressUnreadable as e:
         raise RuntimeError(str(e)) from e
     if existing is not None:
-        if existing.get('current_phase') and existing.get('current_phase') != 'phase4':
+        # 旧判据是 current_phase != 'phase4'，但 phase4 在 finalize 之前就写入，
+        # 渲染失败时会被误判为「已完成、不可续跑」。现在只认显式 completed。
+        if existing.get('current_phase') and not is_completed(existing):
             # 恢复：更新 run_id（匹配本次 SSE），保持工作产物
             existing['run_id'] = run_id
             existing['pipeline_running'] = True
             existing['resumed'] = True
+            existing['completed'] = False
             drifts = _config_drift(existing, req)
             if drifts:
                 # 记进 progress 供界面展示；不阻断（用户可能是有意换的）
@@ -359,6 +421,9 @@ def init_progress(req, run_id):
         "blueprint_confirmed": False, "blueprint_user_edited": False,
         "current_processing_batch": 0, "processed_batches": [], "completed_files": [],
         "error_logs": [], "resumed": False,
+        # 只有 phase4_finalize 成功返回后才置 true；finished_at 只表示「本轮结束」，
+        # 失败/停止同样会写，不能拿来判断完成。
+        "completed": False,
         # v8.8 缝合幂等游标：已完成 merge 的虚拟章父章 id、已完成批次间缝合的边界 key
         "stitch_virtual_done": [], "stitch_batch_done": [],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "estimated": False},
