@@ -59,7 +59,13 @@ function rowBadge(row: QualityChapterRow): string {
   return row.status === 'bad' ? 'badge err2' : row.status === 'warn' ? 'badge paused' : 'badge ok';
 }
 function rowStatus(row: QualityChapterRow): string {
-  return row.status === 'bad' ? '异常' : row.status === 'warn' ? '留意' : row.status === 'skipped' ? '空章' : '正常';
+  return row.status === 'bad'
+    ? '异常'
+    : row.status === 'warn'
+      ? '留意'
+      : row.status === 'skipped'
+        ? '空章'
+        : '正常';
 }
 </script>
 
@@ -89,7 +95,10 @@ function rowStatus(row: QualityChapterRow): string {
           <div class="q-stat">
             <span class="q-k">章节</span>
             <b>{{ fmt(report.summary.chapters_reconstructed) }}</b>
-            <span class="hint">/ {{ fmt(report.summary.chapters) }}（空章跳过 {{ fmt(report.summary.chapters_skipped_empty) }}）</span>
+            <span class="hint"
+              >/ {{ fmt(report.summary.chapters) }}（空章跳过
+              {{ fmt(report.summary.chapters_skipped_empty) }}）</span
+            >
           </div>
           <div class="q-stat">
             <span class="q-k">总字数</span>
@@ -190,7 +199,9 @@ function rowStatus(row: QualityChapterRow): string {
                 <td>{{ fmt(row.original_chars) }}</td>
                 <td>{{ fmt(row.reconstructed_chars) }}</td>
                 <td>{{ ratioText(row.ratio) }}</td>
-                <td><span :class="rowBadge(row)">{{ rowStatus(row) }}</span></td>
+                <td>
+                  <span :class="rowBadge(row)">{{ rowStatus(row) }}</span>
+                </td>
                 <td class="mono q-codes">{{ row.issue_codes.join('、') || '-' }}</td>
               </tr>
             </tbody>
@@ -199,7 +210,8 @@ function rowStatus(row: QualityChapterRow): string {
 
         <p class="hint q-caveat">{{ report.caveat }}</p>
         <p class="hint q-config">
-          {{ report.config.model || '未知模型' }} · {{ report.config.refactor_mode || '-' }} · 提示词
+          {{ report.config.model || '未知模型' }} · {{ report.config.refactor_mode || '-' }} ·
+          提示词
           {{ report.config.prompt_version || '-' }}
         </p>
       </template>

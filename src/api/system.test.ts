@@ -28,11 +28,12 @@ describe('api/system 质量报告', () => {
   it('后端 404 时把 detail 作为错误抛出（界面显示「尚无报告」）', async () => {
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () =>
-        new Response(JSON.stringify({ detail: '尚无质量报告（完成一次重构后生成）' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        }),
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail: '尚无质量报告（完成一次重构后生成）' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          }),
       ),
     );
 

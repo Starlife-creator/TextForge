@@ -617,12 +617,18 @@ try:
     ok4 = wait_done(ev4, th4, api_port=API_PORT)[0]
     st4 = put(f"{L}/", {})["stats"]
     splits = [d for e, d in ev4 if e == "batch_split"]
+    # batch_split 只用于即时提示，不在 SSE 重放集合内；慢速 runner 上订阅建立前
+    # 事件可能已经发完。拆批是否真的发生以 progress.json 的持久状态为准。
+    prog4_path = o4 / "progress.json"
+    prog4 = json.loads(prog4_path.read_text(encoding="utf-8")) if prog4_path.exists() else {}
+    split_recorded = bool(prog4.get("adaptive_max_chapters")) or len(prog4.get("batches", [])) > 1
     if not ok4:
         errs4 = [d for e, d in ev4 if e == "error"]
         print("  错误:", errs4[-1][:220] if errs4 else [e for e, _ in ev4][-8:])
-    print(f"    超限次数={st4.get('ctx_overflow', 0)} 自动拆批次数={len(splits)}")
+    print(f"    超限次数={st4.get('ctx_overflow', 0)} 拆批事件={len(splits)} "
+          f"批次={len(prog4.get('batches', []))} 自适应上限={prog4.get('adaptive_max_chapters')}")
     check("上下文超限时流水线仍能跑完（自动拆批自愈）", ok4, str(st4))
-    check("确实发生了自动拆批", len(splits) >= 1, str(len(splits)))
+    check("确实发生了自动拆批", split_recorded, str(prog4.get("batches"))[:160])
     check("服务端确实拒绝过超限请求", st4.get("ctx_overflow", 0) >= 1, str(st4.get("ctx_overflow")))
     o4c = sorted((o4 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
     check("拆批后 6 章全部产出", len(o4c) == 6, str([p.name for p in o4c]))
