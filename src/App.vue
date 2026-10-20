@@ -63,7 +63,7 @@ const contextWindow = ref(8000);
 const authorStyle = ref('出版级文学重构，文笔凝练，注重画面感');
 const novelName = ref('');
 const refactorMode = ref<'full_rewrite' | 'fidelity' | 'fix_gaps' | 'reskin'>('full_rewrite');
-// 重构保护门（后端 refactor_gates，默认全关）
+// 重构保护门（后端 refactor_gates，默认全关；自动重写默认开）
 const gates = reactive({
   lock_names: false,
   lock_plot: false,
@@ -71,7 +71,17 @@ const gates = reactive({
   require_chapter_accept: false,
   skip_stitch_if_smooth: false,
   qc_block_export: false,
+  auto_rewrite_bad_batch: true,
 });
+const GATE_KEYS = [
+  'lock_names',
+  'lock_plot',
+  'inject_forbidden',
+  'require_chapter_accept',
+  'skip_stitch_if_smooth',
+  'qc_block_export',
+  'auto_rewrite_bad_batch',
+] as const;
 // 逐章验收弹窗
 const showAccept = ref(false);
 const acceptBatch = ref<number | null>(null);
@@ -113,6 +123,8 @@ const forbiddenCanon = ref('');
 const nameMapText = ref('');
 // B1 批次间隔（秒）
 const batchInterval = ref(2.0);
+// 有界并发：默认串行；云端可调到 2-4，本地小模型不建议
+const maxConcurrency = ref(1);
 // B2 服务商预设（温度/上下文/批次间隔一键套用，纯前端）
 const preset = ref('通用');
 const PRESETS: Record<string, { temps: number[]; ctx: number; interval: number }> = {
@@ -238,6 +250,8 @@ function persist() {
         authorStyle: authorStyle.value,
         refactorMode: refactorMode.value,
         batchInterval: batchInterval.value,
+        maxConcurrency: maxConcurrency.value,
+        gates: { ...gates },
         darkMode: darkMode.value,
         forbiddenCanon: forbiddenCanon.value,
         nameMapText: nameMapText.value,
@@ -280,6 +294,13 @@ function restore() {
     if (['full_rewrite', 'fidelity', 'fix_gaps', 'reskin'].includes(p.refactorMode))
       refactorMode.value = p.refactorMode;
     if (typeof p.batchInterval === 'number') batchInterval.value = p.batchInterval;
+    if (typeof p.maxConcurrency === 'number')
+      maxConcurrency.value = Math.min(4, Math.max(1, Math.round(p.maxConcurrency)));
+    if (p.gates && typeof p.gates === 'object') {
+      for (const key of GATE_KEYS) {
+        if (typeof p.gates[key] === 'boolean') gates[key] = p.gates[key];
+      }
+    }
     if (typeof p.darkMode === 'boolean') {
       darkMode.value = p.darkMode;
       document.documentElement.classList.toggle('dark', p.darkMode);
@@ -843,6 +864,15 @@ function handleSSEEvent(event: string, payload: any) {
       // 否则用户只会觉得「怎么跑了这么久」，而不知道程序已在自动降规模。
       addLog(payload.message || `批次 ${payload.from_batch} 自动拆分重跑`, 'warn');
       break;
+    case 'qc_auto_rewrite':
+      addLog(payload.message || `批次 ${payload.batch_id} 检测到硬伤，已自动重写一次`, 'warn');
+      break;
+    case 'qc_warning':
+      addLog(`批次质检仍有 ${payload.count ?? 0} 项遗留问题，详见质量报告`, 'warn');
+      break;
+    case 'phase_note':
+      if (payload.message) addLog(payload.message);
+      break;
     case 'stream_chunk':
       // #2 节流后的流式增量：再按帧合并，避免逐 chunk 触发全量重渲染。
       streamBuf += payload.text || '';
@@ -1062,6 +1092,7 @@ async function startPipeline() {
       stitch: num(tStitch.value, 0, 0.6, 2),
     },
     batch_interval_sec: num(batchInterval.value, 0, 2.0, 300),
+    max_concurrency: Math.round(num(maxConcurrency.value, 1, 1, 4)),
     models: buildModels(),
   };
   try {
@@ -1652,6 +1683,10 @@ const canStart = computed(
             <label class="rich"
               ><input type="checkbox" v-model="gates.qc_block_export" /> 质检拦截导出</label
             >
+            <label class="rich" title="只处理空章/塌缩/占位/残留等结构硬伤，每批最多重写一次"
+              ><input type="checkbox" v-model="gates.auto_rewrite_bad_batch" />
+              硬伤批次自动重写</label
+            >
           </details>
         </div>
 
@@ -1716,7 +1751,11 @@ const canStart = computed(
         <div class="row">
           <label>代理</label>
           <input v-model="proxy" placeholder="可选，如 http://127.0.0.1:7890" />
-          <label class="rich"><input type="checkbox" v-model="richText" /> docx富文本</label>
+          <label
+            class="rich"
+            title="仅影响 docx 成品：章标题用 Word 标题样式、章间分页、**粗体**/*斜体* 生效"
+            ><input type="checkbox" v-model="richText" /> docx富文本</label
+          >
           <label class="rich" title="仅在使用 https 自签证书的服务端时需要关闭"
             ><input type="checkbox" v-model="sslVerify" /> 校验HTTPS证书</label
           >
@@ -1739,6 +1778,11 @@ const canStart = computed(
           <div class="row">
             <label>批次间隔(秒)</label>
             <input v-model.number="batchInterval" type="number" min="0" max="300" step="0.5" />
+          </div>
+          <div class="row">
+            <label>并发批次数</label>
+            <input v-model.number="maxConcurrency" type="number" min="1" max="4" step="1" />
+            <span class="ph-note">本地模型建议 1；云端可 2-4</span>
           </div>
         </details>
         <details class="adv">

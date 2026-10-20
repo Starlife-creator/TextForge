@@ -79,6 +79,23 @@ def test_is_completed_explicit_flag_wins():
                          "current_phase": "phase4"})
 
 
+def test_auth_default_deny_without_token(monkeypatch):
+    from utils import auth
+
+    monkeypatch.delenv(auth.ENV_KEY, raising=False)
+    monkeypatch.delenv("TEXTFORGE_DEV", raising=False)
+    assert auth.is_enforced() is True
+    assert auth.check({}) is False
+
+    monkeypatch.setenv("TEXTFORGE_DEV", "1")
+    assert auth.is_enforced() is False
+
+    monkeypatch.delenv("TEXTFORGE_DEV")
+    monkeypatch.setenv(auth.ENV_KEY, "unit-token")
+    assert auth.check({auth.HEADER: "unit-token"}) is True
+    assert auth.check({auth.HEADER: "wrong"}) is False
+
+
 def test_is_completed_legacy_fallback():
     # 旧 progress 没有 completed 字段：沿用 phase4 + finished_at 判定
     assert is_completed({"finished_at": "2026-01-01T00:00:00Z", "current_phase": "phase4"})

@@ -1,6 +1,6 @@
 [package]
 name = "textforge"
-version = "0.11.0"
+version = "0.12.0"
 description = "文炼工坊 TextForge"
 authors = ["Starlife-creator"]
 edition = "2021"

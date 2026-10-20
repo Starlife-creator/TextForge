@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -27,7 +28,14 @@ MAX_DUPLICATE_PAIRS = 20
 MAX_POSTINGS = 30
 
 RESIDUAL_MARKERS = ("===CHAPTER_BREAK===", "===PREV_END===", "===NEXT_START===")
-PLACEHOLDERS = ("todo", "占位符", "待补", "此处省略", "此处略", "未完成待续")
+# 最后一组是模型元话术（不是小说正文）：出现即说明模型把「回复用户」的措辞
+# 写进了成品。只收几乎不可能出现在小说对白里的固定短语，避免误伤剧情。
+PLACEHOLDERS = (
+    "todo", "占位符", "待补", "此处省略", "此处略", "未完成待续",
+    "作为ai", "作为 ai", "作为一个ai", "作为一个 ai",
+    "以下是重构", "以下是修改后", "希望以上内容",
+    "如需继续请告诉", "如果你需要我继续",
+)
 
 BAD = "bad"
 WARN = "warn"
@@ -113,6 +121,151 @@ def find_duplicate_pairs(texts: dict[str, str]) -> list[dict]:
 def _chapter_label(ch: dict) -> str:
     title = ch.get("title") or ch.get("filename") or f"chapter_{ch.get('id')}"
     return str(title)
+
+
+def assess_batch_texts(
+    *,
+    chapters: list[dict],
+    chapter_ids: list[str],
+    texts: dict[str, str],
+    output_path: str | Path,
+    forbidden_canon=(),
+    name_map=None,
+    refactor_mode: str = "full_rewrite",
+    gates=None,
+) -> list[dict]:
+    """在批次落盘前做内容级检查，返回按严重度排序的问题清单。
+
+    与最终质量报告共用同一组阈值，但只覆盖本批章节；用于决定是否自动重写。
+    这里只判断可机械验证的硬伤，不评价文笔。
+    """
+    output_path = Path(output_path)
+    by_id = {str(c.get("id")): c for c in chapters or []}
+    forbidden = list(forbidden_canon or [])
+    old_names = [k for k in (name_map or {}) if len(str(k).strip()) >= 2]
+    reskin = (refactor_mode or "") == "reskin"
+    inject_forbidden = bool((gates or {}).get("inject_forbidden"))
+    issues: list[dict] = []
+
+    def add(severity: str, code: str, cid: str, message: str, evidence: str = "") -> None:
+        issues.append(
+            {
+                "severity": severity,
+                "code": code,
+                "chapter_id": str(cid),
+                "message": message,
+                "evidence": evidence,
+            }
+        )
+
+    seen_hashes: dict[str, str] = {}
+    for raw_cid in chapter_ids or []:
+        cid = str(raw_cid)
+        ch = by_id.get(cid)
+        if ch is None:
+            add(BAD, "missing_chapter", cid, f"章节 {cid} 不在章节表中")
+            continue
+        if ch.get("is_empty"):
+            continue
+        split_file = ch.get("split_file") or f"02_workspace/split/{cid}.txt"
+        orig = _read_text(output_path / split_file).strip()
+        recon = (texts.get(cid) or "").strip()
+        if not orig:
+            continue
+        label = _chapter_label(ch)
+        if not recon:
+            add(BAD, "empty_chapter", cid, f"第 {cid} 章（{label}）重构稿为空")
+            continue
+
+        for marker in RESIDUAL_MARKERS:
+            idx = recon.find(marker)
+            if idx >= 0:
+                add(
+                    BAD,
+                    "residual_marker",
+                    cid,
+                    f"第 {cid} 章（{label}）残留机器标记 {marker}",
+                    _snippet(recon, idx, len(marker)),
+                )
+                break
+
+        ph_hits = find_hits(recon, PLACEHOLDERS)
+        if ph_hits:
+            needle, snippet = ph_hits[0]
+            add(
+                BAD,
+                "placeholder",
+                cid,
+                f"第 {cid} 章（{label}）疑似占位/未完稿（出现「{needle}」）",
+                snippet,
+            )
+
+        if inject_forbidden and forbidden:
+            fh = find_hits(recon, forbidden)
+            if fh:
+                needle, snippet = fh[0]
+                add(
+                    BAD,
+                    "forbidden_canon",
+                    cid,
+                    f"第 {cid} 章（{label}）命中禁用设定「{needle}」",
+                    snippet,
+                )
+
+        if reskin and old_names:
+            oh = find_hits(recon, old_names)
+            if oh:
+                needle, snippet = oh[0]
+                add(
+                    WARN,
+                    "old_name_residue",
+                    cid,
+                    f"第 {cid} 章（{label}）仍出现改名前的旧称「{needle}」",
+                    snippet,
+                )
+
+        orig_len, recon_len = len(orig), len(recon)
+        ratio = recon_len / orig_len if orig_len else None
+        if ratio is not None:
+            if orig_len >= 500 and ratio < 0.30:
+                add(
+                    BAD,
+                    "content_collapse",
+                    cid,
+                    f"第 {cid} 章（{label}）明显塌缩：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
+                )
+            elif orig_len >= 500 and ratio > 3.0:
+                add(
+                    BAD,
+                    "content_expansion",
+                    cid,
+                    f"第 {cid} 章（{label}）异常膨胀：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
+                )
+            elif ratio < 0.55 or ratio > 1.8:
+                add(
+                    WARN,
+                    "length_off",
+                    cid,
+                    f"第 {cid} 章（{label}）篇幅偏离较大：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
+                )
+
+        digest = hashlib.sha256(recon.encode("utf-8")).hexdigest()
+        if digest in seen_hashes:
+            add(
+                BAD,
+                "duplicate_chapter",
+                cid,
+                f"第 {cid} 章（{label}）与第 {seen_hashes[digest]} 章内容完全相同",
+            )
+        else:
+            seen_hashes[digest] = cid
+
+    issues.sort(key=lambda i: 0 if i["severity"] == BAD else 1)
+    return issues
+
+
+def has_blocking_issues(issues) -> bool:
+    return any(i.get("severity") == BAD for i in issues or [])
 
 
 def build_quality_report(
@@ -296,6 +449,36 @@ def build_quality_report(
             "qc_issue",
             "重构阶段质检记录：" + "；".join(str(x) for x in progress["qc_issues"][:10]),
         )
+    if progress.get("pre_stitch_issues"):
+        add_issue(
+            WARN,
+            "pre_stitch_qc",
+            "批次质检仍有未消除的问题："
+            + "；".join(
+                str(i.get("message") if isinstance(i, dict) else i)
+                for i in progress["pre_stitch_issues"][:10]
+            ),
+        )
+    if progress.get("auto_rewrite_log"):
+        kept = sum(1 for x in progress["auto_rewrite_log"] if x.get("kept") == "rewrite")
+        add_issue(
+            WARN,
+            "auto_rewrite",
+            f"自动重写 {len(progress['auto_rewrite_log'])} 个批次（采用重写稿 {kept} 个），"
+            "建议重点抽读这些批次",
+        )
+    if progress.get("stitch_failures"):
+        preview = "；".join(
+            f"{x.get('boundary')}: {x.get('error')}"
+            for x in progress["stitch_failures"][:5]
+            if isinstance(x, dict)
+        )
+        add_issue(
+            WARN,
+            "stitch_skipped",
+            f"{len(progress['stitch_failures'])} 处缝合失败已跳过（未应用的补丁保持原文），"
+            f"建议人工检查：{preview}",
+        )
     if progress.get("config_drift"):
         add_issue(
             WARN,
@@ -339,6 +522,9 @@ def build_quality_report(
             "placeholder_hits": count_code("placeholder"),
             "forbidden_hits": count_code("forbidden_canon"),
             "old_name_hits": count_code("old_name_residue"),
+            "auto_rewrites": len(progress.get("auto_rewrite_log") or []),
+            "pre_stitch_issues": len(progress.get("pre_stitch_issues") or []),
+            "stitch_failures": len(progress.get("stitch_failures") or []),
             "issues_by_severity": counts,
         },
         "issues": issues[:200],

@@ -26,6 +26,8 @@ class StartRequest(BaseModel):
     # 上限 300s：不封顶的话一次手误（999999）会让流水线在批次之间「活着」地
     # 傻等 11 天，只有 15s 一次的心跳能证明它还活着。
     batch_interval_sec: float = Field(default=2.0, ge=0, le=300)
+    # 有界并发：默认 1（串行）。云端可调高；本地小模型并发容易 OOM，不建议。
+    max_concurrency: int = Field(default=1, ge=1, le=4)
 
     # ---- 优化方案增量字段（默认值 = 旧版行为，无字段即 full_rewrite + 门全关） ----
     # P1.1 重构模式：缺省 full_rewrite（= 原「全部重构」极端档，行为不变）
@@ -34,7 +36,7 @@ class StartRequest(BaseModel):
     refactor_gates: Dict[str, bool] = Field(default_factory=lambda: {
         "lock_names": False, "lock_plot": False, "inject_forbidden": False,
         "require_chapter_accept": False, "skip_stitch_if_smooth": False,
-        "qc_block_export": False,
+        "qc_block_export": False, "auto_rewrite_bad_batch": True,
     })
     # P0.2 可选的禁改清单（仅非 full_rewrite 注入）
     forbidden_canon: List[str] = Field(default_factory=list, max_length=5000)

@@ -248,6 +248,7 @@ def _config_drift(existing: dict, req) -> list[str]:
         ("name_map", "人名映射"),
         ("models", "分阶段模型"),
         ("diagnose_json", "断层清单路径"),
+        ("max_concurrency", "并发批次数"),
     ):
         if key not in existing:
             continue
@@ -423,6 +424,13 @@ def init_progress(req, run_id):
         "fix_list": getattr(req, "fix_list", []),
         "diagnose_json": getattr(req, "diagnose_json", None),
         "models": getattr(req, "models", {}),
+        "max_concurrency": getattr(req, "max_concurrency", 1),
+        "auto_rewrite_count": 0,
+        "auto_rewritten_batches": [],
+        "auto_rewrite_log": [],
+        "batch_qc": {},
+        "pre_stitch_issues": [],
+        "stitch_failures": [],
         "chapters": [], "batches": [], "virtual_chapter_map": [], "cross_batch_virtual": [],
         "stitch_anchors": [], "current_phase": "phase0", "sub_step": None,
         "blueprint_confirmed": False, "blueprint_user_edited": False,

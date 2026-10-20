@@ -43,8 +43,8 @@ app.add_middleware(
 )
 
 # 本地 API 调用方鉴权。放在 CORS **之后**注册，使其在请求链上更靠外层，
-# 无效请求不会被 CORS 处理逻辑白跑一遍。TEXTFORGE_TOKEN 未设置时自动放行
-# （开发/测试模式），生产由外壳注入。
+# 无效请求不会被 CORS 处理逻辑白跑一遍。生产默认拒绝（未注入 token 也拒绝），
+# 仅显式设置 TEXTFORGE_DEV=1 时放行；正常由外壳注入 TOKEN。
 app.add_middleware(TokenAuthMiddleware)
 
 app.include_router(health_router)

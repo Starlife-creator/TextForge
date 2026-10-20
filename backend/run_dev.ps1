@@ -6,6 +6,8 @@ Set-Location -Path $PSScriptRoot
 
 $env:TEXTFORGE_DEBUG = "1"
 $env:TEXTFORGE_DEV_PORT = "8000"
+# 开发模式显式关闭鉴权：生产默认拒绝匿名请求（即使没注入 token）。
+$env:TEXTFORGE_DEV = "1"
 
 Write-Host "启动 TextForge 后端（开发模式，端口 8000）..." -ForegroundColor Cyan
 & .\venv\Scripts\python.exe main.py

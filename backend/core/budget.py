@@ -25,6 +25,25 @@ PROMPT_FIXED_TOKENS = 600
 # 单批正文 token 下限：再小就退化成逐段调用，反而放大了脚手架开销。
 MIN_BODY_TOKENS = 200
 
+# 跨批连续性上下文（上一批结尾）的 token 预留。批大小在 phase1 就定下来，
+# 那时重构稿还不存在，因此按固定上限预留，避免重构时把请求顶出窗口。
+CONTINUITY_MAX_TOKENS = 600
+
+
+def continuity_token_allowance(context_window: int) -> int:
+    """跨批连续性上下文在单批请求里的 token 预留（保守上限）。"""
+    return int(min(CONTINUITY_MAX_TOKENS, max(200, context_window * 0.04)))
+
+
+# 前情摘要（上一批诊断结果）的 token 预留。它补的是「事实一致」，
+# 与上一批结尾片段（补「文风衔接」）是两件事，必须分开预留。
+STORY_MEMO_MAX_TOKENS = 500
+
+
+def story_memo_token_allowance(context_window: int) -> int:
+    """前情摘要在单批请求里的 token 预留；也用作摘要裁剪的字符上限。"""
+    return int(min(STORY_MEMO_MAX_TOKENS, max(180, context_window * 0.035)))
+
 
 def blueprint_token_allowance(context_window: int) -> int:
     """蓝图在重构提示词里占用的 token 预留。
@@ -39,12 +58,14 @@ def blueprint_token_allowance(context_window: int) -> int:
 
 def body_token_budget(context_window: int, *, blueprint_text: str = "",
                       author_style: str = "", extra_text: str = "",
+                      reserve_tokens: int = 0,
                       fixed_tokens: int = PROMPT_FIXED_TOKENS,
                       safety: float = CONTEXT_SAFETY,
                       output_ratio: float = OUTPUT_RATIO) -> int:
     """算出单批**正文**可用的 token 上限。
 
     blueprint_text 已知时按实测长度扣；未知（phase1）时按 blueprint_token_allowance 预留。
+    reserve_tokens 用于尚未生成、但重构时一定会带上的内容（如跨批连续性上下文）。
     """
     total = context_window * safety
     scaffold = float(fixed_tokens)
@@ -52,6 +73,7 @@ def body_token_budget(context_window: int, *, blueprint_text: str = "",
                  else blueprint_token_allowance(context_window))
     scaffold += estimate_tokens(author_style or "")
     scaffold += estimate_tokens(extra_text or "")
+    scaffold += max(0, int(reserve_tokens))
     usable = total - scaffold
     body = usable / (1 + output_ratio)
     return max(MIN_BODY_TOKENS, int(body))

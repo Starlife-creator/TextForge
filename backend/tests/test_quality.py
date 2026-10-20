@@ -5,8 +5,10 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from core.quality import (
+    assess_batch_texts,
     build_quality_report,
     find_duplicate_pairs,
+    has_blocking_issues,
     read_quality_report,
     write_quality_report,
 )
@@ -145,3 +147,58 @@ def test_quality_report_roundtrip():
     assert loaded is not None
     assert loaded["status"] == report["status"]
     assert loaded["summary"]["chapters"] == 1
+
+
+def test_assess_batch_flags_placeholder_and_collapse():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        split = out / "02_workspace/split"
+        split.mkdir(parents=True)
+        (split / "1.txt").write_text("原文内容。" * 300, encoding="utf-8")
+        issues = assess_batch_texts(
+            chapters=[_chapter(1)],
+            chapter_ids=["1"],
+            texts={"1": "TODO：这里待补。"},
+            output_path=out,
+            gates={"inject_forbidden": False},
+        )
+
+    codes = {i["code"] for i in issues}
+    assert {"placeholder", "content_collapse"} <= codes
+    assert has_blocking_issues(issues)
+
+
+def test_assess_batch_flags_ai_meta_talk():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        split = out / "02_workspace/split"
+        split.mkdir(parents=True)
+        original = "原文内容。" * 300
+        (split / "1.txt").write_text(original, encoding="utf-8")
+        issues = assess_batch_texts(
+            chapters=[_chapter(1)],
+            chapter_ids=["1"],
+            texts={"1": original + "\n\n作为 AI，希望以上内容对你有帮助。"},
+            output_path=out,
+        )
+
+    codes = {i["code"] for i in issues}
+    assert "placeholder" in codes
+    assert has_blocking_issues(issues)
+
+
+def test_assess_batch_good_text_has_no_blocking_issue():
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp)
+        split = out / "02_workspace/split"
+        split.mkdir(parents=True)
+        original = "原文内容。" * 300
+        (split / "1.txt").write_text(original, encoding="utf-8")
+        issues = assess_batch_texts(
+            chapters=[_chapter(1)],
+            chapter_ids=["1"],
+            texts={"1": "重构后的内容。" * 300},
+            output_path=out,
+        )
+
+    assert not has_blocking_issues(issues)

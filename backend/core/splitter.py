@@ -472,8 +472,17 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
     # 单批正文上限按 token 算，并先扣掉蓝图/风格/规则等随行脚手架（见 core.budget）。
     # 旧实现 batch_limit = chars*0.40 只给正文定额，漏算脚手架，实测会发出
     # 远超模型窗口的请求（16038 token vs 本地 8448）→ 直接 400 整批报废。
-    from core.budget import body_token_budget
-    body_limit = body_token_budget(req.context_window, author_style=req.author_style)
+    from core.budget import (
+        body_token_budget,
+        continuity_token_allowance,
+        story_memo_token_allowance,
+    )
+    body_limit = body_token_budget(
+        req.context_window, author_style=req.author_style,
+        reserve_tokens=(
+            continuity_token_allowance(req.context_window)
+            + story_memo_token_allowance(req.context_window)
+        ))
     # 诊断阶段的「上一批尾巴」重叠上下文，按正文预算的 37.5% 取（与原 0.15/0.40 同比例）
     overlap_limit = int(body_limit * 0.375)
 

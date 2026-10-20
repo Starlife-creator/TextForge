@@ -13,9 +13,9 @@ Tauri + Vue 3 + FastAPI，后端以 sidecar 随应用分发。
 |---|---|
 | 阶段0 拆书 | 按章节拆分，支持无分隔符格式；**人工确认**后继续；识别不准可填自定义章节标记重拆 |
 | 阶段1 诊断 | 逐批次生成章节摘要、人物状态、断层诊断；**人工勾选**要修复的断层 |
-| 阶段2 蓝图 | 汇总全书重构建议书；**人工确认/编辑**后进入重构 |
-| 阶段3 重构+缝合 | 按章重构；跨批次、跨虚拟章边界执行文字缝合；**逐章验收** |
-| 阶段4 收尾 | 合并输出 txt/docx，备份旧稿，生成缝合报告 |
+| 阶段2 蓝图 | 分卷压缩全书摘要后汇总重构建议书（长书覆盖首尾）；**人工确认/编辑**后进入重构 |
+| 阶段3 重构+缝合 | 按章重构，自动带入上一批结尾与前情摘要；批次落盘前做内容级质检，硬伤自动重写一次；跨批次、跨虚拟章边界执行文字缝合（单处失败降级跳过，不报废整轮）；**逐章验收** |
+| 阶段4 收尾 | 合并输出 txt/docx（可选富文本：章标题样式 + 章间分页），备份旧稿，生成缝合报告与质量报告 |
 
 所有闸门都是**无界等待**（`while not Event`）——程序会一直停在那里等你确认，
 漏掉任何一个都会让任务假死。前端靠 `/api/status` 的 `resume` 字段在刷新后恢复弹窗。
@@ -23,6 +23,13 @@ Tauri + Vue 3 + FastAPI，后端以 sidecar 随应用分发。
 ### 其他能力
 
 - **上下文预算**：按 token 估算自动分批；上下文超限时对半拆批自愈
+- **跨批连续性**：重构下一批时带入上一批结尾（优先重构稿，未写完则回退原文），避免称谓/伏笔断层
+- **前情摘要**：同时带入上一批的诊断摘要（剧情走向 + 人物状态），补蓝图之外的局部事实一致性
+- **内容级质检**：空章、塌缩、占位、AI 元话术、残留标记、重复章等硬伤会在落盘前拦截；开启自动重写时每批最多重写一次（整轮有上限）
+- **缝合降级**：缝合输出契约不合格会带错因重试一次；仍失败则跳过该交界、保留原文，并计入质量报告，不再让整本已重构好的稿子报废
+- **有界并发**：默认串行；云端可将并发批次数调到 2-4，本地小模型建议保持 1
+- **docx 富文本**：勾选后章标题用 Word 标题样式、章间分页、`**粗体**`/`*斜体*` 生效；不勾选保持原有纯段落排版
+- **质量报告**：每次成功运行生成 `_diagnostics/quality_report.json`，界面可查看逐章指标与问题证据
 - **断点续跑**：中断后重跑同一输出目录，只做未完成的批次，并检测配置漂移
 - **成品版本**：重跑覆盖前自动快照上一版，可回滚
 - **任务历史**：跨会话记录跑过哪些书、停在哪、为什么停
@@ -68,7 +75,8 @@ Rust 外壳先解析目录，再经环境变量注入 sidecar，避免两侧各�
 2. 前端只能经 Tauri IPC（同进程）取到
 3. 后端纯 ASGI 中间件校验 `X-TextForge-Token`
 
-`/api/health` 豁免（不返回任何数据，供探活）。未配置 token 时放行（开发/测试）。
+`/api/health` 豁免（不返回任何数据，供探活）。**未配置 token 时默认拒绝**（即使没注入 token 也不会放行）；
+只有显式设置 `TEXTFORGE_DEV=1` 才关闭鉴权，`run_dev.ps1` 与 e2e 已设置。
 
 > 注意：外壳自己发起的 HTTP 调用**也必须**带 token，漏带会让关窗时的
 > `/api/stop`、`/api/system/shutdown` 被 401 静默拒绝，优雅退出退化成强杀。
@@ -118,13 +126,13 @@ npm run tauri dev               # 终端 B
 
 ```bash
 cd backend
-venv\Scripts\python regression_test.py    # 249 项 单元/回归
-venv\Scripts\python test_event_stream.py  # 20 项 事件流
-venv\Scripts\python -m pytest tests -q    # 7 项
-venv\Scripts\python test_e2e_pipeline.py  # 98 项 端到端
+venv\Scripts\python regression_test.py    # 回归 / 单元
+venv\Scripts\python test_event_stream.py  # SSE 事件流
+venv\Scripts\python -m pytest tests -q    # pytest 单元
+venv\Scripts\python test_e2e_pipeline.py  # 端到端（含并发/连续性/自动重写）
 
-cd ..\src-tauri && cargo test             # 10 项 Rust
-cd .. && npm run test                     # 7 项 前端
+cd ..\src-tauri && cargo test             # Rust 单元
+cd .. && npm run test                     # 前端单元
 npm run lint                              # ESLint 代码质量
 npm run format:check                      # Prettier 排版检查
 npm run build                             # 类型检查 + 构建

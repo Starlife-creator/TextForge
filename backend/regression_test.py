@@ -22,6 +22,10 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 sys.path.insert(0, str(Path(__file__).parent))
+# 回归脚本大量用 TestClient 直接打 API；显式开发模式关闭鉴权。
+# 鉴权专项测试会临时移除该变量，验证「未配置 token 默认拒绝」。
+_REAL_DEV = os.environ.get("TEXTFORGE_DEV")
+os.environ["TEXTFORGE_DEV"] = "1"
 # 绝不改 %APPDATA%：Windows 上它总是有值，改了等于污染开发者真实环境。
 # 需要隔离目录的测试各自用 tempfile.mkdtemp，并断言真实 APPDATA 未被触碰。
 _REAL_APPDATA = os.environ.get("APPDATA")
@@ -807,14 +811,30 @@ from app import app as _app2
 
 _real_tok = os.environ.get(_AUTH.ENV_KEY)
 try:
-    # 1) 未注入 = 开发/测试模式，必须放行（否则所有测试都会被 401 拦死）
+    # 1) 无 token 且非开发模式 = 生产默认拒绝。
+    # 这是安全边界：backend.exe 被手动启动、又没有外壳注入 token 时，
+    # 任意本地进程/网页都不能匿名调用 /api/start 读写任意路径。
     os.environ.pop(_AUTH.ENV_KEY, None)
-    check("未配置 token 时鉴权不启用", _AUTH.is_enforced() is False, "")
+    os.environ.pop("TEXTFORGE_DEV", None)
+    check("未配置 token 时默认拒绝", _AUTH.is_enforced() is True, "")
+    check("未配置 token 时比对必然失败", _AUTH.check({}) is False, "")
     with _TC2(_app2) as _c:
-        check("未配置 token 时正常放行", _c.get("/api/health").status_code == 200,
+        check("未配置 token 时 /api/health 仍可探活",
+              _c.get("/api/health").status_code == 200,
               str(_c.get("/api/health").status_code))
+        check("未配置 token 时业务接口返回 401",
+              _c.get("/api/status").status_code == 401,
+              str(_c.get("/api/status").status_code))
 
-    # 2) 注入后必须校验
+    # 2) 显式开发模式放行（run_dev.ps1 / e2e 使用）
+    os.environ["TEXTFORGE_DEV"] = "1"
+    check("开发模式关闭鉴权", _AUTH.is_enforced() is False, "")
+    with _TC2(_app2) as _c:
+        check("开发模式下正常放行", _c.get("/api/status").status_code == 200,
+              str(_c.get("/api/status").status_code))
+    os.environ.pop("TEXTFORGE_DEV", None)
+
+    # 3) 注入 token 后必须校验
     os.environ[_AUTH.ENV_KEY] = "s3cret-token-for-test"
     check("配置 token 后鉴权启用", _AUTH.is_enforced() is True, "")
     check("比对逻辑：正确 token 通过", _AUTH.check({_AUTH.HEADER: "s3cret-token-for-test"}))
@@ -845,6 +865,11 @@ finally:
         os.environ.pop(_AUTH.ENV_KEY, None)
     else:
         os.environ[_AUTH.ENV_KEY] = _real_tok
+    if _REAL_DEV is None:
+        # 本脚本其余用例仍要通过 TestClient 调 API，继续用开发模式。
+        os.environ["TEXTFORGE_DEV"] = "1"
+    else:
+        os.environ["TEXTFORGE_DEV"] = _REAL_DEV
 
 # ---------- 优雅退出钩子（/api/shutdown） ----------
 # 这条路由必须在**随 app 注册的路由表**里，而不是 main.py 的 __main__ 块里：

@@ -4084,7 +4084,7 @@ dependencies = [
 
 [[package]]
 name = "textforge"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "libc",
  "reqwest 0.12.28",

@@ -137,6 +137,16 @@ function rowStatus(row: QualityChapterRow): string {
             <span class="q-k">改名残留</span>
             <b>{{ fmt(report.summary.old_name_hits) }}</b>
           </div>
+          <div v-if="report.summary.auto_rewrites" class="q-stat">
+            <span class="q-k">自动重写</span>
+            <b>{{ fmt(report.summary.auto_rewrites) }}</b>
+            <span class="hint">批</span>
+          </div>
+          <div v-if="report.summary.stitch_failures" class="q-stat">
+            <span class="q-k">缝合跳过</span>
+            <b>{{ fmt(report.summary.stitch_failures) }}</b>
+            <span class="hint">处</span>
+          </div>
         </div>
 
         <h4 class="q-h4">问题清单</h4>

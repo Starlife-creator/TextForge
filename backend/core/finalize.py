@@ -1,7 +1,7 @@
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
 from utils.sort import natural_sort_key
-from core.document import write_text_docx
+from core.document import write_chapters_docx
 import shutil, datetime, logging
 
 logger = logging.getLogger("textforge")
@@ -120,10 +120,11 @@ def phase4_finalize(output_path: Path, progress: dict, req):
             else: raise
     
     novel_name = _safe_filename(progress.get('novel_name') or '重构终稿')
+    rich = bool(getattr(req, "rich_text", False))
 
     if req.input_mode == "single_file":
         output_file = final_dir / f"{novel_name}_重构终稿.{output_format}"
-        _write_with_backup(output_file, merged_texts, output_format, backup_dir)
+        _write_with_backup(output_file, merged_texts, output_format, backup_dir, rich=rich)
     else:
         # 逐章文件名必须去非法字符 + 去重：多文件模式允许 txt/md/docx 混放，
         # 「001.txt」与「001.md」会生成同一个 重构_001.{fmt}，后者静默覆盖前者。
@@ -138,9 +139,9 @@ def phase4_finalize(output_path: Path, progress: dict, req):
                 out_name = f"重构_{stem}({n}).{output_format}"
             used.add(out_name)
             output_file = final_dir / out_name
-            _write_with_backup(output_file, [text], output_format, backup_dir)
+            _write_with_backup(output_file, [text], output_format, backup_dir, rich=rich)
         output_file = final_dir / f"{novel_name}_重构终稿.{output_format}"
-        _write_with_backup(output_file, merged_texts, output_format, backup_dir)
+        _write_with_backup(output_file, merged_texts, output_format, backup_dir, rich=rich)
     
     _cleanup_backups(backup_dir)
     write_stitch_report(output_path, progress)
@@ -164,7 +165,8 @@ def phase4_finalize(output_path: Path, progress: dict, req):
         logger.warning(f"[finalize] 质量报告生成失败（不影响成品）: {e}")
     logger.info(f"[finalize] 输出完成 -> {final_dir}")
 
-def _write_with_backup(output_file: Path, texts: list, ext: str, backup_dir: Path):
+def _write_with_backup(output_file: Path, texts: list, ext: str, backup_dir: Path,
+                       *, rich: bool = False):
     if output_file.exists():
         backup_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -175,6 +177,6 @@ def _write_with_backup(output_file: Path, texts: list, ext: str, backup_dir: Pat
             i += 1
         shutil.copy2(output_file, backup_file)
     if ext == "docx":
-        write_text_docx("\n\n---\n\n".join(texts), str(output_file))
+        write_chapters_docx(texts, str(output_file), rich=rich, title=output_file.stem)
     else:
         atomic_write_text(output_file, "\n\n---\n\n".join(texts))

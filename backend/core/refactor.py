@@ -1,4 +1,4 @@
-import asyncio, re, logging, html, hashlib
+import asyncio, re, logging, html, hashlib, json
 from collections import deque
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
@@ -7,11 +7,21 @@ from routes.events import sse_emit
 from core.stitch import stitch_pipeline
 from core.api_client import (call_with_retry, RetryableBusinessError,
                              ContextOverflowError, pick_endpoint)
-from core.budget import output_token_reserve
+from core.budget import output_token_reserve, story_memo_token_allowance
 from core.batching import split_batch_in_progress as _split_batch_in_progress
+from core.quality import assess_batch_texts, has_blocking_issues
 from utils.tokens import estimate_tokens
 
 logger = logging.getLogger("textforge")
+
+# 跨批连续性上下文的稳定标记（mock/测试据此判断提示词是否带上了上一批结尾）。
+CONTINUITY_MARK = "【上一批结尾（仅用于衔接）】"
+CONTINUITY_CHARS = 600
+# 前情摘要：补「事实/人物状态一致」，与结尾片段补「文风衔接」互补。
+STORY_MEMO_MARK = "【前情摘要（仅用于保持事实一致）】"
+
+# 自动重写只兜「结构性硬伤」：每批最多一次，整轮有上限，避免坏模型无限烧钱。
+AUTO_REWRITE_MAX_PER_RUN = 3
 
 class ChapterBreakMissingError(RetryableBusinessError):
     """v8.8 修正：继承 RetryableBusinessError，才能进入 call_with_retry 的重试路径。"""
@@ -57,8 +67,14 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     # 含 phase3_done：恢复时跳过已完成的批次（否则会重复计费并覆盖已产出稿）
     completed_batches = [b for b in progress['batches'] if b['status'] in ('phase1_done', 'phase3_done')]
 
+    max_conc = _effective_concurrency(req, gates)
+    if max_conc > 1:
+        logger.info(f"[phase3] 并发波前 max_concurrency={max_conc}")
+        sse_emit("phase_note", {"phase": "phase3",
+                                "message": f"并发重构：每波最多 {max_conc} 批"}, run_id)
+
     async with make_httpx_client(req, api_url=ep_ref["api_url"], api_key=ep_ref["api_key"]) as client:
-        # 阶段 3-1：无重叠重构
+        # 阶段 3-1：重构（默认串行；可选有界并发波前）
         #
         # 用 deque 而不是 for：当某批触发「上下文超限」或「分隔符契约失败」时，
         # 要把该批**对半拆细**再重新入队重跑，而不是让整轮报废。
@@ -66,67 +82,101 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         # 配置填错（或模型比预期弱）时，代价应当是「批次更多、更慢」，而不是「报错、跑不完」。
         queue = deque(b for b in completed_batches if b['status'] != 'phase3_done')
         while queue:
-            batch = queue.popleft()
-            if batch['status'] == 'phase3_done':
-                continue
             if state.stop_requested: raise asyncio.CancelledError()
             await _wait_pause()
 
-            # 自适应上限：一旦发现过「撑爆」的批次，就把后续批次也预先拆到同尺度，
-            # 避免每批都先浪费一次失败调用（本地模型一次失败可能就是几分钟）。
-            cap = progress.get('adaptive_max_chapters')
-            if cap and len(batch['chapter_ids']) > cap:
-                parts = _split_batch_in_progress(progress, batch, reason="adaptive",
-                                                 detail=f"参考已失败批次，单批章数上限降为 {cap}",
-                                                 run_id=run_id)
-                if parts:
-                    queue.extendleft(reversed(parts))
-                    async with state.progress_lock:
-                        atomic_write_json(progress_path, progress)
+            wave = []
+            while queue and len(wave) < max_conc:
+                batch = queue.popleft()
+                if batch['status'] == 'phase3_done':
                     continue
+                # 自适应上限：一旦发现过「撑爆」的批次，就把后续批次也预先拆到同尺度，
+                # 避免每批都先浪费一次失败调用（本地模型一次失败可能就是几分钟）。
+                cap = progress.get('adaptive_max_chapters')
+                if cap and len(batch['chapter_ids']) > cap:
+                    parts = _split_batch_in_progress(progress, batch, reason="adaptive",
+                                                     detail=f"参考已失败批次，单批章数上限降为 {cap}",
+                                                     run_id=run_id)
+                    if parts:
+                        queue.extendleft(reversed(parts))
+                        await _save_progress(progress, progress_path)
+                        continue
+                wave.append(batch)
+            if not wave:
+                continue
 
-            try:
-                output_files = await _refactor_and_split(
+            # 衔接优先用上一章的**重构稿**（文风最连续）；同波次前批可能还没写完，
+            # 此时自动退回该章原文，保证不空等、也不会跳过衔接。
+            results = await asyncio.gather(*[
+                _run_refactor_batch(
                     client, req, output_path, recon_dir, blueprint_text,
-                    progress, batch, run_id, ep_ref)
-            except ContextOverflowError as e:
-                # 第 2 层：上下文超限 → 对半拆批重跑
-                parts = _split_batch_in_progress(
-                    progress, batch, reason="overflow",
-                    detail=(f"模型上限 {e.available} token" if e.available else "超出模型上下文窗口"),
-                    run_id=run_id)
-                async with state.progress_lock:
-                    atomic_write_json(progress_path, progress)
-                if not parts:
-                    # 只含 1 章（或 1 个不可拆的虚拟组）仍超限：给出可执行的建议
-                    raise RuntimeError(
-                        f"单章仍超出模型上下文：批次 {batch['batch_id']} 章节={batch['chapter_ids']}，"
-                        + (f"模型上限约 {e.available} token。" if e.available else "模型上下文不足。")
-                        + "请调大模型上下文长度，或在导入时把该章拆成更小的文件。") from e
-                queue.extendleft(reversed(parts))
-                continue
-            except ChapterBreakMissingError as e:
-                # 第 4 层：小模型在长上下文里维持不住分隔符契约 → 同样降级拆批，
-                # 让每批章数更少、要吐的分隔符更少，而不是重发同样大小的请求碰运气。
-                parts = _split_batch_in_progress(
-                    progress, batch, reason="contract", detail=str(e)[:120], run_id=run_id)
-                async with state.progress_lock:
-                    atomic_write_json(progress_path, progress)
-                if not parts:
-                    raise  # 单章还失败：交给上层报错（此时拆无可拆）
-                queue.extendleft(reversed(parts))
-                continue
+                    progress, batch, run_id, ep_ref,
+                    continuity=_continuity_for_batch(output_path, progress, batch),
+                )
+                for batch in wave
+            ], return_exceptions=True)
 
-            async with state.progress_lock:
-                atomic_write_json(progress_path, progress)
-            logger.info(f"[phase3] batch {batch['batch_id']} 完成 文件={output_files}")
-            sse_emit("batch_done", {"batch_id": batch['batch_id'], "output_files": output_files}, run_id)
-            # 逐章验收门：开启时每个批次重构稿产出后暂停，等待用户验收再继续
-            if gates.get("require_chapter_accept"):
-                await _wait_batch_accept(progress, progress_path, batch, output_path, run_id)
-            # 铁律8：批次间保持串行间隔，避免连续请求触发云端限流（间隔可配置，缺省 2s）
+            for batch, result in zip(wave, results, strict=False):
+                if isinstance(result, ContextOverflowError):
+                    # 第 2 层：上下文超限 → 对半拆批重跑
+                    parts = _split_batch_in_progress(
+                        progress, batch, reason="overflow",
+                        detail=(f"模型上限 {result.available} token" if result.available
+                                else "超出模型上下文窗口"),
+                        run_id=run_id)
+                    await _save_progress(progress, progress_path)
+                    if not parts:
+                        # 只含 1 章（或 1 个不可拆的虚拟组）仍超限：给出可执行的建议
+                        raise RuntimeError(
+                            f"单章仍超出模型上下文：批次 {batch['batch_id']} 章节={batch['chapter_ids']}，"
+                            + (f"模型上限约 {result.available} token。" if result.available
+                               else "模型上下文不足。")
+                            + "请调大模型上下文长度，或在导入时把该章拆成更小的文件。") from result
+                    queue.extendleft(reversed(parts))
+                    continue
+                if isinstance(result, ChapterBreakMissingError):
+                    # 第 4 层：小模型在长上下文里维持不住分隔符契约 → 同样降级拆批，
+                    # 让每批章数更少、要吐的分隔符更少，而不是重发同样大小的请求碰运气。
+                    parts = _split_batch_in_progress(
+                        progress, batch, reason="contract", detail=str(result)[:120], run_id=run_id)
+                    await _save_progress(progress, progress_path)
+                    if not parts:
+                        raise result  # 单章还失败：交给上层报错（此时拆无可拆）
+                    queue.extendleft(reversed(parts))
+                    continue
+                if isinstance(result, BaseException):
+                    raise result
+
+                output_files, batch_issues = result
+                logger.info(f"[phase3] batch {batch['batch_id']} 完成 文件={output_files}"
+                            + (f" 遗留质检问题={len(batch_issues)}" if batch_issues else ""))
+                sse_emit("batch_done", {"batch_id": batch['batch_id'],
+                                        "output_files": output_files,
+                                        "qc_issues": len(batch_issues)}, run_id)
+                # 逐章验收门：开启时每个批次重构稿产出后暂停，等待用户验收再继续
+                if gates.get("require_chapter_accept"):
+                    await _wait_batch_accept(progress, progress_path, batch, output_path, run_id)
+
+            await _save_progress(progress, progress_path)
+            # 铁律8：波次间保持间隔，避免连续请求触发云端限流（间隔可配置，缺省 2s）
             if queue:
                 await asyncio.sleep(getattr(req, "batch_interval_sec", 2.0))
+
+        # 缝合前汇总本批**硬伤**遗留问题：不阻断（已有自动重写兜底），
+        # 但要写进 progress 与最终质量报告，避免「自动重写过了」被当成没问题。
+        # 只收 bad：篇幅偏离等 warn 已由质量报告逐章列出，不能每轮都刷一条「遗留」。
+        pre_issues = [
+            issue
+            for issues in (progress.get('batch_qc') or {}).values()
+            for issue in (issues or [])
+            if issue.get("severity") == "bad"
+        ]
+        if pre_issues:
+            progress['pre_stitch_issues'] = pre_issues[:200]
+            sse_emit("qc_warning", {"count": len(pre_issues),
+                                    "issues": pre_issues[:20]}, run_id)
+            logger.warning(f"[phase3] 质检遗留 {len(pre_issues)} 项，已写入质量报告")
+            await _save_progress(progress, progress_path)
     
     # 阶段 3-2：缝合（用缝合阶段的独立端点 client）
     # 注意：必须与上面的重构 client 平级，否则重构的连接池会在整个缝合阶段空占
@@ -177,6 +227,14 @@ async def regen_single_chapter(req, output_path, chapter_id):
         blueprint_text = (output_path / "Story_Bible.md").read_text(encoding='utf-8')
     except OSError:
         blueprint_text = ""
+    try:
+        progress = json.loads((output_path / "progress.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        progress = {}
+    continuity = _continuity_for_batch(output_path, progress, {"chapter_ids": [chapter_id]})
+    story_memo = _story_memo_for_batch(
+        output_path, progress, {"chapter_ids": [chapter_id]},
+        limit=story_memo_token_allowance(req.context_window))
     gates = getattr(req, "refactor_gates", {}) or {}
     prompt = _build_refactor_prompt(
         getattr(req, "refactor_mode", "full_rewrite"),
@@ -186,6 +244,8 @@ async def regen_single_chapter(req, output_path, chapter_id):
         fix_list=getattr(req, "fix_list", []) or [],
         gates=gates,
         n_chapters=1,   # 单章重生成：明确要求不输出分隔符
+        continuity=continuity,
+        story_memo=story_memo,
     )
     payload = {
         "model": ep["model"],
@@ -211,11 +271,184 @@ async def regen_single_chapter(req, output_path, chapter_id):
     return new_text
 
 
-async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_text,
-                              progress, batch, run_id, ep=None):
-    """v8.8 新增：将 '调用 + 按章拆分' 包成一个可重试单元。
-    这样 ChapterBreakMissingError 由 call_with_retry 捕获并重试（而非在返回后丢失）。
-    A2：ep = pick_endpoint(req,'refactor')，未传则回退全局（单厂商兼容）。"""
+async def _save_progress(progress, progress_path):
+    async with state.progress_lock:
+        atomic_write_json(progress_path, progress)
+
+
+def _effective_concurrency(req, gates) -> int:
+    """有界并发：默认 1（串行）；逐章验收要求严格顺序，强制串行。"""
+    try:
+        n = int(getattr(req, "max_concurrency", 1) or 1)
+    except (TypeError, ValueError):
+        n = 1
+    n = max(1, min(4, n))
+    if n > 1 and (gates or {}).get("require_chapter_accept"):
+        logger.info("[phase3] 逐章验收开启，强制串行")
+        return 1
+    return n
+
+
+def _read_optional(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", newline="")
+    except OSError:
+        return ""
+
+
+def _tail_for_prompt(text: str, limit: int = CONTINUITY_CHARS) -> str:
+    """取结尾片段，尽量从句子边界开始，避免把一句话拦腰截断。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    tail = text[-limit:]
+    # 只在开头这段里找第一个句末标点；若切完剩不下多少内容，就保留完整尾巴。
+    for pos in range(min(80, len(tail))):
+        if tail[pos] in "。！？\n":
+            if len(tail) - pos - 1 >= 40:
+                tail = tail[pos + 1:]
+            break
+    return "……" + tail.strip()
+
+
+def _continuity_for_batch(output_path, progress, batch) -> str:
+    """取当前批次之前最近一章的结尾，用于衔接称谓、语气与未回收伏笔。
+
+    优先读该章的**重构稿**（文风最连续）；并发时同波次前批可能还没写完，
+    自动退回该章**原文**，仍为空才继续向前找，避免跳过衔接。
+    """
+    chapters = progress.get("chapters") or []
+    ids = [str(c.get("id")) for c in chapters]
+    try:
+        start = ids.index(str(batch["chapter_ids"][0]))
+    except (KeyError, ValueError, IndexError):
+        return ""
+    for i in range(start - 1, -1, -1):
+        ch = chapters[i]
+        if ch.get("is_empty"):
+            continue
+        cid = str(ch.get("id"))
+        split_file = ch.get("split_file") or f"02_workspace/split/{cid}.txt"
+        text = _read_optional(output_path / "02_workspace/reconstructed" / f"chapter_{cid}.txt")
+        if not text.strip():
+            text = _read_optional(output_path / split_file)
+        tail = _tail_for_prompt(text)
+        if tail:
+            return tail
+    return ""
+
+
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?[\s\S]*?```", re.IGNORECASE)
+
+
+def _compact_story_memo(text: str, limit: int) -> str:
+    """把上一批诊断压成「剧情 + 人物状态」两段，去掉 JSON 与断层建议。
+
+    断层建议只针对上一批，本批不应再照着改；保留会误导模型重复修已经修过的地方。
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    text = _JSON_BLOCK_RE.sub("", text).strip()
+    text = re.split(r"【结构化诊断", text, maxsplit=1)[0].strip()
+
+    summary = ""
+    state = ""
+    m = re.search(r"章节摘要[\s\S]*?(?=\n\s*\d[.、]\s*|\n\s*人物状态|$)", text)
+    if m:
+        summary = m.group(0).strip()
+    m = re.search(r"人物状态[\s\S]*?(?=\n\s*\d[.、]\s*|\n\s*断层诊断|$)", text)
+    if m:
+        state = m.group(0).strip()
+    merged = "\n".join(x for x in (summary, state) if x) or text
+    merged = re.sub(r"\n{3,}", "\n\n", merged).strip()
+    if len(merged) <= limit:
+        return merged
+    return merged[: max(0, limit - 1)].rstrip() + "……"
+
+
+def _story_memo_for_batch(output_path, progress, batch, limit: int = 500) -> str:
+    """取最近一个与当前批次无章节重叠的已诊断批次的摘要。"""
+    batches = progress.get("batches") or []
+    current = {str(c) for c in (batch.get("chapter_ids") or [])}
+    if not current or not batches:
+        return ""
+    idx = next(
+        (i for i, b in enumerate(batches) if b.get("batch_id") == batch.get("batch_id")),
+        None,
+    )
+    if idx is None:
+        # 单章重生成只传 chapter_ids，没有 batch_id：按章节归属定位
+        idx = next(
+            (i for i, b in enumerate(batches)
+             if current & {str(c) for c in (b.get("chapter_ids") or [])}),
+            None,
+        )
+    if idx is None:
+        return ""
+    output_path = Path(output_path)
+    for prev in reversed(batches[:idx]):
+        if current & {str(c) for c in (prev.get("chapter_ids") or [])}:
+            continue
+        sid = prev.get("batch_id")
+        if sid is None:
+            continue
+        try:
+            text = _read_optional(output_path / f"01_summaries/batch_{int(sid):02d}.txt")
+        except (TypeError, ValueError):
+            continue
+        memo = _compact_story_memo(text, limit)
+        if memo:
+            return memo
+    return ""
+
+
+def _assess_batch(req, progress, output_path, batch, chapter_texts) -> list[dict]:
+    return assess_batch_texts(
+        chapters=progress.get("chapters") or [],
+        chapter_ids=batch["chapter_ids"],
+        texts=chapter_texts,
+        output_path=output_path,
+        forbidden_canon=getattr(req, "forbidden_canon", []) or [],
+        name_map=getattr(req, "name_map", {}) or {},
+        refactor_mode=getattr(req, "refactor_mode", "full_rewrite"),
+        gates=getattr(req, "refactor_gates", {}) or {},
+    )
+
+
+def _quality_feedback(issues, n_chapters: int) -> str:
+    lines = [f"- {i['message']}" for i in issues[:8]]
+    need = max(0, int(n_chapters or 1) - 1)
+    return (
+        "你上一次的输出未通过结构性质检，请重新完整输出本批全部章节：\n"
+        + "\n".join(lines)
+        + f"\n\n仍按原要求输出 {need} 个 ===CHAPTER_BREAK===；"
+        "不要解释，不要省略，不要用占位文本。\n"
+    )
+
+
+def _issue_weight(issues) -> tuple[int, int]:
+    bad = sum(1 for i in issues or [] if i.get("severity") == "bad")
+    return bad, len(issues or [])
+
+
+def _should_auto_rewrite(req, gates, progress, batch, issues) -> bool:
+    if not (gates or {}).get("auto_rewrite_bad_batch", True):
+        return False
+    if not has_blocking_issues(issues):
+        return False
+    bid = str(batch.get("batch_id"))
+    if bid in (progress.get("auto_rewritten_batches") or []):
+        return False
+    return int(progress.get("auto_rewrite_count", 0) or 0) < AUTO_REWRITE_MAX_PER_RUN
+
+
+async def _request_refactor_text(client, req, output_path, blueprint_text,
+                                 progress, batch, run_id, ep,
+                                 *, continuity: str = "", feedback: str = ""):
+    """调用模型并校验分隔符契约；不落盘，便于质检后决定保留哪一版。"""
     ep = ep or pick_endpoint(req, "refactor")
     chapter_ids = batch['chapter_ids']
     # 批次与章节表的一致性前置校验：否则下面 _find_idx 抛错时无从判断是哪个批次出的问题
@@ -226,7 +459,8 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
             f"批次 {batch.get('batch_id')} 引用了 progress['chapters'] 中不存在的章 {missing}；"
             f"progress.json 很可能来自不兼容的旧版本，建议换一个输出目录重跑")
     batch_content = "\n\n".join(
-        (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file']).read_text(encoding='utf-8', newline='')
+        (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file'])
+        .read_text(encoding='utf-8', newline='')
         for cid in chapter_ids
     )
     prompt = _build_refactor_prompt(
@@ -237,6 +471,10 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
         fix_list=progress.get('fix_list') or getattr(req, "fix_list", []) or [],
         gates=getattr(req, "refactor_gates", {}) or {},
         n_chapters=len(chapter_ids),
+        continuity=continuity,
+        story_memo=_story_memo_for_batch(
+            output_path, progress, batch,
+            limit=story_memo_token_allowance(req.context_window)),
     )
     payload = {
         "model": ep["model"], "messages": [{"role": "user", "content": prompt}],
@@ -246,8 +484,13 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
         "max_tokens": output_token_reserve(estimate_tokens(batch_content)),
         "stream": True,
     }
-    logger.info(f"[phase3] batch {batch['batch_id']} 开始 章节={chapter_ids}")
-    sse_emit("batch_start", {"batch_id": batch['batch_id'], "chapter_ids": chapter_ids}, run_id)
+    if feedback:
+        payload["messages"].append({"role": "user", "content": feedback})
+        payload["temperature"] = max(0.0, min(payload["temperature"], 0.5))
+    logger.info(f"[phase3] batch {batch['batch_id']} 开始 章节={chapter_ids}"
+                + ("（质检重写）" if feedback else ""))
+    sse_emit("batch_start", {"batch_id": batch['batch_id'], "chapter_ids": chapter_ids,
+                             "rewrite": bool(feedback)}, run_id)
 
     # 「分隔符数量不符」要能真正重试，必须同时满足两点，原实现**两点都没做到**：
     #   1. 契约校验放在 call_with_retry 的 validate 里。原先是在它返回**之后**才拆分，
@@ -259,12 +502,14 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
     def _validate(text: str) -> None:
         _parsed["chapters"] = _split_refactored_by_chapters(text, chapter_ids)
 
-    result, usage, _ = await call_with_retry(
+    _result, usage, _ = await call_with_retry(
         client, ep["api_url"], payload, sse_emit, run_id,
         on_retry=_break_feedback(len(chapter_ids)),
         validate=_validate)
-    chapter_texts = _parsed["chapters"]
-    
+    return _parsed["chapters"], usage
+
+
+def _persist_batch_outputs(req, output_path, recon_dir, progress, batch, chapter_texts):
     output_files = []
     for cid, ctext in chapter_texts.items():
         rel = f"02_workspace/reconstructed/chapter_{cid}.txt"
@@ -279,15 +524,62 @@ async def _refactor_and_split(client, req, output_path, recon_dir, blueprint_tex
         output_files.append(rel)
 
     for v in progress.setdefault('virtual_chapter_map', []):
-        if v['virtual_id'] in chapter_ids:
+        if v['virtual_id'] in batch['chapter_ids']:
             v['output_file'] = f"02_workspace/reconstructed/chapter_{v['virtual_id']}.txt"
             v['batch_id'] = batch['batch_id']
 
-    from core.splitter import _accum_usage
-    _accum_usage(progress, usage)
     batch['status'] = 'phase3_done'
     batch['output_files'] = output_files
     return output_files
+
+
+async def _run_refactor_batch(client, req, output_path, recon_dir, blueprint_text,
+                              progress, batch, run_id, ep, *, continuity: str = ""):
+    """单批重构 + 内容级质检 + 至多一次带反馈的自动重写。"""
+    from core.splitter import _accum_usage
+
+    chapter_texts, usage = await _request_refactor_text(
+        client, req, output_path, blueprint_text, progress, batch, run_id, ep,
+        continuity=continuity)
+    _accum_usage(progress, usage)
+    issues = _assess_batch(req, progress, output_path, batch, chapter_texts)
+
+    gates = getattr(req, "refactor_gates", {}) or {}
+    if _should_auto_rewrite(req, gates, progress, batch, issues):
+        bid = str(batch.get('batch_id'))
+        progress.setdefault('auto_rewritten_batches', []).append(bid)
+        progress['auto_rewrite_count'] = int(progress.get('auto_rewrite_count', 0) or 0) + 1
+        sse_emit("qc_auto_rewrite", {
+            "batch_id": batch.get('batch_id'), "count": len(issues),
+            "issues": issues[:10],
+            "message": f"批次 {bid} 检测到 {len(issues)} 项结构性硬伤，正在自动重写一次",
+        }, run_id)
+        logger.warning(f"[phase3] batch {bid} 命中 {len(issues)} 项质检硬伤，自动重写一次")
+        try:
+            rewritten, usage2 = await _request_refactor_text(
+                client, req, output_path, blueprint_text, progress, batch, run_id, ep,
+                continuity=continuity, feedback=_quality_feedback(issues, len(batch['chapter_ids'])))
+            _accum_usage(progress, usage2)
+            issues2 = _assess_batch(req, progress, output_path, batch, rewritten)
+            keep_rewrite = _issue_weight(issues2) <= _issue_weight(issues)
+            if keep_rewrite:
+                chapter_texts, issues = rewritten, issues2
+            progress.setdefault('auto_rewrite_log', []).append({
+                "batch_id": batch.get('batch_id'),
+                "before": issues,
+                "after": issues2,
+                "kept": "rewrite" if keep_rewrite else "original",
+            })
+        except Exception as e:
+            # 重写失败不能让批次报废：首次输出至少满足分隔符契约，保留它。
+            logger.warning(f"[phase3] batch {bid} 自动重写未成功，保留首次输出: {e}")
+            progress.setdefault('auto_rewrite_log', []).append({
+                "batch_id": batch.get('batch_id'), "error": str(e)[:200], "kept": "original",
+            })
+
+    output_files = _persist_batch_outputs(req, output_path, recon_dir, progress, batch, chapter_texts)
+    progress.setdefault('batch_qc', {})[str(batch.get('batch_id'))] = issues[:50]
+    return output_files, issues
 
 def _find_idx(chapters, cid):
     for i, c in enumerate(chapters):
@@ -362,23 +654,43 @@ def _break_feedback(n_chapters: int):
 
 def _build_refactor_prompt(mode, blueprint, author_style, batch_content, *,
                            forbidden_canon=(), name_map=None, fix_list=(), gates=None,
-                           n_chapters=1):
+                           n_chapters=1, continuity="", story_memo=""):
     """按重构档位选择提示词。缺省/未知 mode 一律回退 full_rewrite（原行为）。
     档位提示词构建后，若启用了任何「保护门」(lock_names/lock_plot/inject_forbidden)，
     追加一段强制规则；全关时完全不加，旧行为不变。
 
     n_chapters：本批实际章数，必须传真实值 —— 分隔条数契约（_common_tail）依赖它。
+    continuity：上一批结尾片段，只用于跨批文风衔接。
+    story_memo：上一批诊断摘要，只用于人物状态与已知事实的一致性。
     """
     n_chapters = max(1, int(n_chapters or 1))
     mode = mode or "full_rewrite"
+    blocks = []
+    if story_memo:
+        blocks.append(
+            f"{STORY_MEMO_MARK}\n{story_memo}\n\n"
+            "【事实一致性要求】以上摘要只用于保持人物状态、称谓与已知事实一致；"
+            "不要照抄、不要复述、不要把它当作待处理正文。\n"
+        )
+    if continuity:
+        blocks.append(
+            f"{CONTINUITY_MARK}\n{continuity}\n\n"
+            "【衔接要求】以上内容只用于保持称谓、语气和未回收伏笔的连续；"
+            "不要复述、不要续写、不要把它当作待处理正文。\n"
+        )
+    carryover_block = ("\n".join(blocks) + "\n") if blocks else ""
     if mode == "fidelity":
-        prompt = _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates, n_chapters)
+        prompt = _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon,
+                                  gates, n_chapters, carryover_block)
     elif mode == "fix_gaps":
-        prompt = _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates, n_chapters)
+        prompt = _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon,
+                                  fix_list, gates, n_chapters, carryover_block)
     elif mode == "reskin":
-        prompt = _prompt_reskin(blueprint, author_style, batch_content, name_map, n_chapters)
+        prompt = _prompt_reskin(blueprint, author_style, batch_content, name_map,
+                                n_chapters, carryover_block)
     else:
-        prompt = _prompt_full_rewrite(blueprint, author_style, batch_content, n_chapters)
+        prompt = _prompt_full_rewrite(blueprint, author_style, batch_content,
+                                      n_chapters, carryover_block)
     gate_block = _render_gate_rules(gates, forbidden_canon)
     if gate_block:
         prompt += "\n\n【本次已启用的保护门（强制遵守）】\n" + gate_block
@@ -418,7 +730,7 @@ def _common_tail(n_chapters: int) -> str:
 6. 直接输出正文：绝对不要输出任何解释、说明或问候语。"""
 
 
-def _prompt_full_rewrite(blueprint, author_style, batch_content, n_chapters):
+def _prompt_full_rewrite(blueprint, author_style, batch_content, n_chapters, carryover_block=""):
     """原「全部重构」极端档：蓝图是方向不是宪法，允许推翻细节、改人名、整段重写。"""
     return f"""你是一位小说主笔。请严格按照用户提供的【全局设定与重构方向】，对【待处理正文】进行重构优化。
 要求：
@@ -432,12 +744,13 @@ def _prompt_full_rewrite(blueprint, author_style, batch_content, n_chapters):
 【作者特殊风格要求】
 {author_style}
 
-【待处理正文】
+{carryover_block}【待处理正文】
 {batch_content}
 """
 
 
-def _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates, n_chapters):
+def _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, gates,
+                     n_chapters, carryover_block=""):
     """保真润色档：锁定人名与事件骨架，仅润色表述，逐句贴近原意。"""
     forbid = _render_forbidden(forbidden_canon, gates)
     return f"""你是一位保真度优先的小说润色师。你的任务是在【不改变任何事实的前提下】优化文字。
@@ -454,12 +767,13 @@ def _prompt_fidelity(blueprint, author_style, batch_content, forbidden_canon, ga
 【作者特殊风格要求】
 {author_style}
 
-【待处理正文】
+{carryover_block}【待处理正文】
 {batch_content}
 """
 
 
-def _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list, gates, n_chapters):
+def _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fix_list,
+                     gates, n_chapters, carryover_block=""):
     """修断层档：锁定骨架与人名，最小改动补逻辑断层（默认修列出的断层，未列出不动）。"""
     forbid = _render_forbidden(forbidden_canon, gates)
     scope = ""
@@ -479,12 +793,13 @@ def _prompt_fix_gaps(blueprint, author_style, batch_content, forbidden_canon, fi
 【作者特殊风格要求】
 {author_style}
 
-【待处理正文】
+{carryover_block}【待处理正文】
 {batch_content}
 """
 
 
-def _prompt_reskin(blueprint, author_style, batch_content, name_map, n_chapters):
+def _prompt_reskin(blueprint, author_style, batch_content, name_map, n_chapters,
+                   carryover_block=""):
     """换皮档：节拍锁定，按映射表统一替换人名/设定名。"""
     mapping = _render_name_map(name_map)
     return f"""你是一位既保留原有节拍、又把作品「换皮」的改写师。原始剧情节拍不变，仅统一更换人设/地名等外皮。
@@ -501,7 +816,7 @@ def _prompt_reskin(blueprint, author_style, batch_content, name_map, n_chapters)
 【作者特殊风格要求】
 {author_style}
 
-【待处理正文】
+{carryover_block}【待处理正文】
 {batch_content}
 """
 
@@ -672,6 +987,13 @@ def _run_qc(output_path, progress):
         if h in hashes:
             issues.append(f"章 {out_id}: 与第 {hashes[h]} 章内容重复（可能未重构）")
         hashes[h] = out_id
+    # 批次级自动质检遗留的问题（已尝试自动重写但仍未消除）一并暴露给导出门
+    for item in progress.get('pre_stitch_issues') or []:
+        msg = item.get('message') if isinstance(item, dict) else str(item)
+        if msg:
+            issues.append(f"阶段质检: {msg}")
+    for item in progress.get('stitch_failures') or []:
+        issues.append(f"缝合跳过: {item.get('boundary')}（{item.get('error')}）")
     return issues
 
 

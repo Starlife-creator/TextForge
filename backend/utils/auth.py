@@ -41,10 +41,12 @@ def expected_token() -> str | None:
 
 
 def is_enforced() -> bool:
-    """是否启用鉴权：生产默认开启，仅当 TEXTFORGE_DEV=1 时关闭。"""
-    if os.environ.get("TEXTFORGE_DEV") == "1":
-        return False
-    return expected_token() is not None
+    """是否启用鉴权：生产默认开启，仅当 TEXTFORGE_DEV=1 时关闭。
+
+    注意：不是「有 token 才开」—— 未配置 token 时必须默认拒绝，
+    否则便携包里的 backend.exe 被手动启动一次，任意本地进程/网页就能调 API。
+    """
+    return os.environ.get("TEXTFORGE_DEV") != "1"
 
 
 def check(headers) -> bool:
@@ -55,7 +57,8 @@ def check(headers) -> bool:
     """
     want = expected_token()
     if want is None:
-        return True
+        # 未注入 token = 生产配置缺失，默认拒绝；开发模式由 is_enforced 提前放行。
+        return False
     lookup = {str(k).lower(): v for k, v in dict(headers).items()}
     got = lookup.get(HEADER.lower())
     if not got:

@@ -24,6 +24,9 @@ LLM_PORT = int(os.environ.get("TF_E2E_LLM_PORT", "8299"))
 API_PORT = int(os.environ.get("TF_E2E_API_PORT", "8298"))
 
 FAILS = []
+# 现有场景刻意验证调用次数/恢复语义，关闭自动重写避免多出的重试干扰断言；
+# 自动重写由场景九单独覆盖。
+NO_AUTO_REWRITE = {"auto_rewrite_bad_batch": False}
 def check(name, cond, extra=""):
     try:
         print(f"{'PASS' if cond else 'FAIL'}  {name}" + (f"  [{extra}]" if extra and not cond else ""))
@@ -331,7 +334,8 @@ llm = subprocess.Popen([PY, str(BACKEND / "mock_llm.py"), str(LLM_PORT)],
                        cwd=str(BACKEND), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 api = subprocess.Popen([PY, "-m", "uvicorn", "app:app", "--host", "127.0.0.1",
                         "--port", str(API_PORT), "--log-level", "warning"],
-                       cwd=str(BACKEND), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                       cwd=str(BACKEND), env={**os.environ, "TEXTFORGE_DEV": "1"},
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 tmp = Path(tempfile.mkdtemp(prefix="tf_e2e_"))
 try:
     B = f"http://127.0.0.1:{API_PORT}"
@@ -371,7 +375,8 @@ try:
         "author_style": "冷峻克制", "novel_name": "端到端测试书",
         "refactor_mode": "full_rewrite", "review_split": False,
         # 逐章验收门 + 质检门都打开：无人值守跑通必须把这两道门也走一遍
-        "refactor_gates": {"require_chapter_accept": True, "qc_block_export": True},
+        "refactor_gates": {"require_chapter_accept": True, "qc_block_export": True,
+                           "auto_rewrite_bad_batch": False},
         "forbidden_canon": [], "name_map": {},
         "compare_output": True, "chapter_snapshots": True,
         "diagnose_json": None, "proxy": None, "rich_text": False,
@@ -428,6 +433,13 @@ try:
           not any("缝合" in p.name for p in outs), str([p.name for p in outs]))
     check("_diagnostics 里有缝合报告",
           (outd / "_diagnostics" / "缝合补丁报告.json").exists())
+    _anchors_path = outd / "_diagnostics" / "stitch_anchors.jsonl"
+    _anchor_lines = (_anchors_path.read_text(encoding="utf-8").splitlines()
+                     if _anchors_path.exists() else [])
+    check("缝合锚点完整落盘（含原文/替换文，不是只有哈希引用）",
+          bool(_anchor_lines)
+          and all({"original", "replacement"} <= set(json.loads(x)) for x in _anchor_lines),
+          f"{len(_anchor_lines)} 条")
     qpath = outd / "_diagnostics" / "quality_report.json"
     check("_diagnostics 里有质量报告", qpath.exists())
     quality = json.loads(qpath.read_text(encoding="utf-8")) if qpath.exists() else {}
@@ -528,7 +540,7 @@ try:
     doutd = tmp / "out_docx"
     ev2, th2 = sse_events(API_PORT, 240, stop_on="done")
     b2 = dict(body, input_path=str(dinp), output_path=str(doutd), input_format="docx",
-              novel_name="docx测试", refactor_gates={}, compare_output=False,
+              novel_name="docx测试", refactor_gates=NO_AUTO_REWRITE, compare_output=False,
               chapter_snapshots=False)
     r2 = post(f"{B}/api/start", b2)
     print(f"  第二次 start -> {r2['status']}（刻意在上一轮 done 后立即发起）")
@@ -575,7 +587,7 @@ try:
     o3 = tmp / "out3"
     ev3, th3 = sse_events(API_PORT, 240, stop_on="done")
     r3 = post(f"{B}/api/start", dict(body, input_path=str(e3in), output_path=str(o3),
-                                      novel_name="分隔符纠正", refactor_gates={},
+                                      novel_name="分隔符纠正", refactor_gates=NO_AUTO_REWRITE,
                                       compare_output=False, chapter_snapshots=False))
     ok3 = wait_done(ev3, th3, api_port=API_PORT)[0]
     st3 = put(f"{L}/", {})["stats"]
@@ -612,7 +624,7 @@ try:
     ev4, th4 = sse_events(API_PORT, 300, stop_on="done")
     r4 = post(f"{B}/api/start", dict(body, input_path=str(e4in), output_path=str(o4),
                                       context_window=32768, novel_name="上下文超限自愈",
-                                      refactor_gates={}, compare_output=False,
+                                      refactor_gates=NO_AUTO_REWRITE, compare_output=False,
                                       chapter_snapshots=False))
     ok4 = wait_done(ev4, th4, api_port=API_PORT)[0]
     st4 = put(f"{L}/", {})["stats"]
@@ -659,7 +671,7 @@ try:
     ev5, th5 = sse_events(API_PORT, 240, stop_on="done")
     r5 = post(f"{B}/api/start", dict(body, input_mode="single_file", input_path=str(single),
                                       output_path=str(o5), novel_name="单文件识别",
-                                      refactor_gates={}, compare_output=False,
+                                      refactor_gates=NO_AUTO_REWRITE, compare_output=False,
                                       chapter_snapshots=False))
     print("    场景五 run_id:", r5.get("run_id", "?")[:8], "start status:", r5.get("status"))
     ok5 = wait_done(ev5, th5, api_port=API_PORT)[0]
@@ -704,7 +716,7 @@ try:
     o6 = tmp / "out6"
     ev6, th6 = sse_events(API_PORT, 240, stop_on="done")
     start_run(dict(body, input_mode="single_file", input_path=str(e6in / "ai_book.txt"),
-                   output_path=str(o6), novel_name="AI拆章", refactor_gates={},
+                   output_path=str(o6), novel_name="AI拆章", refactor_gates=NO_AUTO_REWRITE,
                    compare_output=False, chapter_snapshots=False))
     ok6 = wait_done(ev6, th6, api_port=API_PORT)[0]
     st6 = get(f"{B}/api/status")
@@ -742,7 +754,7 @@ try:
     # 流水线会直接冲进 phase1，重拆断言必然失败。
     _GATE.suppress = {"split_ready"}
     start_run(dict(body, input_mode="single_file", input_path=str(e7in / "odd_book.txt"),
-                   output_path=str(o7), novel_name="人工重拆", refactor_gates={},
+                   output_path=str(o7), novel_name="人工重拆", refactor_gates=NO_AUTO_REWRITE,
                    ai_split=False, compare_output=False, chapter_snapshots=False))
 
     def _wait_phase(phase, timeout=120):
@@ -812,7 +824,7 @@ try:
     # 「第一批成功、之后失败」，前提是确实存在第二批可失败。
     # arm_after=1 即「第 1 次 refactor 调用放行，第 2 次起失败」。
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
-                   novel_name="断点续跑", refactor_gates={}, compare_output=False,
+                   novel_name="断点续跑", refactor_gates=NO_AUTO_REWRITE, compare_output=False,
                    chapter_snapshots=False))
 
     # 第一轮应当因注入的失败而中断。以 progress.json 为准轮询（不依赖可能漏事件的 SSE）。
@@ -852,7 +864,7 @@ try:
                                         encoding="utf-8")
     ev8b, th8b = sse_events(API_PORT, 300, stop_on="done")
     start_run(dict(body, input_path=str(e8in), output_path=str(o8), context_window=8000,
-                   novel_name="断点续跑", refactor_gates={}, compare_output=False,
+                   novel_name="断点续跑", refactor_gates=NO_AUTO_REWRITE, compare_output=False,
                    chapter_snapshots=False))
     ok8 = wait_done(ev8b, th8b, api_port=API_PORT)[0]
     st8b = put(f"{L}/", {})["stats"]
@@ -875,6 +887,97 @@ try:
     check("续跑后整本跑完", ok8 and (o8 / "03_final").is_dir(), str([e for e, _ in ev8b][-3:]))
     final8 = list((o8 / "03_final").glob("*")) if (o8 / "03_final").is_dir() else []
     check("续跑后有完整成品", len(final8) >= 1, str([p.name for p in final8]))
+
+    # ---------- 场景九：并发波前 + 跨批连续性 + 硬伤自动重写 ----------
+    print("\n--- 场景九：并发重构 + 跨批连续性 + 硬伤自动重写 ---")
+    put(f"{L}/", {"reset": True, "log_clear": True,
+                  "fail": {"phase": None, "times": 0, "status": 500, "body": "",
+                           "skip": 0, "arm_after": 0, "extra_breaks": 0},
+                  "ctx_limit": {"max_chapters": 0},
+                  "bad_content": {"times": 1}})
+    e9in = tmp / "in9"; make_novel(e9in, chapters=8)
+    o9 = tmp / "out9"
+    ev9, th9 = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(e9in), output_path=str(o9), context_window=8000,
+                   novel_name="并发连续性与自动重写", refactor_gates={},
+                   compare_output=False, chapter_snapshots=False, max_concurrency=2))
+    ok9 = wait_done(ev9, th9, api_port=API_PORT)[0]
+    st9 = put(f"{L}/", {})["stats"]
+    prog9 = json.loads((o9 / "progress.json").read_text(encoding="utf-8"))
+    check("并发 + 连续性 + 自动重写场景跑完", ok9, str(st9))
+    check("跨批连续性已注入提示词", st9.get("continuity_injected", 0) >= 1, str(st9))
+    check("前情摘要已注入提示词", st9.get("story_memo_injected", 0) >= 1, str(st9))
+    check("硬伤批次触发了自动重写", bool(prog9.get("auto_rewrite_log")),
+          str(prog9.get("auto_rewrite_log"))[:200])
+    _bad9 = [i for issues in (prog9.get("batch_qc") or {}).values() for i in issues
+             if i.get("severity") == "bad"]
+    check("自动重写后没有遗留硬伤", not _bad9, str(_bad9)[:200])
+    check("并发度写入进度", prog9.get("max_concurrency") == 2, str(prog9.get("max_concurrency")))
+    o9c = sorted((o9 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
+    check("并发场景 8 章全部产出", len(o9c) == 8, str([p.name for p in o9c]))
+    q9 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o9))}")
+    check("质量报告记录自动重写次数",
+          (q9.get("summary") or {}).get("auto_rewrites", 0) >= 1, str(q9.get("summary")))
+    put(f"{L}/", {"bad_content": {"times": 0}})
+
+    # ---------- 场景十：缝合全部失败 → 降级跳过，正文照常产出 ----------
+    print("\n--- 场景十：缝合失败降级 ---")
+    put(f"{L}/", {"reset": True, "log_clear": True,
+                  "fail": {"phase": "stitch", "times": 99, "status": 500,
+                           "body": "injected stitch failure", "skip": 0,
+                           "arm_after": 0, "extra_breaks": 0},
+                  "ctx_limit": {"max_chapters": 0}})
+    e10in = tmp / "in10"; make_novel(e10in, chapters=8)
+    o10 = tmp / "out10"
+    ev10, th10 = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(e10in), output_path=str(o10), context_window=8000,
+                   novel_name="缝合降级", refactor_gates={}, compare_output=False,
+                   chapter_snapshots=False, max_concurrency=1))
+    ok10 = wait_done(ev10, th10, api_port=API_PORT)[0]
+    st10 = put(f"{L}/", {})["stats"]
+    prog10 = json.loads((o10 / "progress.json").read_text(encoding="utf-8"))
+    check("缝合全部失败仍能跑完整轮", ok10, str(st10))
+    check("缝合失败已记录进进度", bool(prog10.get("stitch_failures")),
+          str(prog10.get("stitch_failures"))[:200])
+    o10c = sorted((o10 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
+    check("缝合失败时 8 章正文仍完整",
+          len(o10c) == 8 and all(p.stat().st_size > 0 for p in o10c),
+          str([p.name for p in o10c]))
+    final10 = list((o10 / "03_final").glob("*")) if (o10 / "03_final").is_dir() else []
+    check("缝合失败时仍产出成品", len(final10) >= 1, str([p.name for p in final10]))
+    q10 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o10))}")
+    check("质量报告标出缝合跳过",
+          (q10.get("summary") or {}).get("stitch_failures", 0) >= 1, str(q10.get("summary")))
+    put(f"{L}/", {"fail": {"phase": None, "times": 0, "status": 500, "body": "",
+                           "skip": 0, "arm_after": 0, "extra_breaks": 0}})
+
+    # ---------- 场景十一：docx 富文本输出 ----------
+    print("\n--- 场景十一：docx 富文本 ---")
+    o11 = tmp / "out_rich"
+    ev11, th11 = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(dinp), output_path=str(o11), input_format="docx",
+                   novel_name="富文本docx", refactor_gates=NO_AUTO_REWRITE,
+                   compare_output=False, chapter_snapshots=False, rich_text=True))
+    ok11 = wait_done(ev11, th11, api_port=API_PORT)[0]
+    check("富文本 docx 场景跑通", ok11, str(ev11[-1][:2] if ev11 else None))
+    rich_merged = o11 / "03_final" / "富文本docx_重构终稿.docx"
+    check("富文本成品已生成", rich_merged.exists(), str(rich_merged))
+    if rich_merged.exists():
+        import zipfile as _zf
+        from docx import Document as _RD
+        with _zf.ZipFile(rich_merged) as _z:
+            _xml11 = _z.read("word/document.xml").decode("utf-8")
+        check("章与章之间插入分页", _xml11.count('w:type="page"') >= 2,
+              str(_xml11.count('w:type="page"')))
+        check("富文本模式不再写字面分隔线",
+              all(p.text.strip() != "---" for p in _RD(str(rich_merged)).paragraphs))
+        check("文档标题写入元数据", _RD(str(rich_merged)).core_properties.title
+              == "富文本docx_重构终稿", str(_RD(str(rich_merged)).core_properties.title))
+    plain_merged = doutd / "03_final" / "docx测试_重构终稿.docx"
+    if plain_merged.exists():
+        from docx import Document as _PD
+        check("未开富文本时保持旧排版（字面分隔线）",
+              any(p.text.strip() == "---" for p in _PD(str(plain_merged)).paragraphs))
 
     # 输出目录管理端点（GUI 用）：HTTP 层验证
     from urllib.parse import quote

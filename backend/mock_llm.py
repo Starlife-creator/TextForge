@@ -21,6 +21,8 @@ FAIL = {"phase": None, "times": 0, "status": 500, "body": "injected",
         "extra_breaks": 0, "skip": 0, "arm_after": 0}
 # 上下文上限模拟：max_chapters>0 时，请求里章数超过它即返回 400（LM Studio 文案）。
 CTX_LIMIT = {"max_chapters": 0}
+# 内容级质检故障注入：下 N 次重构输出插入 "TODO" 占位，触发自动重写。
+BAD_CONTENT = {"times": 0}
 # 服务端上报的真实上下文窗口（供 /props、/api/v0/models、/models、/api/show 探测）。
 CONTEXT_REPORT = {"n_ctx": 4096}
 LOG = []
@@ -135,6 +137,10 @@ def make_text(user: str, phase: str) -> str:
             ]
             segs.append("\n\n".join(paras))
         out = f"\n\n{BREAK}\n\n".join(segs)
+        if BAD_CONTENT.get("times", 0) > 0 and "结构性质检" not in user:
+            BAD_CONTENT["times"] -= 1
+            STATS["bad_content_injected"] = STATS.get("bad_content_injected", 0) + 1
+            out = out.replace("【重构第1段·其一】", "TODO：此处待补。【重构第1段·其一】", 1)
         # 故障注入：模拟真实模型在**中间**多分了一段。
         # 用户实际遇到的报错是「需要 3 个，实际 5 个（切出 6 段）」——
         # 多余分隔符出现在批次中间（模型把原文的「第N章」标题也当成分隔点），
@@ -208,6 +214,10 @@ class H(BaseHTTPRequestHandler):
         phase = classify(user)
         STATS[phase] = STATS.get(phase, 0) + 1
         STATS["total"] += 1
+        if "【上一批结尾（仅用于衔接）】" in user:
+            STATS["continuity_injected"] = STATS.get("continuity_injected", 0) + 1
+        if "【前情摘要（仅用于保持事实一致）】" in user:
+            STATS["story_memo_injected"] = STATS.get("story_memo_injected", 0) + 1
         LOG.append({"phase": phase, "n_msgs": len(req.get("messages", [])),
                     "extra": FAIL.get("extra_breaks", 0),
                     "has_fix": CORRECTED_MARK in user})
@@ -273,9 +283,12 @@ class H(BaseHTTPRequestHandler):
             FAIL.update(body["fail"])
         if "ctx_limit" in body:
             CTX_LIMIT.update(body["ctx_limit"])
+        if "bad_content" in body:
+            BAD_CONTENT.update(body["bad_content"])
         if "context_report" in body:
             CONTEXT_REPORT.update(body["context_report"])
         self._json(200, {"stats": STATS, "fail": FAIL, "ctx_limit": CTX_LIMIT,
+                         "bad_content": BAD_CONTENT,
                          "context_report": CONTEXT_REPORT, "log": LOG[-12:]})
 
 

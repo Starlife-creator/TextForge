@@ -224,6 +224,9 @@ export interface QualityReport {
     placeholder_hits: number;
     forbidden_hits: number;
     old_name_hits: number;
+    auto_rewrites?: number;
+    pre_stitch_issues?: number;
+    stitch_failures?: number;
     issues_by_severity: Record<QualitySeverity, number>;
   };
   issues: QualityIssue[];
