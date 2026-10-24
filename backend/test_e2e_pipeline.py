@@ -50,8 +50,27 @@ def post(url, obj=None, method="POST", timeout=120):
 
 
 def get(url, timeout=30):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        return json.loads(r.read() or b"{}")
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        # 带上响应体：404 只有 body 说得清原因（如「上一次生成失败：…」）
+        detail = e.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError(f"GET {url} → HTTP {e.code}: {detail}") from e
+
+
+def quality_report(port, outd):
+    """拉质量报告；拿不到时**不抛**，把原因交回给调用方去判 FAIL。
+
+    报告缺失时该接口返回 404。原先直接 urlopen 会在场景中途抛 HTTPError，
+    把后面所有场景一起带走 —— v0.13.0 首次发布时 CI 上就只剩一个 traceback，
+    连「为什么没有报告」都看不到。
+    """
+    try:
+        url = f"{port}/api/output/quality?output_path={urllib.request.quote(str(outd))}"
+        return get(url), ""
+    except RuntimeError as e:
+        return {}, str(e)
 
 
 def put(url, obj, timeout=30):
@@ -495,9 +514,9 @@ try:
     check("质量报告汇总了缝合观测（数量与 progress 里已应用的锚点一致）",
           _st.get("applied_patches") == sum(1 for a in _pa if a.get("applied"))
           and _st.get("exposed_chars", 0) > 0, str(_st)[:200])
-    qr = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(outd))}")
+    qr, qr_err = quality_report(B, outd)
     check("/api/output/quality 返回同一份报告",
-          qr.get("summary", {}).get("chapters") == 6, str(qr.get("summary")))
+          qr.get("summary", {}).get("chapters") == 6, qr_err or str(qr.get("summary")))
     inspect = get(f"{B}/api/output/inspect?output_path={urllib.request.quote(str(outd))}")
     check("inspect 带出质量状态", inspect.get("quality", {}).get("status") == quality.get("status"))
     check("03_final 只有交付物（无非 txt/md/docx 文件）",
@@ -972,9 +991,10 @@ try:
     check("并发度写入进度", prog9.get("max_concurrency") == 2, str(prog9.get("max_concurrency")))
     o9c = sorted((o9 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
     check("并发场景 8 章全部产出", len(o9c) == 8, str([p.name for p in o9c]))
-    q9 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o9))}")
+    q9, q9_err = quality_report(B, o9)
     check("质量报告记录自动重写次数",
-          (q9.get("summary") or {}).get("auto_rewrites", 0) >= 1, str(q9.get("summary")))
+          (q9.get("summary") or {}).get("auto_rewrites", 0) >= 1,
+          q9_err or str(q9.get("summary")))
     put(f"{L}/", {"bad_content": {"times": 0}})
 
     # ---------- 场景十：缝合全部失败 → 降级跳过，正文照常产出 ----------
@@ -1002,9 +1022,10 @@ try:
           str([p.name for p in o10c]))
     final10 = list((o10 / "03_final").glob("*")) if (o10 / "03_final").is_dir() else []
     check("缝合失败时仍产出成品", len(final10) >= 1, str([p.name for p in final10]))
-    q10 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o10))}")
+    q10, q10_err = quality_report(B, o10)
     check("质量报告标出缝合跳过",
-          (q10.get("summary") or {}).get("stitch_failures", 0) >= 1, str(q10.get("summary")))
+          (q10.get("summary") or {}).get("stitch_failures", 0) >= 1,
+          q10_err or str(q10.get("summary")))
     put(f"{L}/", {"fail": {"phase": None, "times": 0, "status": 500, "body": "",
                            "skip": 0, "arm_after": 0, "extra_breaks": 0}})
 
@@ -1069,10 +1090,10 @@ try:
     check("闸门拒绝后 8 章正文仍完整",
           len(o12c) == 8 and all(p.stat().st_size > 0 for p in o12c),
           str([p.name for p in o12c]))
-    q12 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o12))}")
+    q12, q12_err = quality_report(B, o12)
     check("质量报告说明闸门当时是开着的",
           "已开启" in ((q12.get("config") or {}).get("stitch_gate") or ""),
-          str(q12.get("config"))[:200])
+          q12_err or str(q12.get("config"))[:200])
     put(f"{L}/", {"stitch_bulk": {"times": 0}})
 
     # ---------- 场景十三：单章重生成必须刷新质检结论 ----------
@@ -1144,10 +1165,10 @@ try:
     check("刷新结果没有被流水线写回覆盖", ("1", "placeholder") not in _allf, str(_allf)[:240])
     check("另一批的占位硬伤仍在册（只清被重写的那一章）", ("5", "placeholder") in _allf,
           str(_allf)[:240])
-    q13 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o13))}")
+    q13, q13_err = quality_report(B, o13)
     check("质量报告里的占位硬伤只剩未重写的那一章",
           (q13.get("summary") or {}).get("placeholder_hits", 0) == 1,
-          str(q13.get("summary")))
+          q13_err or str(q13.get("summary")))
     put(f"{L}/", {"bad_content": {"times": 0}})
 
     # 输出目录管理端点（GUI 用）：HTTP 层验证

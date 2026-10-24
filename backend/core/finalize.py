@@ -145,12 +145,25 @@ def phase4_finalize(output_path: Path, progress: dict, req):
     
     _cleanup_backups(backup_dir)
     write_stitch_report(output_path, progress)
-    # 质量报告是「可核查的成品说明」，但它只是诊断产物：生成失败绝不能
-    # 让已经写完的成品变成一次失败运行。
+    write_quality_report_safely(
+        output_path, progress,
+        chapters=original_chapters, texts=merged_texts, req=req,
+    )
+    logger.info(f"[finalize] 输出完成 -> {final_dir}")
+
+
+def write_quality_report_safely(output_path: Path, progress: dict, *,
+                                chapters: list, texts: list, req) -> None:
+    """生成质量报告。失败**不拖垮**已写完的成品，但原因必须落进 progress。
+
+    原先这里只有一行 `logger.warning`：打包版用户看不到日志，界面只会显示
+    「尚无报告」；CI 里也取不到值 —— v0.13.0 首次发布时就丢过一次报告，
+    端到端只拿到一个 404，没有任何线索可查。
+    """
     try:
         from core.quality import build_quality_report, write_quality_report
         report = build_quality_report(
-            chapters=original_chapters, texts=merged_texts,
+            chapters=chapters, texts=texts,
             progress=progress, req=req, output_path=output_path,
         )
         report_path = write_quality_report(output_path, report)
@@ -162,8 +175,12 @@ def phase4_finalize(output_path: Path, progress: dict, req):
         }
         logger.info(f"[finalize] 质量报告 -> {report_path} status={report['status']}")
     except Exception as e:
-        logger.warning(f"[finalize] 质量报告生成失败（不影响成品）: {e}")
-    logger.info(f"[finalize] 输出完成 -> {final_dir}")
+        progress["quality_report"] = {
+            "status": "failed",
+            "error": f"{type(e).__name__}: {e}"[:500],
+            "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        logger.warning(f"[finalize] 质量报告生成失败（成品照常交付）: {e}", exc_info=True)
 
 def _write_with_backup(output_file: Path, texts: list, ext: str, backup_dir: Path,
                        *, rich: bool = False):

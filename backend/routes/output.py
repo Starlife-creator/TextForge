@@ -100,8 +100,28 @@ async def output_quality(output_path: str = Query(...)):
     from core.quality import read_quality_report
     report = read_quality_report(output_path.strip())
     if report is None:
-        raise HTTPException(404, "尚无质量报告（完成一次重构后生成）")
+        raise HTTPException(404, _missing_report_detail(output_path.strip()))
     return report
+
+
+def _missing_report_detail(output_path: str) -> str:
+    """404 时把 finalize 记下的失败原因带出来，而不是只说「尚无报告」。
+
+    没有报告有两种情况：跑的是旧版本成品，或者生成时抛了异常。后者的原因
+    现在写在 progress.json 里（`quality_report.status == "failed"`），这里读出来
+    拼进 404 详情 —— 否则用户与 CI 都只能看到一个没有任何线索的 404。
+    """
+    base = "尚无质量报告（完成一次重构后生成）"
+    try:
+        prog = json.loads(
+            (Path(output_path) / "progress.json").read_text(encoding="utf-8-sig")
+        )
+    except (OSError, json.JSONDecodeError):
+        return base
+    qr = prog.get("quality_report") if isinstance(prog, dict) else None
+    if isinstance(qr, dict) and qr.get("status") == "failed" and qr.get("error"):
+        return f"{base}；上一次生成失败：{qr['error']}"
+    return base
 
 
 def _special_dirs(home: Path) -> set:
