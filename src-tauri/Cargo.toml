@@ -3,6 +3,7 @@ name = "textforge"
 version = "0.13.1"
 description = "文炼工坊 TextForge"
 authors = ["Starlife-creator"]
+license = "Apache-2.0"
 edition = "2021"
 
 [lib]
