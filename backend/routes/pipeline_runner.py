@@ -8,6 +8,7 @@ from core.pipeline import phase2_blueprint
 from core.refactor import phase3_refactor_stitch
 from core.finalize import phase4_finalize
 from utils.atomic import atomic_write_json
+from utils.redact import redact
 from utils.version import VERSION
 from core.prompt_version import PROMPT_VERSION
 
@@ -202,7 +203,12 @@ def _history_record(progress_path: Path, progress: dict) -> None:
         logger.warning(f"[history] 记录失败（忽略）: {e}")
 
 def _cfg_brief(value) -> str:
-    """把配置值压成一行短文本，避免把整份人名映射/模型表塞进提示。"""
+    """把配置值压成一行短文本，避免把整份人名映射/模型表塞进提示。
+
+    P0-1：序列化前先递归脱敏——分阶段模型表 models 可携带 api_key/token，
+    否则明文会进入 config_drift 差异文案、progress 与状态回传。
+    """
+    value = redact(value)
     if isinstance(value, (dict, list)):
         text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     else:
@@ -423,7 +429,8 @@ def init_progress(req, run_id):
         "name_map": getattr(req, "name_map", {}),
         "fix_list": getattr(req, "fix_list", []),
         "diagnose_json": getattr(req, "diagnose_json", None),
-        "models": getattr(req, "models", {}),
+        # P0-1：progress.json 不落盘明文 api_key/token；密钥仅留存于本次运行内存。
+        "models": redact(getattr(req, "models", {})),
         "max_concurrency": getattr(req, "max_concurrency", 1),
         "auto_rewrite_count": 0,
         "auto_rewritten_batches": [],

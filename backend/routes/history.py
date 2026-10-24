@@ -23,6 +23,7 @@ from routes import state
 from utils.appdir import ensure_data_dir
 from utils.atomic import atomic_write_json
 from utils.progress_io import is_completed
+from utils.redact import redact
 
 logger = logging.getLogger("textforge")
 router = APIRouter()
@@ -69,7 +70,8 @@ def upsert(output_path: str, meta: dict) -> None:
               "total_chapters", "batches_done", "batches_total", "finished",
               "finished_at", "chapter_detection", "config_drift"):
         if k in meta and meta[k] is not None:
-            e[k] = meta[k]
+            # P0-1：历史注册表不得留存明文密钥；config_drift 落 runs.json 前兜底脱敏。
+            e[k] = redact(meta[k]) if k == "config_drift" else meta[k]
     errs = meta.get("last_error")
     if errs:
         e["last_error"] = str(errs)[:_TRIM_CHARS]
@@ -102,7 +104,8 @@ def _meta_from_progress(progress: dict) -> dict:
         "finished": is_completed(progress),
         "finished_at": progress.get("finished_at"),
         "chapter_detection": progress.get("chapter_detection"),
-        "config_drift": progress.get("config_drift") or [],
+        # P0-1：抽取元数据时即脱敏，杜绝明文密钥写入 runs.json。
+        "config_drift": redact(progress.get("config_drift") or []),
         "last_error": (errs[-1].get("message") if errs else None),
     }
 

@@ -4,6 +4,7 @@ from collections import OrderedDict
 import json, logging, os
 from routes import state
 from utils.progress_io import is_completed
+from utils.redact import redact
 
 router = APIRouter()
 logger = logging.getLogger("textforge")
@@ -97,7 +98,8 @@ async def status(output_path: str | None = None):
         # 拆章方式/置信度：界面据此提示「是否按预期拆分」，低置信时引导人工确认
         "chapter_detection": progress.get("chapter_detection"),
         # 续跑时配置与上次不一致（模型/API/上下文/输入路径），前端提示以免风格割裂
-        "config_drift": progress.get("config_drift") or [],
+        # P0-1：回传前递归脱敏兜底，防止历史 progress 残留明文密钥进入响应。
+        "config_drift": redact(progress.get("config_drift") or []),
         "total_logic_chapters": len(logic_ids),
         "reconstructed_chapters": reconstructed,
         "resumed": progress.get("resumed", False),
