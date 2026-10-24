@@ -5,6 +5,7 @@ from docx import Document
 from utils.atomic import atomic_write_text, atomic_write_json
 from utils.sort import natural_sort_key
 from utils.tokens import estimate_tokens
+from core.batching import pack_groups
 from routes import state
 from routes.events import sse_emit
 import chardet
@@ -626,35 +627,19 @@ def _load_batches(chapters, output_path, body_token_limit, max_chapters=8):
         else:
             groups.append((('normal', ch['id']), [ch]))
 
-    batches = []
-    current = []
-    current_tokens = 0
-    for gk, glist in groups:
-        group_tokens = sum(
-            estimate_tokens((output_path / ch['split_file']).read_text(encoding='utf-8', newline=''))
-            for ch in glist
-        )
-        group_ids = [ch['id'] for ch in glist]
-        # 虚拟组承诺「不拆散」，所以 group_tokens 可能超过 body_token_limit。
-        # 这里**只告警不报错**：上限由用户填的 context_window 推导，而它未必等于
-        # 模型真实窗口（例如填 8000、模型实际支持 128k）。硬报错会把本来能正常
-        # 跑完的配置直接判死；放行则最坏情况由上下文溢出自动拆批兜底（见 refactor）。
-        if group_tokens > body_token_limit:
-            logger.warning(
-                f"[phase1] 章节组 {gk} 共约 {group_tokens} token，超过单批上限 {int(body_token_limit)} token"
-                f"（章：{group_ids}）。该组因虚拟章保护不会被拆分；若服务商返回"
-                f"上下文超限，会自动对半拆批重试。")
-        if current and (current_tokens + group_tokens > body_token_limit
-                        or len(current) + len(group_ids) > max_chapters):
-            batches.append(current)
-            current = list(group_ids)
-            current_tokens = group_tokens
-        else:
-            current.extend(group_ids)
-            current_tokens += group_tokens
-    if current:
-        batches.append(current)
-    return batches
+    return pack_groups(
+        [
+            (
+                gk,
+                [ch['id'] for ch in glist],
+                sum(estimate_tokens((output_path / ch['split_file'])
+                                    .read_text(encoding='utf-8', newline='')) for ch in glist),
+            )
+            for gk, glist in groups
+        ],
+        body_token_limit,
+        max_chapters,
+    )
 
 def _build_cross_batch_virtual(chapters, batches, virtual_map):
     """扫描虚拟章跨批次分布。返回 [{"original_id": "7", "batch_pairs": [[2,3]]}, ...]"""

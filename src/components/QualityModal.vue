@@ -52,6 +52,9 @@ const visibleChapters = computed(() => {
 function fmt(n: number | null | undefined): string {
   return typeof n === 'number' ? n.toLocaleString('zh-CN') : '-';
 }
+function pct(v: number | null | undefined): string {
+  return typeof v === 'number' ? `${(v * 100).toFixed(1)}%` : '-';
+}
 function ratioText(ratio: number | null): string {
   return ratio == null ? '-' : `${(ratio * 100).toFixed(1)}%`;
 }
@@ -175,6 +178,29 @@ function rowStatus(row: QualityChapterRow): string {
               <span class="hint">
                 共享 {{ d.shared_shingles }} 处 60 字片段 · 占较短章
                 {{ (d.containment * 100).toFixed(1) }}%
+              </span>
+            </div>
+          </div>
+        </template>
+
+        <template v-if="report.stitch && report.stitch.applied_patches">
+          <h4 class="q-h4">缝合改动观测</h4>
+          <p class="hint">
+            已应用补丁 {{ fmt(report.stitch.applied_patches) }} 个，覆盖
+            {{ fmt(report.stitch.exposed_chars) }} 字；其中可测量
+            {{ fmt(report.stitch.measured) }} 个 —— 平均改动率
+            <b>{{ pct(report.stitch.mean) }}</b> · P90 {{ pct(report.stitch.p90) }} · 最大
+            {{ pct(report.stitch.max) }}
+          </p>
+          <p v-if="report.config.stitch_metric" class="hint">
+            {{ report.config.stitch_metric }}
+          </p>
+          <div v-if="report.stitch.worst.length" class="sum-list">
+            <div v-for="(w, i) in report.stitch.worst" :key="i" class="split-row q-dup">
+              <span class="mono q-title">{{ w.file }}</span>
+              <span class="hint">
+                {{ w.source === 'virtual_stitch' ? '虚拟章边界' : '批次边界' }} · 覆盖
+                {{ fmt(w.chars) }} 字 · 改动 {{ pct(w.change_rate) }}
               </span>
             </div>
           </div>

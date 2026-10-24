@@ -440,6 +440,15 @@ try:
           bool(_anchor_lines)
           and all({"original", "replacement"} <= set(json.loads(x)) for x in _anchor_lines),
           f"{len(_anchor_lines)} 条")
+    # 改动率观测：progress.json 里的轻量引用必须带 change_rate/chars，且 applied 为真
+    # （applied 恒为 False 说明记录又跑到了应用之前，质量报告会因此永远量不到东西）
+    _pa = json.loads((outd / "progress.json").read_text(encoding="utf-8")).get(
+        "stitch_anchors", [])
+    check("缝合锚点带改动率与覆盖字数",
+          bool(_pa) and all("change_rate" in a and isinstance(a.get("chars"), int)
+                            for a in _pa), str(_pa[:1]))
+    check("已应用的缝合锚点 applied=true",
+          any(a.get("applied") for a in _pa), str([a.get("applied") for a in _pa][:8]))
     qpath = outd / "_diagnostics" / "quality_report.json"
     check("_diagnostics 里有质量报告", qpath.exists())
     quality = json.loads(qpath.read_text(encoding="utf-8")) if qpath.exists() else {}
@@ -447,6 +456,10 @@ try:
           quality.get("summary", {}).get("chapters") == 6
           and quality.get("status") in ("good", "warn", "bad"),
           str(quality.get("summary")))
+    _st = quality.get("stitch", {})
+    check("质量报告汇总了缝合观测（数量与 progress 里已应用的锚点一致）",
+          _st.get("applied_patches") == sum(1 for a in _pa if a.get("applied"))
+          and _st.get("exposed_chars", 0) > 0, str(_st)[:200])
     qr = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(outd))}")
     check("/api/output/quality 返回同一份报告",
           qr.get("summary", {}).get("chapters") == 6, str(qr.get("summary")))

@@ -15,9 +15,14 @@ import {
   fetchVersions,
   restoreVersion,
   fetchQualityReport,
+  estimateRun,
+  costOf,
+  formatCost,
   type HistoryItem,
   type VersionInfo,
   type QualityReport,
+  type EstimateResult,
+  type UnitPrice,
 } from './api/system';
 
 // 版本号单一来源：package.json（经 vite define 注入，见 vite.config.ts）
@@ -220,6 +225,26 @@ function flushStream() {
 
 // 统计与提示
 const usageTokens = ref({ prompt: 0, completion: 0 });
+// 单价（元 / 百万 token），0 = 本地模型不计费。只在折算时使用，不发给后端、不进日志。
+const priceInput = ref(0);
+const priceOutput = ref(0);
+const estimate = ref<EstimateResult | null>(null);
+const estimating = ref(false);
+const estimateError = ref('');
+const unitPrice = computed<UnitPrice>(() => ({
+  input: Number(priceInput.value) || 0,
+  output: Number(priceOutput.value) || 0,
+}));
+const spentText = computed(() =>
+  formatCost(costOf(usageTokens.value.prompt, usageTokens.value.completion, unitPrice.value)),
+);
+const estimateCostText = computed(() =>
+  estimate.value
+    ? formatCost(
+        costOf(estimate.value.tokens.prompt, estimate.value.tokens.completion, unitPrice.value),
+      )
+    : '',
+);
 const batchStats = ref({ total: 0, phase1: 0, phase3: 0 });
 const chapterProgress = ref({ total: 0, done: 0 });
 const chapterRows = ref<{ id: string; label: string; status: string }[]>([]);
@@ -270,6 +295,8 @@ function persist() {
         tStitch: tStitch.value,
         proxy: proxy.value,
         richText: richText.value,
+        priceInput: priceInput.value,
+        priceOutput: priceOutput.value,
         // 刻意不持久化 apiKey：后端全链路约定「Key 仅存内存、不落盘、不进日志」
         // （api_client.make_httpx_client / routes/state.current_req），明文写进
         // WebView2 localStorage 会打破这个不变量，也会让设置面板上
@@ -317,6 +344,9 @@ function restore() {
     if (typeof p.sslVerify === 'boolean') sslVerify.value = p.sslVerify;
     if (typeof p.proxy === 'string') proxy.value = p.proxy;
     if (typeof p.richText === 'boolean') richText.value = p.richText;
+    // 单价：只接受非负数字；损坏/负值一律回落到 0（= 本地不计费），不让它污染折算
+    if (typeof p.priceInput === 'number' && p.priceInput >= 0) priceInput.value = p.priceInput;
+    if (typeof p.priceOutput === 'number' && p.priceOutput >= 0) priceOutput.value = p.priceOutput;
     // 不恢复 apiKey：见 persist() 处的说明（凭据不落盘）
     for (const [k, ref] of [
       ['tDiagnose', tDiagnose],
@@ -1036,20 +1066,32 @@ function apiBase() {
   return `http://127.0.0.1:${port.value}`;
 }
 
-async function startPipeline() {
-  if (starting.value) return; // 防重复提交：双击会并发起两个 run
-  if (!inputPath.value || !outputPath.value || !apiUrl.value || !model.value) {
-    alert('请填写完整：输入路径、输出路径、API URL、模型名');
+async function runEstimate() {
+  if (estimating.value) return;
+  if (!port.value) {
+    estimateError.value = '后端未连接，无法预估';
     return;
   }
-  if (refactorMode.value === 'fix_gaps' && !diagnoseJson.value.trim()) {
-    alert(
-      '「修断层」模式依赖结构化断层清单：请在「优化项」中填写诊断JSON输出目录，诊断后勾选断层才能闭环修复。',
-    );
+  if (!inputPath.value || !outputPath.value || !model.value) {
+    estimateError.value = '请先填写输入路径、输出路径与模型名';
     return;
   }
-  starting.value = true;
-  const body = {
+  estimating.value = true;
+  estimateError.value = '';
+  try {
+    estimate.value = await estimateRun(port.value, buildStartBody());
+  } catch (e: any) {
+    estimate.value = null;
+    estimateError.value = e?.message || String(e);
+  } finally {
+    estimating.value = false;
+  }
+}
+
+/** /api/start 与 /api/estimate 共用同一份请求体：两处各写一遍必然漂移
+ *  （预估看到的档位/门/风格与真跑不一致，预估结果就不作数了）。 */
+function buildStartBody() {
+  return {
     input_mode: inputMode.value,
     input_path: inputPath.value,
     output_path: outputPath.value,
@@ -1095,6 +1137,22 @@ async function startPipeline() {
     max_concurrency: Math.round(num(maxConcurrency.value, 1, 1, 4)),
     models: buildModels(),
   };
+}
+
+async function startPipeline() {
+  if (starting.value) return; // 防重复提交：双击会并发起两个 run
+  if (!inputPath.value || !outputPath.value || !apiUrl.value || !model.value) {
+    alert('请填写完整：输入路径、输出路径、API URL、模型名');
+    return;
+  }
+  if (refactorMode.value === 'fix_gaps' && !diagnoseJson.value.trim()) {
+    alert(
+      '「修断层」模式依赖结构化断层清单：请在「优化项」中填写诊断JSON输出目录，诊断后勾选断层才能闭环修复。',
+    );
+    return;
+  }
+  starting.value = true;
+  const body = buildStartBody();
   try {
     const res = await apiFetch(`${apiBase()}/api/start`, {
       method: 'POST',
@@ -1842,6 +1900,62 @@ const canStart = computed(
           <textarea v-model="authorStyle" rows="2"></textarea>
         </div>
 
+        <div class="row">
+          <label>单价</label>
+          <input
+            v-model.number="priceInput"
+            class="num"
+            type="number"
+            min="0"
+            step="0.1"
+            aria-label="每百万输入 token 价格"
+          />
+          <span class="ph-note">¥/百万输入</span>
+          <input
+            v-model.number="priceOutput"
+            class="num"
+            type="number"
+            min="0"
+            step="0.1"
+            aria-label="每百万输出 token 价格"
+          />
+          <span class="ph-note">¥/百万输出（留 0 = 本地不计费）</span>
+        </div>
+        <div class="row">
+          <button class="ghost" :disabled="estimating" @click="runEstimate">
+            {{ estimating ? '预估中…' : '预估本次规模与花费' }}
+          </button>
+          <span v-if="estimateError" class="ph-note err">{{ estimateError }}</span>
+        </div>
+        <div v-if="estimate" class="estimate">
+          <p class="estimate-line">
+            <b>{{ estimate.chapters }}</b> 章 → <b>{{ estimate.batches }}</b> 批（每批
+            {{ estimate.chapters_per_batch.join('/') }} 章） · 调用
+            <b>{{ estimate.calls.total }}</b> 次（诊断 {{ estimate.calls.diagnose }} · 蓝图
+            {{ estimate.calls.blueprint }} · 重构 {{ estimate.calls.refactor }} · 缝合
+            {{ estimate.calls.stitch }}）
+          </p>
+          <p class="estimate-line">
+            Token：<b>{{ estimate.tokens.prompt.toLocaleString('zh-CN') }}</b> 输入 /
+            <b>{{ estimate.tokens.completion.toLocaleString('zh-CN') }}</b> 输出 · 预计
+            <b>{{ estimateCostText }}</b>
+          </p>
+          <p class="hint">
+            单批正文上限 {{ estimate.body_token_limit.toLocaleString('zh-CN') }} token；
+            每次请求的固定脚手架
+            {{ estimate.scaffold_per_request.toLocaleString('zh-CN') }} token（占输入约
+            {{ (estimate.scaffold_share * 100).toFixed(0) }}%，窗口越小越亏）
+          </p>
+          <p class="hint">
+            缝合边界 {{ estimate.stitch_boundaries }} 处，每侧改写窗口
+            {{ estimate.stitch_window_chars.toLocaleString('zh-CN') }} 字，合计覆盖
+            {{ estimate.stitch_exposed_chars.toLocaleString('zh-CN') }} 字
+          </p>
+          <ul class="hint estimate-notes">
+            <li v-for="(n, i) in estimate.notes" :key="i">· {{ n }}</li>
+          </ul>
+        </div>
+
         <button class="start-btn" :disabled="!canStart" @click="startPipeline">开始重构</button>
       </section>
 
@@ -1920,6 +2034,7 @@ const canStart = computed(
           :batch-stats="batchStats"
           :chapter-progress="chapterProgress"
           :usage-tokens="usageTokens"
+          :spent-text="spentText"
           :elapsed="elapsed"
           :pipeline-running="pipelineRunning"
           :diag-percent="diagPercent"
@@ -2506,6 +2621,34 @@ html.dark .tree-toggle {
   color: #718096;
   margin: 4px 0 8px;
   line-height: 1.5;
+}
+.ph-note.err {
+  color: #b91c1c;
+}
+.estimate {
+  border: 1px solid #e2e8f0;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  background: #f9fafb;
+}
+.estimate-line {
+  margin: 3px 0;
+  font-size: 13px;
+}
+.estimate-notes {
+  margin: 6px 0 0;
+  padding-left: 2px;
+  list-style: none;
+  font-size: 12px;
+  color: #718096;
+}
+html.dark .estimate {
+  background: #1f2937;
+  border-color: #374151;
+}
+html.dark .ph-note.err {
+  color: #f87171;
 }
 .adv {
   border: 1px solid #e2e8f0;

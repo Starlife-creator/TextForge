@@ -18,6 +18,37 @@ _REASON_LABEL = {
 }
 
 
+def pack_groups(groups, body_token_limit, max_chapters=8):
+    """把「不可拆分组」按 token 上限贪心装批，返回 [[chapter_id, ...], ...]。
+
+    groups 元素是 (label, chapter_ids, group_tokens)。这是 phase1 划分批次的**唯一**
+    装批算法：拆批降级（split_batch_in_progress）与开跑前预估（core.estimate）都复用
+    它，避免预估自己写一套、真跑的批数与它对不上。
+    超过单批上限的组**只告警不报错**：上限由用户填的 context_window 推导，未必等于
+    模型真实窗口；硬报错会把本来能跑完的配置判死，放行最坏由上下文超限自动拆批兜底。
+    """
+    batches = []
+    current: list = []
+    current_tokens = 0
+    for label, group_ids, group_tokens in groups:
+        if group_tokens > body_token_limit:
+            logger.warning(
+                f"[batch] 章节组 {label} 共约 {group_tokens} token，超过单批上限 "
+                f"{int(body_token_limit)} token（章：{group_ids}）。该组因虚拟章保护不会被"
+                f"拆分；若服务商返回上下文超限，会自动对半拆批重试。")
+        if current and (current_tokens + group_tokens > body_token_limit
+                        or len(current) + len(group_ids) > max_chapters):
+            batches.append(current)
+            current = list(group_ids)
+            current_tokens = group_tokens
+        else:
+            current.extend(group_ids)
+            current_tokens += group_tokens
+    if current:
+        batches.append(current)
+    return batches
+
+
 def chapter_groups(chapters, chapter_ids):
     """把一批章 id 按「不可拆分组」聚合：同一 original_id 的虚拟章必须留在一起。
 

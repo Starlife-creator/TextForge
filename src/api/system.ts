@@ -205,6 +205,24 @@ export interface QualityDuplicate {
   containment: number;
 }
 
+export interface StitchAnchorMetric {
+  file: string | null;
+  source: string | null;
+  chars: number | null;
+  change_rate: number;
+}
+
+/** 缝合观测：补丁覆盖了多少字、原文句子被改掉了多少。口径见 config.stitch_metric */
+export interface StitchMetrics {
+  applied_patches: number;
+  measured: number;
+  exposed_chars: number;
+  mean: number | null;
+  p90: number | null;
+  max: number | null;
+  worst: StitchAnchorMetric[];
+}
+
 export interface QualityReport {
   schema: number;
   generated_at: string;
@@ -227,12 +245,20 @@ export interface QualityReport {
     auto_rewrites?: number;
     pre_stitch_issues?: number;
     stitch_failures?: number;
+    stitch_patches?: number;
+    stitch_measured?: number;
+    stitch_exposed_chars?: number;
+    stitch_exposed_ratio?: number | null;
+    stitch_mean_rate?: number | null;
+    stitch_p90_rate?: number | null;
+    stitch_max_rate?: number | null;
     issues_by_severity: Record<QualitySeverity, number>;
   };
   issues: QualityIssue[];
   issues_truncated: boolean;
   chapters: QualityChapterRow[];
   duplicates: QualityDuplicate[];
+  stitch?: StitchMetrics;
   config: {
     novel_name?: string | null;
     model?: string | null;
@@ -245,6 +271,7 @@ export interface QualityReport {
     forbidden_canon_count?: number;
     name_map_count?: number;
     forbidden_check?: string;
+    stitch_metric?: string;
   };
   usage: { prompt_tokens?: number | string; completion_tokens?: number | string };
   caveat: string;
@@ -310,4 +337,69 @@ export async function probeContext(
   const body = await res.json().catch(() => null);
   if (!res.ok || !body) throw new Error(`上下文探测失败：HTTP ${res.status}`);
   return body as ContextProbeResult;
+}
+
+// ---------- 开跑前预估与费用换算 ----------
+
+export interface EstimateResult {
+  chapters: number;
+  batches: number;
+  chapters_per_batch: number[];
+  body_token_limit: number;
+  context_window: number;
+  max_chapters_per_batch: number;
+  safety: number;
+  calls: { diagnose: number; blueprint: number; refactor: number; stitch: number; total: number };
+  tokens: {
+    prompt: number;
+    completion: number;
+    total: number;
+    by_stage: Record<string, { prompt: number; completion: number }>;
+  };
+  scaffold_per_request: number;
+  scaffold_share: number;
+  stitch_boundaries: number;
+  stitch_window_chars: number;
+  stitch_exposed_chars: number;
+  stitch_exposed_ratio: number;
+  notes: string[];
+}
+
+/** 用与 /api/start 完全相同的请求体预估（纯本地读文件，不调模型）。 */
+export function estimateRun(port: number, body: unknown) {
+  return req<EstimateResult>(port, '/api/estimate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export interface UnitPrice {
+  /** 每百万输入 token 的价格（元） */
+  input: number;
+  /** 每百万输出 token 的价格（元） */
+  output: number;
+}
+
+/**
+ * 按单价折算费用。两个单价都是 0（或非法）时返回 null，表示「本地模型，不计费」——
+ * 界面据此显示说明而不是 ¥0.00，避免把「没填」渲染成「免费」。
+ */
+export function costOf(
+  promptTokens: number | string,
+  completionTokens: number | string,
+  price: UnitPrice,
+): number | null {
+  const p = Number(price.input);
+  const o = Number(price.output);
+  if (!(p > 0) && !(o > 0)) return null;
+  const tin = Math.max(0, Number(promptTokens) || 0) / 1e6;
+  const tout = Math.max(0, Number(completionTokens) || 0) / 1e6;
+  return tin * (p > 0 ? p : 0) + tout * (o > 0 ? o : 0);
+}
+
+export function formatCost(value: number | null): string {
+  if (value === null) return '本地模型（未计单价）';
+  if (value < 0.01) return `¥${value.toFixed(4)}`;
+  return `¥${value.toFixed(2)}`;
 }

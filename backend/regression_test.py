@@ -908,6 +908,42 @@ with _TC(_app) as _c:
           _forced.status_code == 200, f"{_forced.status_code} {_forced.text[:60]}")
     state.pipeline_running = _running
 
+# ---------- 开跑前预估 /api/estimate ----------
+# 界面点「预估」走的是 HTTP：pytest 只测了纯函数 estimate_run()，路由这一层
+# （StartRequest 反序列化、路径校验、鉴权中间件）必须在这里钉住。
+import tempfile as _tf
+from pathlib import Path as _P
+
+check("注册了 /api/estimate", "/api/estimate" in _app.openapi()["paths"],
+      str([p for p in _app.openapi()["paths"] if "estimate" in p]))
+
+_est_sent = ("他推开门，屋里静得能听见自己的心跳声。" * 40)
+with _tf.TemporaryDirectory() as _td, _tf.TemporaryDirectory() as _td2:
+    _book = _P(_td) / "book.txt"
+    _book.write_text(
+        "\n\n".join(f"第{i}章 起事\n{_est_sent}" for i in range(1, 4)), encoding="utf-8")
+    _body = {
+        "input_mode": "single_file", "input_path": str(_book),
+        # 输出目录必须是输入目录的**兄弟**：paths.validate 禁止输出落在输入内部
+        "output_path": str(_P(_td2) / "out"), "input_format": "txt",
+        "api_url": "http://127.0.0.1:9/v1/chat/completions", "model": "mock-model",
+        "context_window": 8000,
+    }
+    with _TC(_app) as _c:
+        _er = _c.post("/api/estimate", json=_body)
+        _ej = _er.json() if _er.status_code == 200 else {}
+        check("POST /api/estimate 返回批数与调用数",
+              _er.status_code == 200 and _ej.get("chapters") == 3
+              and _ej.get("calls", {}).get("total", 0) > 0,
+              f"{_er.status_code} {_er.text[:200]}")
+        check("预估里缝合观测字段齐全",
+              {"stitch_boundaries", "stitch_window_chars", "scaffold_share"} <= set(_ej),
+              str(sorted(_ej)[:12]))
+        # 与 /api/start 同一套校验：格式与扩展名不符必须 422，不能让它跑起来才炸
+        _bad = _c.post("/api/estimate", json={**_body, "input_format": "docx"})
+        check("预估沿用 start 的路径校验（格式不符 422）",
+              _bad.status_code == 422, f"{_bad.status_code} {_bad.text[:80]}")
+
 # ---------- 心跳不再重写 progress.json ----------
 # 前端据此判断僵死（pipeline_running 且心跳超 90s 报警），因此心跳必须新鲜；
 # 但原实现是每 15s 把整个 progress.json 读出来、改一个字段、再全量写回 + fsync，

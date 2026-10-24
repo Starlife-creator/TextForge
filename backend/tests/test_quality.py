@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from core.quality import (
     assess_batch_texts,
     build_quality_report,
+    change_rate,
     find_duplicate_pairs,
     has_blocking_issues,
     read_quality_report,
+    stitch_metrics,
     write_quality_report,
 )
 
@@ -202,3 +204,98 @@ def test_assess_batch_good_text_has_no_blocking_issue():
         )
 
     assert not has_blocking_issues(issues)
+
+
+def _uniq(n=90, tag="文"):
+    """每行都不同的长文本：重复文本会让 shingle 集合自碰撞，改动率失真。"""
+    return "".join(f"第{i:02d}{tag}内容含{i * 7 % 100}号标记。" for i in range(n))
+
+
+def _anchor(rate, chars=900, *, applied=True, file="02_workspace/reconstructed/chapter_1.txt",
+            source="batch_stitch"):
+    return {"applied": applied, "change_rate": rate, "chars": chars,
+            "file": file, "source": source}
+
+
+def test_change_rate_distinguishes_untouched_from_bulk_rewrite():
+    base = _uniq()
+    assert change_rate(base, base) == 0.0
+    cut = base.index("。", len(base) // 2) + 1
+    assert change_rate(base, base[:cut] + "他停下脚步。" + base[cut:]) == 0.0, (
+        "只在句边界插一句过渡、原文一句未动，改动率必须是 0（滑窗口径会在这里误报 52%）")
+    # 把过渡句塞进句子中间会毁掉那一句 → 恰好多计一句，说明口径偏严不偏松
+    half = len(base) // 2
+    assert change_rate(base, base[:half] + "他停下脚步" + base[half:]) == round(1 / 90, 4)
+    one = base.replace("第45文内容含15号标记", "第45文这里被整句改写了")
+    assert one != base, "夹具没命中要改写的那句，测试本身失效"
+    assert 0 < change_rate(base, one) < 0.05
+    assert change_rate(base, _uniq(tag="别")) == 1.0
+    # 反向断言：窗口太短必须给 None，不能伪装成「没有改动」
+    assert change_rate("很短的一句。", "也就一句。") is None
+    assert change_rate("", base) is None
+
+
+def test_change_rate_ignores_pure_line_reflow():
+    base = _uniq()
+    reflowed = "\n\n".join(base[i:i + 60] for i in range(0, len(base), 60))
+    assert change_rate(base, reflowed) == 0.0, "只改分段/换行不该被算成改写"
+
+
+def test_stitch_metrics_counts_only_applied_and_separates_unmeasured():
+    m = stitch_metrics([
+        _anchor(0.1, file="a"),
+        _anchor(0.8, file="b"),
+        _anchor(None, chars=600, file="c"),        # 已应用但窗口太短：计入覆盖，不计入均值
+        _anchor(0.95, file="d", applied=False),    # 降级跳过的补丁绝不能算成改写
+    ])
+    assert m["applied_patches"] == 3
+    assert m["measured"] == 2
+    assert m["exposed_chars"] == 2400
+    assert m["mean"] == 0.45
+    assert m["max"] == 0.8
+    assert m["worst"][0]["file"] == "b"
+
+
+def test_stitch_metrics_keeps_zero_rate_as_measured():
+    """改动率 0.0 是「最理想的结果」，绝不能因为它是假值而被当成没数据丢掉。"""
+    m = stitch_metrics([_anchor(0.0, file="a"), _anchor(0.0, file="b")])
+    assert m["measured"] == 2
+    assert m["mean"] == 0.0 and m["max"] == 0.0 and m["p90"] == 0.0
+
+
+def test_stitch_metrics_p90_is_nearest_rank():
+    rates = [0.05, 0.1, 0.15, 0.2, 0.9]
+    m = stitch_metrics([_anchor(r, file=f"f{i}") for i, r in enumerate(rates)])
+    assert m["p90"] == 0.9          # ceil(0.9*5)=5 → 最大那个
+    m2 = stitch_metrics([_anchor(r, file=f"f{i}") for i, r in enumerate(rates[:-1])])
+    assert m2["p90"] == 0.2         # ceil(0.9*4)=4 → 第四位，不能被离群值拉走
+
+
+def test_quality_report_records_stitch_observation_without_warning():
+    originals = [("原文第%d章。" % i) * 150 for i in range(1, 4)]
+    recons = [("重构第%d章故事继续。" % i) * 130 for i in range(1, 4)]
+    progress = {"stitch_anchors": [_anchor(0.1, file="a"), _anchor(0.2, file="b"),
+                                   _anchor(0.3, file="c")]}
+    with tempfile.TemporaryDirectory() as tmp:
+        rep = _report(tmp, originals, recons, progress=progress)
+
+    assert rep["stitch"]["measured"] == 3
+    assert rep["stitch"]["mean"] == 0.2
+    assert rep["summary"]["stitch_exposed_chars"] == 2700
+    assert rep["summary"]["stitch_mean_rate"] == 0.2
+    assert rep["summary"]["stitch_exposed_ratio"] == 1.0
+    # 反向断言：平均改动率没越过阈值时不得产生提醒
+    assert "stitch_bulk_rewrite" not in {i["code"] for i in rep["issues"]}
+
+
+def test_quality_report_warns_when_stitch_rewrites_bulk():
+    originals = [("原文第%d章。" % i) * 150 for i in range(1, 4)]
+    recons = [("重构第%d章故事继续。" % i) * 130 for i in range(1, 4)]
+    progress = {"stitch_anchors": [_anchor(0.9, file="a"), _anchor(0.95, file="b")]}
+    with tempfile.TemporaryDirectory() as tmp:
+        rep = _report(tmp, originals, recons, progress=progress)
+
+    hit = [i for i in rep["issues"] if i["code"] == "stitch_bulk_rewrite"]
+    assert hit and "平均改动率" in hit[0]["message"], str(hit)
+    assert rep["status"] == "warn"
+    assert [w["file"] for w in rep["stitch"]["worst"]] == ["b", "a"]

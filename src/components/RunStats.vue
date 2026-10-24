@@ -11,6 +11,8 @@ defineProps<{
   batchStats: { phase1: number; phase3: number; total: number };
   chapterProgress: { done: number; total: number };
   usageTokens: { prompt: number | string; completion: number | string };
+  /** 按用户填的单价折算的已花费；未填单价时为「本地模型（未计单价）」 */
+  spentText?: string;
   elapsed: string;
   pipelineRunning: boolean;
   /** 三个百分比由父组件算好（字符串，含 % 号），这里不再做业务计算 */
@@ -39,6 +41,9 @@ defineProps<{
       >Tokens：<b>{{ usageTokens.prompt }}</b
       >输入 / <b>{{ usageTokens.completion }}</b
       >输出</span
+    >
+    <span v-if="spentText" class="stat"
+      >已花费：<b>{{ spentText }}</b></span
     >
   </div>
 

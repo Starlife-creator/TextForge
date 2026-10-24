@@ -1,6 +1,7 @@
 import asyncio, json, re, hashlib, unicodedata, logging
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
+from core.quality import change_rate
 
 logger = logging.getLogger("textforge")
 
@@ -166,6 +167,7 @@ async def _stitch_common(prev_file_rel, next_file_rel, output_path, payload_base
             "end": len(prev_text),
             "original": prev_seg, "replacement": prev_repl,
             "before_hash": sha256_of(prev_seg), "applied": False,
+            "change_rate": change_rate(prev_seg, prev_repl),
         },
         {
             "file": next_file_rel,
@@ -173,6 +175,7 @@ async def _stitch_common(prev_file_rel, next_file_rel, output_path, payload_base
             "end": len(next_seg),
             "original": next_seg, "replacement": next_repl,
             "before_hash": sha256_of(next_seg), "applied": False,
+            "change_rate": change_rate(next_seg, next_repl),
         },
     ]
 
@@ -287,12 +290,15 @@ def _record_anchors(progress: dict, patches: list, output_path: Path | None = No
             continue
         known.add(k)
         new_patches.append(p)
-        # 轻量引用：不含 original/replacement 全文
+        # 轻量引用：不含 original/replacement 全文，但要带改动率与覆盖字数 ——
+        # 质量报告只读 progress.json，靠这两个字段汇总缝合的实际改写面积。
         anchors.append({
             "file": p.get("file"),
             "start": p.get("start"),
             "end": p.get("end"),
+            "chars": int(p.get("end") or 0) - int(p.get("start") or 0),
             "before_hash": p.get("before_hash"),
+            "change_rate": p.get("change_rate"),
             "applied": p.get("applied", False),
             "source": p.get("source", "unknown"),
         })
@@ -347,14 +353,21 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
         for i in range(len(virtuals_sorted) - 1):
             if state.stop_requested: raise asyncio.CancelledError()
             boundary = f"virtual:{virtuals_sorted[i].get('virtual_id')}->{virtuals_sorted[i + 1].get('virtual_id')}"
+            patches = []
             try:
                 patches = await apply_virtual_stitch(virtuals_sorted[i], virtuals_sorted[i + 1],
                     client, payload_base, sse_emit_fn, run_id, chars)
-                _record_anchors(progress, patches, output_path)
                 patches_by_file = {}
                 for p in patches: patches_by_file.setdefault(p['file'], []).append(p)
                 apply_stitches(output_path, patches_by_file)
+                # 记录必须发生在应用**之后**：applied 标志是 apply_stitches 就地改写的，
+                # 先记后应用会让 progress 与缝合报告把所有补丁都写成「未应用」，
+                # 也让按 applied 汇总的改动率永远为空。
+                _record_anchors(progress, patches, output_path)
             except Exception as e:
+                # 失败分支也记录：此时 patches 可能是「已生成但未应用」或「部分应用」，
+                # 两者都是成品的真实状态，丢掉就等于改过正文却毫无线索。
+                _record_anchors(progress, patches, output_path)
                 _record_stitch_failure(progress, 1, boundary, e, sse_emit_fn, run_id)
         # 所有虚拟章组都 merge 成父章文件（merge 本身幂等：总是用当前虚拟章内容覆盖父章）
         merge_virtual_chapters(virtuals_sorted, output_path, progress)
@@ -375,14 +388,16 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
             logger.info(f"[stitch] 批次边界 {pair_key} 已完成，恢复跳过")
             continue
         # v8.8：去掉 is_cross_batch_pair 跳过——虚拟章边界必须缝合
+        patches = []
         try:
             patches = await apply_batch_stitch(completed_batches[i], completed_batches[i + 1],
                 client, payload_base, sse_emit_fn, run_id, chars)
-            _record_anchors(progress, patches, output_path)
             patches_by_file = {}
             for p in patches: patches_by_file.setdefault(p['file'], []).append(p)
             apply_stitches(output_path, patches_by_file)
+            _record_anchors(progress, patches, output_path)
         except Exception as e:
+            _record_anchors(progress, patches, output_path)
             _record_stitch_failure(progress, 2, pair_key, e, sse_emit_fn, run_id)
         # 失败边界也记为已完成：续跑时不应反复为一个「已降级跳过」的交界烧调用。
         batch_done.append(pair_key)

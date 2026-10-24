@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from utils.atomic import atomic_write_json
@@ -27,6 +27,11 @@ MIN_CONTAINMENT = 0.01
 MAX_DUPLICATE_PAIRS = 20
 MAX_POSTINGS = 30
 
+# 缝合改动率的提醒阈值：平均改动率超过它，说明多数边界不是「补一句过渡」，
+# 而是接近整段重写。当前只用于提醒与抽读定位，不做拒绝闸门（判据还需真机分布）。
+STITCH_WARN_MEAN_RATE = 0.5
+STITCH_WORST_ITEMS = 5
+
 RESIDUAL_MARKERS = ("===CHAPTER_BREAK===", "===PREV_END===", "===NEXT_START===")
 # 最后一组是模型元话术（不是小说正文）：出现即说明模型把「回复用户」的措辞
 # 写进了成品。只收几乎不可能出现在小说对白里的固定短语，避免误伤剧情。
@@ -39,6 +44,10 @@ PLACEHOLDERS = (
 
 BAD = "bad"
 WARN = "warn"
+
+# 分句：只认句末标点。**换行不算边界** —— 缝合常常只是重新分段，
+# 若把 \n 当边界，「同一段文字换个分行」会被量成整段改写。
+_SENT_SPLIT_RE = re.compile(r"[。！？…；!?;]+")
 
 
 def _read_text(path: Path) -> str:
@@ -82,6 +91,70 @@ def shingle_set(text: str) -> set[str]:
     return {
         compact[i : i + SHINGLE]
         for i in range(0, len(compact) - SHINGLE + 1, SHINGLE_STEP)
+    }
+
+
+def change_rate(original: str, replacement: str) -> float | None:
+    """缝合补丁的改动率：原文句子中**没有被原样保留**的比例。
+
+    口径是「分句后逐句对照」：0.0 = 一字未改（哪怕新增了几句过渡），
+    1.0 = 原文句子一句都没留下。选这个口径而不是滑窗重合度，有两个实测原因：
+      1. 60 字滑窗按步长 10 采样，**在中间插一句**会让后续片段整体错位，
+         实测把「插入 13 字过渡」量成 52% 改动 —— 恰恰把最理想的结果判成最坏。
+      2. 字符级 difflib 是 O(n²)，15000 字窗口单次要 1.6–8 秒；缝合是逐边界调用，
+         这个开销没必要。分句对照是 O(n)。
+
+    代价：句内改一个字就把整句计为改动，所以它**偏严不偏松** —— 作为将来
+    「最小改动闸门」的判据，偏严是安全方向。
+    句子不足 3 句时返回 **None**（窗口可能是一整段无标点长句，测量无意义），
+    而不是 0 —— 把「无法判断」伪装成「没有改动」会让报告虚高。
+    """
+    a = _sentences(original)
+    if len(a) < 3:
+        return None
+    kept = sum((Counter(a) & Counter(_sentences(replacement))).values())
+    return round(1 - kept / len(a), 4)
+
+
+def _sentences(text: str) -> list[str]:
+    """先去掉**全部**空白（重新分段/换行不算改动），再按句末标点分句。"""
+    compact = re.sub(r"\s+", "", text or "")
+    return [s for s in _SENT_SPLIT_RE.split(compact) if s]
+
+
+def stitch_metrics(anchors) -> dict:
+    """汇总缝合补丁的观测值。只统计**已应用**的补丁：
+
+    失败降级的补丁没有改到正文，计入的话会把「跳过」也算成「改写」。
+    """
+    applied = [a for a in anchors or [] if isinstance(a, dict) and a.get("applied")]
+    measured = [
+        a for a in applied
+        if isinstance(a.get("change_rate"), (int, float))
+    ]
+    rates = sorted(a["change_rate"] for a in measured)
+    mean = round(sum(rates) / len(rates), 4) if rates else None
+    p90 = None
+    if rates:
+        rank = -((-len(rates) * 9) // 10)   # 最近秩 ceil(0.9n)
+        p90 = round(rates[rank - 1], 4)
+    worst = sorted(measured, key=lambda a: -a["change_rate"])[:STITCH_WORST_ITEMS]
+    return {
+        "applied_patches": len(applied),
+        "measured": len(rates),
+        "exposed_chars": sum(int(a.get("chars") or 0) for a in applied),
+        "mean": mean,
+        "p90": p90,
+        "max": round(rates[-1], 4) if rates else None,
+        "worst": [
+            {
+                "file": a.get("file"),
+                "source": a.get("source"),
+                "chars": a.get("chars"),
+                "change_rate": a["change_rate"],
+            }
+            for a in worst
+        ],
     }
 
 
@@ -479,6 +552,21 @@ def build_quality_report(
             f"{len(progress['stitch_failures'])} 处缝合失败已跳过（未应用的补丁保持原文），"
             f"建议人工检查：{preview}",
         )
+    # 缝合改动率：观测值，用来回答「这次缝合到底动了多少字、动得有多狠」。
+    # 只有平均改动率越过提醒阈值才产生一条 warn；平时它只是报告里的一组数字。
+    stitch = stitch_metrics(progress.get("stitch_anchors") or [])
+    if (
+        stitch["measured"]
+        and stitch["mean"] is not None
+        and stitch["mean"] > STITCH_WARN_MEAN_RATE
+    ):
+        add_issue(
+            WARN,
+            "stitch_bulk_rewrite",
+            f"{stitch['measured']} 处缝合补丁平均改动率 {stitch['mean']:.0%}"
+            f"（多数边界接近整段重写，而非只补过渡），建议对照抽读改动最大的"
+            f"{len(stitch['worst'])} 处",
+        )
     if progress.get("config_drift"):
         add_issue(
             WARN,
@@ -525,12 +613,22 @@ def build_quality_report(
             "auto_rewrites": len(progress.get("auto_rewrite_log") or []),
             "pre_stitch_issues": len(progress.get("pre_stitch_issues") or []),
             "stitch_failures": len(progress.get("stitch_failures") or []),
+            "stitch_patches": stitch["applied_patches"],
+            "stitch_measured": stitch["measured"],
+            "stitch_exposed_chars": stitch["exposed_chars"],
+            "stitch_exposed_ratio": (
+                round(stitch["exposed_chars"] / total_orig, 3) if total_orig else None
+            ),
+            "stitch_mean_rate": stitch["mean"],
+            "stitch_p90_rate": stitch["p90"],
+            "stitch_max_rate": stitch["max"],
             "issues_by_severity": counts,
         },
         "issues": issues[:200],
         "issues_truncated": len(issues) > 200,
         "chapters": rows,
         "duplicates": duplicates,
+        "stitch": stitch,
         "config": {
             "novel_name": progress.get("novel_name"),
             "model": getattr(req, "model", None),
@@ -543,6 +641,10 @@ def build_quality_report(
             "forbidden_canon_count": len(forbidden),
             "name_map_count": len(name_map),
             "forbidden_check": "字面匹配，仅能发现逐字出现的设定冲突",
+            "stitch_metric": (
+                "改动率 = 缝合窗口内原文句子没有被原样保留的比例（分句对照，忽略换行与分段）；"
+                "0 = 只新增过渡未动原文，1 = 整段换写法。它是观测口径，不判断改写质量"
+            ),
         },
         "usage": progress.get("usage") or {},
         "caveat": (
