@@ -6,7 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.budget import body_token_budget, continuity_token_allowance, story_memo_token_allowance
+from core.budget import (
+    STITCH_MAX_WINDOW_CHARS,
+    body_token_budget,
+    continuity_token_allowance,
+    diagnose_max_tokens,
+    story_memo_token_allowance,
+)
 from core.estimate import chapter_token_sizes, estimate_run
 from core.splitter import _load_batches
 from utils.tokens import estimate_tokens
@@ -168,3 +174,59 @@ def test_estimate_reports_chapter_token_floor():
     assert est["chapters"] == 1
     assert est["tokens"]["prompt"] > estimate_tokens(text)
     assert est["body_token_limit"] > 0
+
+
+def test_estimate_window_knee_justifies_the_ui_default():
+    """32768 是拐点：批数在这里触底，再往上放大窗口只是多付脚手架。
+
+    这条是前端默认值（src/presets.ts 的 DEFAULT_CONTEXT_WINDOW）与「为什么不出 128k
+    档预设」的依据。若日后预留口径不再随窗口放大，本用例先失败，提醒前端重选默认值。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _book(tmp, 60)
+        runs = {
+            cw: estimate_run(_req(book, context_window=cw))
+            for cw in (8000, 16384, 32768, 65536, 131072)
+        }
+
+    assert runs[8000]["batches"] > runs[16384]["batches"] > runs[32768]["batches"]
+    assert runs[32768]["batches"] == runs[65536]["batches"] == runs[131072]["batches"], (
+        "批数在 32768 之后还在下降，拐点判断已过时")
+    assert max(runs[32768]["chapters_per_batch"]) == 8, "触底的原因应是单批 8 章上限"
+    # 触底之后继续放大窗口：输入变贵而不是变便宜（脚手架随每批重发且预留随窗口放大）
+    assert runs[131072]["tokens"]["prompt"] > runs[32768]["tokens"]["prompt"]
+    assert runs[32768]["scaffold_share"] < runs[8000]["scaffold_share"]
+    assert runs[32768]["scaffold_share"] < runs[131072]["scaffold_share"]
+
+
+def test_estimate_stitch_window_follows_the_cap():
+    """预估的缝合面积必须跟着窗口封顶走，否则界面报出的覆盖面积比真跑的大两倍。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _book(tmp, 8)
+        small = estimate_run(_req(book, context_window=8000))
+        huge = estimate_run(_req(book, context_window=128000))
+
+    assert small["stitch_window_chars"] == int(8000 * 1.5 * 0.075)
+    assert small["stitch_window_chars"] < STITCH_MAX_WINDOW_CHARS, "语料窗口不该被封顶"
+    assert huge["stitch_window_chars"] == STITCH_MAX_WINDOW_CHARS, (
+        f"大窗口未封顶：预估 {huge['stitch_window_chars']} 字")
+    assert int(128000 * 1.5 * 0.075) > STITCH_MAX_WINDOW_CHARS, "用例失去意义，请换更大窗口"
+    # 封顶必须说出来：界面若悄悄按 1200 字报覆盖面积，用户会以为真跑也只动这么点
+    assert not any("封顶" in n for n in small["notes"]), str(small["notes"])
+    assert any("封顶" in n and "1200" in n for n in huge["notes"]), str(huge["notes"])
+
+
+def test_estimate_diagnose_output_uses_the_same_formula_as_phase1():
+    """诊断输出预留必须与真跑的 `diagnose_max_tokens` 一致：两份算式各写一遍必漂移。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        book = _book(tmp, 12)
+        plain = estimate_run(_req(book))
+        with_json = estimate_run(_req(book, diagnose_json="diag_out"))
+
+    per_batch = plain["chapters_per_batch"]
+    assert plain["tokens"]["by_stage"]["diagnose"]["completion"] == sum(
+        diagnose_max_tokens(n) for n in per_batch), str(per_batch)
+    assert with_json["tokens"]["by_stage"]["diagnose"]["completion"] == sum(
+        diagnose_max_tokens(n, with_json=True) for n in per_batch), str(per_batch)
+    assert (with_json["tokens"]["by_stage"]["diagnose"]["completion"]
+            > plain["tokens"]["by_stage"]["diagnose"]["completion"])

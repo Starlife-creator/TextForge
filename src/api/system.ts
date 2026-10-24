@@ -272,6 +272,8 @@ export interface QualityReport {
     name_map_count?: number;
     forbidden_check?: string;
     stitch_metric?: string;
+    /** 当时生效的缝合护栏（窗口封顶值 + 最小改动闸门开/关），由后端拼好整句 */
+    stitch_gate?: string;
   };
   usage: { prompt_tokens?: number | string; completion_tokens?: number | string };
   caveat: string;

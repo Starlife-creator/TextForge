@@ -33,10 +33,13 @@ class StartRequest(BaseModel):
     # P1.1 重构模式：缺省 full_rewrite（= 原「全部重构」极端档，行为不变）
     refactor_mode: Literal["full_rewrite", "fidelity", "fix_gaps", "reskin"] = "full_rewrite"
     # P1 门开关：缺省全关（不改变旧行为）
+    # 例外：stitch_minimal_change 默认开。它拒绝的是「整段重写交界处」，
+    # 而拒绝后的降级路径与缝合失败完全一致（保留原文交界），所以不会产出更差正文。
     refactor_gates: Dict[str, bool] = Field(default_factory=lambda: {
         "lock_names": False, "lock_plot": False, "inject_forbidden": False,
         "require_chapter_accept": False, "skip_stitch_if_smooth": False,
         "qc_block_export": False, "auto_rewrite_bad_batch": True,
+        "stitch_minimal_change": True,
     })
     # P0.2 可选的禁改清单（仅非 full_rewrite 注入）
     forbidden_canon: List[str] = Field(default_factory=list, max_length=5000)

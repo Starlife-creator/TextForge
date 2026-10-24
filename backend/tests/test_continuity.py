@@ -17,6 +17,7 @@ from core.refactor import (
     _story_memo_for_batch,
     _tail_for_prompt,
 )
+from utils.tokens import estimate_tokens
 
 
 def _mk_output(tmp: str, *, reconstructed: str = "", original: str = "") -> Path:
@@ -34,10 +35,29 @@ def _mk_output(tmp: str, *, reconstructed: str = "", original: str = "") -> Path
 
 def test_tail_keeps_end_and_prefers_sentence_boundary():
     text = "开头。" + "中间内容。" * 200 + "这是真正的结尾。"
-    tail = _tail_for_prompt(text, limit=80)
+    tail = _tail_for_prompt(text, token_limit=80)
     assert tail.startswith("……")
     assert "这是真正的结尾。" in tail
-    assert len(tail) <= 83
+    assert estimate_tokens(tail) <= 80
+
+
+def test_tail_never_exceeds_the_reserved_tokens():
+    """反向断言：旧实现按 600 **字符**裁，而 8000 窗口只预留 320 token，
+    注入的片段能超出预留近一倍 —— 这条就是钉住那个口径统一的。"""
+    for window in (8000, 16384, 32768, 131072):
+        reserve = continuity_token_allowance(window)
+        text = "他站在门口。" * 6000          # 远超预算的章尾
+        tail = _tail_for_prompt(text, token_limit=reserve)
+        assert tail, "不该被裁成空"
+        assert estimate_tokens(tail) <= reserve, (
+            f"窗口 {window}：预留 {reserve} token，实际注入 {estimate_tokens(tail)}")
+
+
+def test_tail_short_text_returned_whole_and_empty_limits_are_empty():
+    assert _tail_for_prompt("短短一句。", token_limit=320) == "短短一句。"
+    assert _tail_for_prompt("", token_limit=320) == ""
+    assert _tail_for_prompt("有内容", token_limit=2) == ""      # 预算过小就不注入
+    assert _tail_for_prompt("有内容", token_limit=0) == ""
 
 
 def test_continuity_serial_uses_reconstructed_text():
@@ -49,7 +69,8 @@ def test_continuity_serial_uses_reconstructed_text():
                 {"id": "2", "split_file": "02_workspace/split/2.txt", "is_empty": False},
             ]
         }
-        text = _continuity_for_batch(out, progress, {"chapter_ids": ["2"]})
+        text = _continuity_for_batch(
+            out, progress, {"chapter_ids": ["2"]}, token_limit=320)
     assert text == "上一批重构结尾。"
 
 
@@ -63,7 +84,8 @@ def test_continuity_falls_back_to_original_when_recon_missing():
                 {"id": "2", "split_file": "02_workspace/split/2.txt", "is_empty": False},
             ]
         }
-        text = _continuity_for_batch(out, progress, {"chapter_ids": ["2"]})
+        text = _continuity_for_batch(
+            out, progress, {"chapter_ids": ["2"]}, token_limit=320)
     assert text == "上一批原文结尾。"
 
 
@@ -115,7 +137,7 @@ def test_story_memo_uses_nearest_previous_non_overlapping_batch():
             ]
         }
         memo = _story_memo_for_batch(
-            out, progress, {"batch_id": 3, "chapter_ids": ["3"]}, limit=200)
+            out, progress, {"batch_id": 3, "chapter_ids": ["3"]}, token_limit=200)
     assert memo == "第二章前情：主角受伤。"
 
 

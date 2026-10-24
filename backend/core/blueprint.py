@@ -21,12 +21,25 @@ import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
+from core.budget import blueprint_context_chars, window_char_capacity
 from utils.atomic import atomic_write_json
 
 logger = logging.getLogger("textforge")
 
 SEP = "\n\n---\n\n"
 CLIP_MARK = "\n……（中略）……\n"
+
+# 分卷压缩的收缩策略。开跑前预估（core/estimate._blueprint_calls）要复算
+# 「会调用几次、每次多长」，靠的是同一组数字 —— 所以它们只允许写在这里，
+# 预估侧必须按 `blueprint.MAP_*` 取值，不能再抄一份字面量。
+MAP_CHUNK_MIN_CHARS = 1200        # 每轮块预算的下限
+MAP_CHUNK_RATIO = 0.72            # 块预算 = 总预算 × 该比例
+MAP_TARGET_MIN_CHARS = 240        # 单次压缩输出的下限
+MAP_TARGET_MAX_CHARS = 900        # 单次压缩输出的上限
+MAP_TARGET_RATIO = 0.22           # 输出目标 = 块长 × 该比例
+COMPRESS_MIN_BUDGET_CHARS = 400   # 预算地板：低于此值不值得再分块
+MAX_COMPRESS_ROUNDS = 4           # 不收敛就转等距抽样
+GAP_DIGEST_MAX_CHARS = 3000       # 断层清单在蓝图上下文里的预留上限
 
 MapCall = Callable[[str, int], Awaitable[str]]
 ProgressFn = Callable[[int, int, int], None]
@@ -183,13 +196,14 @@ async def _map_one(
         meta["cache_hits"] += 1
         return cached
 
-    target = max(240, min(900, int(len(text) * 0.22)))
+    target = max(MAP_TARGET_MIN_CHARS,
+                 min(MAP_TARGET_MAX_CHARS, int(len(text) * MAP_TARGET_RATIO)))
     prompt = build_map_prompt(text, first, last, target)
     out = _clean_map_output(await map_call(prompt, target))
     meta["map_calls"] += 1
     if not out:
         # call_with_retry 已重试过空响应；这里保底，不让一个坏响应毁掉整轮
-        out = clip_text(text, max(400, target))
+        out = clip_text(text, max(COMPRESS_MIN_BUDGET_CHARS, target))
         meta["fallback_items"] += 1
     else:
         _save_cached(path, key=key, text=out, model=model)
@@ -205,11 +219,11 @@ async def compress_summaries(
     model: str,
     prompt_version: str,
     on_progress: ProgressFn | None = None,
-    max_rounds: int = 4,
+    max_rounds: int | None = None,
 ) -> tuple[list[str], dict]:
     """把有序摘要压进 budget 字符内，返回 (压缩后条目, 统计)。"""
     items = [x.strip() for x in items if x and x.strip()]
-    budget = max(400, int(budget))
+    budget = max(COMPRESS_MIN_BUDGET_CHARS, int(budget))
     meta = {
         "budget": budget,
         "original_items": len(items),
@@ -226,8 +240,11 @@ async def compress_summaries(
     if not items or joined_len(items) <= budget:
         return items, meta
 
-    chunk_budget = max(1200, int(budget * 0.72))
-    while joined_len(items) > budget and len(items) > 1 and meta["rounds"] < max_rounds:
+    chunk_budget = max(MAP_CHUNK_MIN_CHARS, int(budget * MAP_CHUNK_RATIO))
+    # 轮数上限在**调用时**取常量，不能写成默认参数：默认值在 import 时就固化了，
+    # 之后改 MAX_COMPRESS_ROUNDS 只动得到预估那一边（这条由行为门禁实测出来）。
+    rounds_cap = MAX_COMPRESS_ROUNDS if max_rounds is None else max_rounds
+    while joined_len(items) > budget and len(items) > 1 and meta["rounds"] < rounds_cap:
         chunks = chunk_by_budget(items, chunk_budget)
         if len(chunks) <= 1:
             break
@@ -268,11 +285,12 @@ async def compress_summaries(
 
 
 def read_gap_digest(
-    diag_dir: str | None, *, max_chars: int = 3000, max_items: int = 40
+    diag_dir: str | None, *, max_chars: int | None = None, max_items: int = 40
 ) -> dict:
     """把结构化诊断里的断层压成一份短清单，优先 high/medium。"""
+    limit = GAP_DIGEST_MAX_CHARS if max_chars is None else max_chars
     empty = {"text": "", "total": 0, "included": 0}
-    if not diag_dir or max_chars <= 0:
+    if not diag_dir or limit <= 0:
         return empty
     d = Path(diag_dir)
     if not d.is_dir():
@@ -314,8 +332,8 @@ def read_gap_digest(
     for *_, line in entries:
         if len(selected) >= max_items:
             break
-        if used + len(line) + 1 > max_chars:
-            remain = max_chars - used - 1
+        if used + len(line) + 1 > limit:
+            remain = limit - used - 1
             if remain >= 40:
                 selected.append(clip_text(line, remain))
             break
@@ -341,14 +359,14 @@ async def build_blueprint_context(
     if not pairs:
         raise RuntimeError("未找到章节摘要（01_summaries），无法生成蓝图；请从诊断阶段续跑")
 
-    chars = req.context_window * 1.5
-    max_total = int(chars * 0.60)
+    chars = window_char_capacity(req.context_window)
+    max_total = blueprint_context_chars(chars)
     gap = read_gap_digest(
         getattr(req, "diagnose_json", None),
-        max_chars=max(0, min(3000, max_total // 3)),
+        max_chars=max(0, min(GAP_DIGEST_MAX_CHARS, max_total // 3)),
     )
     gap_text = gap["text"]
-    budget = max(400, max_total - (len(gap_text) + 2 if gap_text else 0))
+    budget = max(COMPRESS_MIN_BUDGET_CHARS, max_total - (len(gap_text) + 2 if gap_text else 0))
 
     def on_progress(done: int, total: int, round_no: int) -> None:
         if emit:

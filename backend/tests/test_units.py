@@ -175,3 +175,35 @@ def test_init_progress_records_prompt_version():
     from routes.pipeline_runner import init_progress
     progress = init_progress(_pipeline_req(), "run-1")
     assert progress["prompt_version"] == PROMPT_VERSION
+
+
+def test_diagnose_max_tokens_scales_with_chapter_count():
+    from core.budget import DIAG_TOKENS_CAP, diagnose_max_tokens
+
+    assert diagnose_max_tokens(1) < diagnose_max_tokens(8)
+    assert diagnose_max_tokens(8, with_json=True) > diagnose_max_tokens(8)
+    assert diagnose_max_tokens(20) == DIAG_TOKENS_CAP      # 荒谬批数被上限兜住
+    # 反向断言：旧实现固定 2000，8 章 + JSON 时必须给得比 2000 多，否则末尾 JSON 仍被截
+    assert diagnose_max_tokens(8, with_json=True) > 2000
+    assert diagnose_max_tokens(0) == diagnose_max_tokens(1)  # 章数下限兜住
+
+
+def test_diag_json_miss_is_recorded_and_pushed_once():
+    from core.splitter import _record_diag_json_miss
+
+    events = []
+    progress = {}
+    emit = lambda ev, data, rid=None: events.append((ev, data))
+    import core.splitter as sp
+    original = sp.sse_emit
+    sp.sse_emit = emit
+    try:
+        _record_diag_json_miss(progress, 3, "run")
+        _record_diag_json_miss(progress, 3, "run")   # 同一批重复调用只提醒一次
+    finally:
+        sp.sse_emit = original
+
+    assert progress["diag_json_missing"] == [3]
+    assert len(events) == 2 and events[0][0] == "error"
+    assert events[0][1]["code"] == "diag_json_missing"
+    assert "断层不会进入勾选清单" in events[0][1]["message"]

@@ -1,5 +1,6 @@
 import asyncio, logging
 from pathlib import Path
+from core.budget import blueprint_chars
 from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
 from routes.events import sse_emit
@@ -41,8 +42,9 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
     # 「前几批用旧提示词、后几批用新提示词」，而不是静默混用。
     progress['prompt_version'] = PROMPT_VERSION
 
-    chars = req.context_window * 1.5
-    blueprint_max = min(5000, max(2000, int(chars * 0.05)))
+    # 蓝图上限与重构预留同源（core.budget.blueprint_chars）：
+    # 两处各写一份时，「生成 5000 字」与「按另一套算式预留」会静默错配。
+    blueprint_max = blueprint_chars(req.context_window)
 
     from core.blueprint import build_blueprint_context
     from core.api_client import call_with_retry, make_httpx_client, pick_endpoint

@@ -10,6 +10,12 @@ import RunStats from './components/RunStats.vue';
 import QualityModal from './components/QualityModal.vue';
 import { apiFetch, initAuth } from './api/client';
 import {
+  DEFAULT_CONTEXT_WINDOW,
+  DEFAULT_PRESET_NAME,
+  MIN_CONTEXT_WINDOW,
+  PRESETS,
+} from './presets';
+import {
   fetchHistory,
   forgetHistory,
   fetchVersions,
@@ -64,11 +70,13 @@ const inputFormat = ref<'docx' | 'txt' | 'md'>('txt');
 const apiUrl = ref('');
 const apiKey = ref('');
 const model = ref('');
-const contextWindow = ref(8000);
+// 上下文窗口默认值与预设档位的取值依据在 src/presets.ts（含「为什么不提供 128k 档」）。
+// 老用户不受影响：restore() 会用 localStorage 里已存的值覆盖这个默认值。
+const contextWindow = ref(DEFAULT_CONTEXT_WINDOW);
 const authorStyle = ref('出版级文学重构，文笔凝练，注重画面感');
 const novelName = ref('');
 const refactorMode = ref<'full_rewrite' | 'fidelity' | 'fix_gaps' | 'reskin'>('full_rewrite');
-// 重构保护门（后端 refactor_gates，默认全关；自动重写默认开）
+// 重构保护门（后端 refactor_gates，默认全关；自动重写与缝合最小改动默认开）
 const gates = reactive({
   lock_names: false,
   lock_plot: false,
@@ -77,6 +85,7 @@ const gates = reactive({
   skip_stitch_if_smooth: false,
   qc_block_export: false,
   auto_rewrite_bad_batch: true,
+  stitch_minimal_change: true,
 });
 const GATE_KEYS = [
   'lock_names',
@@ -86,6 +95,7 @@ const GATE_KEYS = [
   'skip_stitch_if_smooth',
   'qc_block_export',
   'auto_rewrite_bad_batch',
+  'stitch_minimal_change',
 ] as const;
 // 逐章验收弹窗
 const showAccept = ref(false);
@@ -130,15 +140,10 @@ const nameMapText = ref('');
 const batchInterval = ref(2.0);
 // 有界并发：默认串行；云端可调到 2-4，本地小模型不建议
 const maxConcurrency = ref(1);
-// B2 服务商预设（温度/上下文/批次间隔一键套用，纯前端）
-const preset = ref('通用');
-const PRESETS: Record<string, { temps: number[]; ctx: number; interval: number }> = {
-  通用: { temps: [0.3, 0.5, 0.8, 0.6], ctx: 8000, interval: 2.0 },
-  快速低保真: { temps: [0.2, 0.3, 0.7, 0.5], ctx: 8000, interval: 1.0 },
-  '创作·宽松': { temps: [0.5, 0.7, 1.0, 0.8], ctx: 8000, interval: 2.5 },
-};
+// B2 服务商预设（温度/上下文/批次间隔一键套用，纯前端；取值见 src/presets.ts）
+const preset = ref(DEFAULT_PRESET_NAME);
 function applyPreset() {
-  const p = PRESETS[preset.value] || PRESETS['通用'];
+  const p = PRESETS[preset.value] || PRESETS[DEFAULT_PRESET_NAME];
   [tDiagnose.value, tBlueprint.value, tRefactor.value, tStitch.value] = p.temps;
   contextWindow.value = p.ctx;
   batchInterval.value = p.interval;
@@ -314,7 +319,10 @@ function restore() {
     const p = JSON.parse(raw);
     if (typeof p.apiUrl === 'string') apiUrl.value = p.apiUrl;
     if (typeof p.model === 'string') model.value = p.model;
-    if (typeof p.contextWindow === 'number') contextWindow.value = p.contextWindow;
+    // 下限护栏：老版本可能存过 4096 之类的值，直接回填会让 /api/start 收到
+    // 后端 ge=8000 拒绝的 422，而且报错很难懂。
+    if (typeof p.contextWindow === 'number' && Number.isFinite(p.contextWindow))
+      contextWindow.value = Math.max(MIN_CONTEXT_WINDOW, Math.round(p.contextWindow));
     if (typeof p.authorStyle === 'string') authorStyle.value = p.authorStyle;
     // 白名单校验：localStorage 可能存着旧版/损坏的值，直接赋值会让
     // /api/start 收到非法 refactor_mode 而 422（提示还很难懂）。
@@ -898,7 +906,12 @@ function handleSSEEvent(event: string, payload: any) {
       addLog(payload.message || `批次 ${payload.batch_id} 检测到硬伤，已自动重写一次`, 'warn');
       break;
     case 'qc_warning':
-      addLog(`批次质检仍有 ${payload.count ?? 0} 项遗留问题，详见质量报告`, 'warn');
+      // 后端两类 qc_warning（批次遗留 / 单章重写后仍有硬伤）文案不同，
+      // 必须优先用事件自带的 message，否则章节级事件会被显示成「批次遗留」。
+      addLog(
+        payload.message || `批次质检仍有 ${payload.count ?? 0} 项遗留问题，详见质量报告`,
+        'warn',
+      );
       break;
     case 'phase_note':
       if (payload.message) addLog(payload.message);
@@ -1100,7 +1113,7 @@ function buildStartBody() {
     api_key: apiKey.value,
     model: model.value,
     // 数字输入框被清空时 v-model.number 得到 ''，序列化后后端 int/float 校验直接 422
-    context_window: num(contextWindow.value, 8000, 8000),
+    context_window: num(contextWindow.value, MIN_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW),
     author_style: authorStyle.value,
     novel_name: novelName.value || null,
     refactor_mode: refactorMode.value,
@@ -1539,7 +1552,7 @@ function applyModelFromSettings(v: {
 }
 
 function applyContextFromSettings(n: number) {
-  if (typeof n === 'number' && n >= 8000) contextWindow.value = n;
+  if (typeof n === 'number' && n >= MIN_CONTEXT_WINDOW) contextWindow.value = n;
   persist();
 }
 
@@ -1695,17 +1708,24 @@ const canStart = computed(
           <label>模型名</label>
           <input v-model="model" placeholder="如 gpt-4o" />
           <label class="ctx">上下文</label>
-          <input v-model.number="contextWindow" type="number" min="8000" />
+          <input
+            v-model.number="contextWindow"
+            type="number"
+            :min="MIN_CONTEXT_WINDOW"
+            title="它决定单批能装多少字：窗口小→批数多→每批都要重发蓝图/前情这些脚手架。填到「预估本次」里的批数不再下降为止，再大只会多花 token"
+          />
         </div>
 
         <div class="row">
           <label>预设</label>
           <select v-model="preset" @change="applyPreset">
             <option v-for="name in Object.keys(PRESETS)" :key="name" :value="name">
-              {{ name }}
+              {{ name }}（上下文 {{ PRESETS[name].ctx }}）
             </option>
           </select>
-          <label class="rich">选后自动套用温度/上下文/批次间隔</label>
+          <label class="rich"
+            >套用温度/上下文/批次间隔。本地小模型选「快速低保真」；没把握就点「预估本次」看批数</label
+          >
         </div>
 
         <div class="row">
@@ -1721,7 +1741,7 @@ const canStart = computed(
         <div class="row">
           <label>保护门</label>
           <details class="adv gates">
-            <summary>重构保护门（默认全关）</summary>
+            <summary>重构保护门（多数默认关）</summary>
             <label class="rich"
               ><input type="checkbox" v-model="gates.lock_names" /> 锁人名/设定名</label
             >
@@ -1744,6 +1764,12 @@ const canStart = computed(
             <label class="rich" title="只处理空章/塌缩/占位/残留等结构硬伤，每批最多重写一次"
               ><input type="checkbox" v-model="gates.auto_rewrite_bad_batch" />
               硬伤批次自动重写</label
+            >
+            <label
+              class="rich"
+              title="交界处原文句子有超过 35% 没被原样保留时拒绝该补丁，退回保留原文（默认开；关掉后只受长度比 0.5~3.0 约束）"
+              ><input type="checkbox" v-model="gates.stitch_minimal_change" />
+              缝合只做最小改动</label
             >
           </details>
         </div>
@@ -1944,7 +1970,9 @@ const canStart = computed(
             单批正文上限 {{ estimate.body_token_limit.toLocaleString('zh-CN') }} token；
             每次请求的固定脚手架
             {{ estimate.scaffold_per_request.toLocaleString('zh-CN') }} token（占输入约
-            {{ (estimate.scaffold_share * 100).toFixed(0) }}%，窗口越小越亏）
+            {{
+              (estimate.scaffold_share * 100).toFixed(0)
+            }}%。窗口越小批数越多越亏；但批数已经触底后再放大窗口，这部分只会继续变贵）
           </p>
           <p class="hint">
             缝合边界 {{ estimate.stitch_boundaries }} 处，每侧改写窗口

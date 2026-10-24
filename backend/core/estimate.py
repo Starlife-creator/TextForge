@@ -8,8 +8,19 @@
 怎么保证不漂移：
   - 单批正文上限用 `budget.body_token_budget`（与 phase1 同一个函数）；
   - 装批用 `batching.pack_groups`（与 phase1 同一个算法）；
-  - 缝合窗口/蓝图预留照抄 stitch.py、pipeline.py、refactor.py 里的那几个系数。
-  这几处系数若被改动，`tests/test_estimate.py` 的对照断言会失败。
+  - 诊断输出上限用 `budget.diagnose_max_tokens`（与 phase1 同一个函数）；
+  - 窗口派生的一切系数（章数上限、重叠比例、窗口换算 1.5、缝合窗口及其封顶、
+    蓝图总预算、蓝图预留、缝合蓝图切片）一律 import `core.budget` 的常量与函数，
+    不复制数字；
+  - 分卷压缩**直接调用真跑的分块函数** `blueprint.chunk_by_budget`，块预算 /
+    输出目标 / 轮数上限按属性读 `core.blueprint` 的 `MAP_*` 常数（按属性读而不是
+    import 值 —— 真跑那边改了常数，预估立刻跟着变）。
+  防再抄的用例是 `tests/test_budget_source.py`；数值对照见 `tests/test_estimate.py`。
+
+只剩提示词骨架的粗估 token（`DIAG/BLUEPRINT/STITCH_FIXED_TOKENS`、
+`MAP_PROMPT_SKELETON_TOKENS`）是本模块自定的：真跑不会给自己的提示词算 token，
+只有预估需要，因此不存在第二份可漂的拷贝。它们也没有不变量可断言 —— 少算一项
+只会让预估更保守（仍是下界），不会让真跑出错，故刻意不给它们写门禁用例。
 
 明确**不计入**的部分（都写进 notes，界面上照原样显示）：自动重写、拆批重跑、
 上下文超限重试、逐章验收里的单章重生成。因此这是下界，不是上界。
@@ -17,41 +28,41 @@
 
 from __future__ import annotations
 
-import math
 import unicodedata
 from pathlib import Path
 
+from core import blueprint
 from core.batching import pack_groups
 from core.budget import (
     CONTEXT_SAFETY,
+    MAX_CHAPTERS_PER_BATCH,
     OUTPUT_RATIO,
+    OVERLAP_RATIO,
     PROMPT_FIXED_TOKENS,
+    STITCH_MAX_WINDOW_CHARS,
+    STITCH_WINDOW_RATIO,
+    blueprint_context_chars,
+    blueprint_for_stitch_chars,
     blueprint_token_allowance,
     body_token_budget,
     continuity_token_allowance,
+    diagnose_max_tokens,
+    stitch_window_chars,
     story_memo_token_allowance,
+    window_char_capacity,
 )
 from utils.sort import natural_sort_key
 from utils.tokens import estimate_tokens
 
-# 与 splitter._load_batches 的默认值同源：单批最多 8 章
-MAX_CHAPTERS_PER_BATCH = 8
 # 诊断提示词的固定骨架（角色设定 + 三段要求），粗估 token
 DIAG_FIXED_TOKENS = 600
-# 诊断输出的经验值：每章摘要 ≤150 字，另加人物状态与断层诊断
-DIAG_TOKENS_PER_CHAPTER = 160
-DIAG_TOKENS_FLOOR = 400
-DIAG_MAX_TOKENS = 2000
 # 蓝图 final 调用的规则文本骨架
 BLUEPRINT_FIXED_TOKENS = 300
 # 缝合提示词的规则与标记说明骨架
 STITCH_FIXED_TOKENS = 400
-# 断层清单在蓝图上下文里的预留（blueprint.read_gap_digest 的默认上限）
-GAP_DIGEST_MAX_CHARS = 3000
-# phase0 拆不出章节标题时的兜底段长（splitter._split_single_file）
-FALLBACK_SEGMENT_CHARS = 3000
-# 空章判据：与 splitter._materialize_chapters 的 `is_empty` 同源（少于 50 字不入批）
-MIN_CHAPTER_CHARS = 50
+# 分卷压缩提示词（角色设定 + 三条保留要求）的骨架，粗估 token。
+# 预估独有的加项：真跑不给自己的提示词算 token，只有预估需要。
+MAP_PROMPT_SKELETON_TOKENS = 150
 
 _DOCX_EXTS = ("txt", "md", "docx")
 
@@ -71,7 +82,13 @@ def chapter_token_sizes(req) -> list[int]:
     与真跑的差别：真跑在规则置信度低时可能用 AI/自定义标记重新拆章。章的**切分位置**
     可能不同，但正文总量不变，因此批数误差在一两个批次以内（notes 里已声明）。
     """
-    from core.splitter import _read_file, _segments_from_rule_matches, detect_chapters
+    from core.splitter import (
+        EMPTY_CHAPTER_MIN_CHARS,
+        FALLBACK_SEGMENT_CHARS,
+        _read_file,
+        _segments_from_rule_matches,
+        detect_chapters,
+    )
 
     input_path = Path(req.input_path)
     bodies: list[str] = []
@@ -82,7 +99,7 @@ def chapter_token_sizes(req) -> list[int]:
         if len(segs) >= 2:
             bodies = [body for _title, body in segs]
         else:
-            # 兜底：与 phase0 一致，按 3000 字硬切
+            # 兜底：与 phase0 同一个 FALLBACK_SEGMENT_CHARS
             bodies = [
                 text[i : i + FALLBACK_SEGMENT_CHARS]
                 for i in range(0, len(text), FALLBACK_SEGMENT_CHARS)
@@ -97,39 +114,57 @@ def chapter_token_sizes(req) -> list[int]:
             key=lambda f: natural_sort_key(f.name),
         )
         bodies = [_read_file(f, f.suffix[1:].lower()) for f in files]
-    # 少于 MIN_CHAPTER_CHARS 的段在 phase0 会被标成空章并跳过，这里同判据
+    # 少于 EMPTY_CHAPTER_MIN_CHARS 的段在 phase0 会被标成空章并跳过，这里同判据
     return [
-        estimate_tokens(b) for b in bodies if len(b.strip()) >= MIN_CHAPTER_CHARS
+        estimate_tokens(b) for b in bodies if len(b.strip()) >= EMPTY_CHAPTER_MIN_CHARS
     ]
 
 
-def _blueprint_calls(context_window: int, summary_tokens: int) -> tuple[int, int, int]:
+def _blueprint_calls(context_window: int, summary_sizes: list[int]) -> tuple[int, int, int]:
     """分卷压缩的 (调用数, 输入 token, 输出 token)。
 
-    照抄 blueprint.compress_summaries 的算式：预算 = context_window*1.5*0.60，
-    每轮的块预算 = max(1200, 预算*0.72)，单次输出 target = clamp(240, 900, 块长*0.22)。
+    **直接复用真跑的分块函数** `blueprint.chunk_by_budget`，并照抄它的三条规则：
+    单条块的批次原样保留、不调模型；块预算与输出目标由 `blueprint.MAP_*` 常数决定；
+    压不完 `MAX_COMPRESS_ROUNDS` 轮就转等距抽样（抽样不花调用）。
+    每条摘要按 `diagnose_max_tokens()` 的**预留长度**代入 —— 预估一贯按预留算钱。
+
+    旧实现按「总量 ÷ 平均块长」估块数，会把真跑原样保留的单条块也算成一次调用，
+    于是预估比真跑**多**算，与本模块「这是下界」的声明相反。
     """
-    budget = _chars_to_tokens(context_window * 1.5 * 0.60)
-    if summary_tokens <= budget:
-        return 0, 0, 0
-    chunk_budget = max(1200, _chars_to_tokens(budget * 0.72))
-    calls = 0
-    in_tokens = 0.0
-    out_tokens = 0.0
-    total = float(summary_tokens)
-    for _round in range(4):  # max_rounds=4
-        if total <= budget:
+    total_budget = blueprint_context_chars(window_char_capacity(context_window))
+    chunk_budget = max(
+        blueprint.MAP_CHUNK_MIN_CHARS,
+        _chars_to_tokens(total_budget * blueprint.MAP_CHUNK_RATIO),
+    )
+    items = ["摘" * max(0, int(n)) for n in summary_sizes]
+    calls = in_tokens = out_tokens = 0
+    for _round in range(blueprint.MAX_COMPRESS_ROUNDS):
+        if blueprint.joined_len(items) <= total_budget or len(items) <= 1:
             break
-        n_chunks = max(1, math.ceil(total / chunk_budget))
-        per_chunk = total / max(1, n_chunks)
-        target = max(240, min(900, per_chunk * 0.22))
-        # 只有块内多于一条摘要时才会被压缩（compress_summaries 对单条块直接原样保留）
-        compressible = n_chunks if per_chunk > 240 else 0
-        calls += compressible
-        in_tokens += compressible * (per_chunk + 150)  # 150 ≈ 压缩提示词骨架
-        out_tokens += compressible * target
-        total = compressible * target + (n_chunks - compressible) * per_chunk
-    return calls, _chars_to_tokens(in_tokens), _chars_to_tokens(out_tokens)
+        chunks = blueprint.chunk_by_budget(items, chunk_budget)
+        if len(chunks) <= 1:
+            break
+        new_items: list[str] = []
+        for chunk in chunks:
+            if len(chunk) == 1:
+                new_items.append(chunk[0])
+                continue
+            text_len = blueprint.joined_len(chunk)
+            target = max(
+                blueprint.MAP_TARGET_MIN_CHARS,
+                min(
+                    blueprint.MAP_TARGET_MAX_CHARS,
+                    int(text_len * blueprint.MAP_TARGET_RATIO),
+                ),
+            )
+            calls += 1
+            in_tokens += text_len + MAP_PROMPT_SKELETON_TOKENS
+            out_tokens += target
+            new_items.append("压" * target)
+        if blueprint.joined_len(new_items) >= blueprint.joined_len(items):
+            break
+        items = new_items
+    return calls, in_tokens, out_tokens
 
 
 def estimate_run(req) -> dict:
@@ -141,6 +176,8 @@ def estimate_run(req) -> dict:
     cw = int(req.context_window)
     style = getattr(req, "author_style", "") or ""
     style_tokens = estimate_tokens(style)
+    # 与 splitter.phase1_diagnose 同源：只有设了结构化诊断路径才追加 JSON 契约
+    with_json = bool(getattr(req, "diagnose_json", None))
     cont = continuity_token_allowance(cw)
     memo = story_memo_token_allowance(cw)
     blueprint_reserve = blueprint_token_allowance(cw)
@@ -157,19 +194,18 @@ def estimate_run(req) -> dict:
     body_total = sum(batch_sizes)
 
     # ---- 阶段 1 诊断（串行，每批一次）----
-    overlap_ratio = 0.375  # splitter.phase1_diagnose: overlap_limit = body_limit * 0.375
     diag_in = sum(
-        b + int(b * overlap_ratio) + DIAG_FIXED_TOKENS + style_tokens for b in batch_sizes
+        b + int(b * OVERLAP_RATIO) + DIAG_FIXED_TOKENS + style_tokens for b in batch_sizes
     )
-    diag_out = sum(
-        min(DIAG_MAX_TOKENS, len(bat) * DIAG_TOKENS_PER_CHAPTER + DIAG_TOKENS_FLOOR)
-        for bat in batches
-    )
+    diag_out_each = [
+        diagnose_max_tokens(len(bat), with_json=with_json) for bat in batches
+    ]
+    diag_out = sum(diag_out_each)
 
     # ---- 阶段 2 蓝图 ----
-    map_calls, map_in, map_out = _blueprint_calls(cw, diag_out)
-    summary_ctx = min(diag_out + map_out, _chars_to_tokens(cw * 1.5 * 0.60))
-    gap_reserve = min(GAP_DIGEST_MAX_CHARS, summary_ctx // 3)
+    map_calls, map_in, map_out = _blueprint_calls(cw, diag_out_each)
+    summary_ctx = min(diag_out + map_out, blueprint_context_chars(window_char_capacity(cw)))
+    gap_reserve = min(blueprint.GAP_DIGEST_MAX_CHARS, summary_ctx // 3)
     bp_in = summary_ctx + gap_reserve + BLUEPRINT_FIXED_TOKENS + style_tokens
     bp_out = blueprint_reserve
 
@@ -184,8 +220,12 @@ def estimate_run(req) -> dict:
     if gates.get("skip_stitch_if_smooth"):
         # 硬分章断点会跳过，比例无法预知：按下限 0 次调用，并在 notes 里说明
         boundaries = 0
-    extract = _chars_to_tokens(cw * 1.5 * 0.075)
-    bp_for_stitch = _chars_to_tokens(cw * 1.5 * 0.10)
+    # 窗口按字计入 prompt（两侧各一份），算式与 stitch._stitch_common 同一个函数：
+    # 不加封顶，128k 窗口下预估会报出 1.4 万字的「交界窗口」，比一整章还长。
+    window_chars = window_char_capacity(cw)
+    extract = _chars_to_tokens(stitch_window_chars(window_chars))
+    window_uncapped = int(window_chars * STITCH_WINDOW_RATIO)
+    bp_for_stitch = _chars_to_tokens(blueprint_for_stitch_chars(window_chars))
     st_in = boundaries * (2 * extract + bp_for_stitch + STITCH_FIXED_TOKENS)
     st_out = boundaries * _chars_to_tokens(2 * extract * 1.2)
 
@@ -200,6 +240,16 @@ def estimate_run(req) -> dict:
         "total": len(batches) + map_calls + 1 + len(batches) + boundaries,
     }
     chars_total = sum(sizes)  # token 口径下与字数同量级
+    notes = [
+        "预估为下界：不含自动重写、拆批重跑、上下文超限重试、单章重生成",
+        "拆章按规则识别估算；真跑若触发自定义标记/AI 拆章，批数可能相差一两个批次",
+        "缝合只算批次边界，虚拟章边界未计入",
+    ]
+    if window_uncapped > STITCH_MAX_WINDOW_CHARS:
+        notes.append(
+            f"缝合窗口已封顶 {STITCH_MAX_WINDOW_CHARS} 字"
+            f"（按窗口本该是 {window_uncapped} 字；更大的窗口只会重写整章，不是补交界）"
+        )
     return {
         "chapters": len(sizes),
         "batches": len(batches),
@@ -228,9 +278,5 @@ def estimate_run(req) -> dict:
         "stitch_exposed_ratio": (
             round(boundaries * 2 * extract / max(1, chars_total), 3) if boundaries else 0.0
         ),
-        "notes": [
-            "预估为下界：不含自动重写、拆批重跑、上下文超限重试、单章重生成",
-            "拆章按规则识别估算；真跑若触发自定义标记/AI 拆章，批数可能相差一两个批次",
-            "缝合只算批次边界，虚拟章边界未计入",
-        ],
+        "notes": notes,
     }

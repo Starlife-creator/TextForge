@@ -27,9 +27,11 @@ MIN_CONTAINMENT = 0.01
 MAX_DUPLICATE_PAIRS = 20
 MAX_POSTINGS = 30
 
-# 缝合改动率的提醒阈值：平均改动率超过它，说明多数边界不是「补一句过渡」，
-# 而是接近整段重写。当前只用于提醒与抽读定位，不做拒绝闸门（判据还需真机分布）。
-STITCH_WARN_MEAN_RATE = 0.5
+# 缝合改动率的提醒阈值：平均改动率超过它，说明多数边界不是「补一句过渡」，而是接近整段重写。
+# 必须**低于** stitch.STITCH_MAX_CHANGE_RATE（拒绝闸门 0.35）：闸门开着时，每个已应用的
+# 补丁改动率都不可能超过 0.35 —— 阈值若设在 0.5，这条提醒就永远不会触发，等于把信号写死。
+# 0.25 的含义是「普遍贴着上限改」：只提示抽读定位，不拦截。
+STITCH_WARN_MEAN_RATE = 0.25
 STITCH_WORST_ITEMS = 5
 
 RESIDUAL_MARKERS = ("===CHAPTER_BREAK===", "===PREV_END===", "===NEXT_START===")
@@ -354,6 +356,10 @@ def build_quality_report(
     name_map = dict(getattr(req, "name_map", {}) or {})
     old_names = [k for k in name_map if len(str(k).strip()) >= 2]
     reskin = getattr(req, "refactor_mode", "full_rewrite") == "reskin"
+    # 缝合的两条护栏阈值：报告要能自证「当时是按什么口径放行/拒绝的」。
+    # 延迟导入：这些值所在的模块在顶层依赖本模块，直接 import 会成环。
+    from core.budget import STITCH_MAX_WINDOW_CHARS
+    from core.stitch import STITCH_MAX_CHANGE_RATE
 
     issues: list[dict] = []
     rows: list[dict] = []
@@ -564,8 +570,8 @@ def build_quality_report(
             WARN,
             "stitch_bulk_rewrite",
             f"{stitch['measured']} 处缝合补丁平均改动率 {stitch['mean']:.0%}"
-            f"（多数边界接近整段重写，而非只补过渡），建议对照抽读改动最大的"
-            f"{len(stitch['worst'])} 处",
+            f"（提醒阈值 {STITCH_WARN_MEAN_RATE:.0%}：多数边界不只是补一句过渡），"
+            f"建议对照抽读改动最大的{len(stitch['worst'])} 处",
         )
     if progress.get("config_drift"):
         add_issue(
@@ -644,6 +650,15 @@ def build_quality_report(
             "stitch_metric": (
                 "改动率 = 缝合窗口内原文句子没有被原样保留的比例（分句对照，忽略换行与分段）；"
                 "0 = 只新增过渡未动原文，1 = 整段换写法。它是观测口径，不判断改写质量"
+            ),
+            "stitch_gate": (
+                f"缝合窗口封顶 {STITCH_MAX_WINDOW_CHARS} 字；最小改动闸门"
+                + (
+                    f"已开启（改动率 > {STITCH_MAX_CHANGE_RATE:.0%} 的补丁被拒绝，该交界保留原文）"
+                    if (getattr(req, "refactor_gates", {}) or {}).get(
+                        "stitch_minimal_change", True)
+                    else "已关闭（仅受替换段长度比 0.5~3.0 约束）"
+                )
             ),
         },
         "usage": progress.get("usage") or {},

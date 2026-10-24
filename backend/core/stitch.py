@@ -1,9 +1,13 @@
 import asyncio, json, re, hashlib, unicodedata, logging
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json
+from core.budget import stitch_window_chars
 from core.quality import change_rate
 
 logger = logging.getLogger("textforge")
+
+# STITCH_MAX_WINDOW_CHARS / STITCH_MAX_CHANGE_RATE 的口径说明见 core/budget.py
+# 与本文件 _stitch_common 里的闸门注释；数值只在一处定义，预估与真跑共用。
 
 def sha256_of(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode('utf-8')).hexdigest()
@@ -19,6 +23,11 @@ def parse_stitch_result(text: str) -> tuple[str, str]:
 
 MIN_REPLACEMENT_RATIO = 0.5
 MAX_REPLACEMENT_RATIO = 3.0
+
+# 「只补过渡」闸门：原文句子被保留的比例低于这个数就拒绝该补丁。
+# 0.35 是**设计取值而非实测值**（真实分布需要拿真模型跑一轮才有）；取偏松的一侧，
+# 因为拒绝的代价只是保留原文交界 —— 与既有的缝合降级完全同一条路径。
+STITCH_MAX_CHANGE_RATE = 0.35
 
 
 def check_replacement_length(original: str, replacement: str) -> None:
@@ -111,14 +120,24 @@ def apply_stitches(output_path: Path, stitches_by_file: dict) -> None:
         logger.info(f"[stitch] 已应用补丁到 {file_rel}（{len(patches)} 个补丁）")
 
 def _stitch_retry_hook(payload: dict, exc: Exception) -> None:
-    """把「标记缺失/替换段过短」的错因写回下一次请求，而不是原样重发碰运气。"""
-    payload.setdefault("messages", []).append({
-        "role": "user",
-        "content": (
-            f"你上一次的缝合输出不合格：{str(exc)[:200]}\n"
+    """把「标记缺失/替换段过短/整段重写」的错因写回下一次请求，而不是原样重发碰运气。"""
+    msg = str(exc)
+    if "改动过大" in msg:
+        # 长度比 0.5~3.0 已经挡不住整段重写（重写整章的长度是合规的），
+        # 所以纠正提示必须换成「照抄」口径，否则重试大概率还是同一份重写稿。
+        correction = (
+            "请重新输出：把【前文结尾】与【后文开头】里的原句**逐字照抄**，"
+            "只在两段的交界处新增一两句过渡，不要替换或改写任何原有句子；"
+            "并严格用 ===PREV_END=== 与 ===NEXT_START=== 包裹。"
+        )
+    else:
+        correction = (
             "请重新输出：必须**完整**返回【前文结尾】与【后文开头】两整段（不是只返回过渡句），"
             "并严格用 ===PREV_END=== 与 ===NEXT_START=== 包裹；除新增过渡句外，其余文字原样保留。"
-        ),
+        )
+    payload.setdefault("messages", []).append({
+        "role": "user",
+        "content": f"你上一次的缝合输出不合格：{msg[:200]}\n{correction}",
     })
     if "temperature" in payload:
         payload["temperature"] = max(0.0, min(payload["temperature"], 0.4))
@@ -133,10 +152,24 @@ async def _stitch_common(prev_file_rel, next_file_rel, output_path, payload_base
     prev_text = unicodedata.normalize('NFC', prev_file.read_text(encoding='utf-8', newline=''))
     next_text = unicodedata.normalize('NFC', next_file.read_text(encoding='utf-8', newline=''))
     
-    stitch_extract_limit = int(chars * 0.075)
+    stitch_extract_limit = stitch_window_chars(chars)
     prev_seg = prev_text[-stitch_extract_limit:]
     next_seg = next_text[:stitch_extract_limit]
     stitch_output_limit = int(stitch_extract_limit * 1.2)
+    # 闸门按改动率拒绝整段重写。关闭时（旧行为）只受长度比 0.5~3.0 约束。
+    minimal_change = bool(payload_base.get("minimal_change"))
+
+    def _rate_guard(seg: str, repl: str, label: str) -> None:
+        if not minimal_change:
+            return
+        rate = change_rate(seg, repl)
+        # rate 为 None = 窗口里不足 3 句（章尾只有一两句话的短边界）：改动率没有分辨力，
+        # 与长度护栏一样放行，宁漏不误杀。
+        if rate is not None and rate > STITCH_MAX_CHANGE_RATE:
+            raise ValueError(
+                f"{label}改动过大：原文句子有 {rate:.0%} 没有被原样保留"
+                f"（闸门上限 {STITCH_MAX_CHANGE_RATE:.0%}）。只允许在交界处新增/微调过渡句，"
+                f"其余原文请一字不动地照抄。")
     
     prompt = build_stitch_prompt(prev_seg, next_seg, payload_base['blueprint'], payload_base['author_style'], stitch_output_limit)
     payload = {**payload_base['payload'], "messages": [{"role": "user", "content": prompt}], "max_tokens": stitch_output_limit * 2}
@@ -149,6 +182,8 @@ async def _stitch_common(prev_file_rel, next_file_rel, output_path, payload_base
             prev_repl, next_repl = parse_stitch_result(text)
             check_replacement_length(prev_seg, prev_repl)
             check_replacement_length(next_seg, next_repl)
+            _rate_guard(prev_seg, prev_repl, "前文结尾")
+            _rate_guard(next_seg, next_repl, "后文开头")
         except ValueError as e:
             raise RetryableBusinessError(str(e)) from e
         parsed["prev"], parsed["next"] = prev_repl, next_repl

@@ -8,6 +8,7 @@ phase1 会先 400 直接终止整轮，用户根本走不到有保护的那一�
 
 import logging
 from routes.events import sse_emit
+from core.budget import MAX_CHAPTERS_PER_BATCH
 
 logger = logging.getLogger("textforge")
 
@@ -18,7 +19,7 @@ _REASON_LABEL = {
 }
 
 
-def pack_groups(groups, body_token_limit, max_chapters=8):
+def pack_groups(groups, body_token_limit, max_chapters=MAX_CHAPTERS_PER_BATCH):
     """把「不可拆分组」按 token 上限贪心装批，返回 [[chapter_id, ...], ...]。
 
     groups 元素是 (label, chapter_ids, group_tokens)。这是 phase1 划分批次的**唯一**

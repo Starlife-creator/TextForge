@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from core.quality import (
+    STITCH_WARN_MEAN_RATE,
     assess_batch_texts,
     build_quality_report,
     change_rate,
@@ -299,3 +300,30 @@ def test_quality_report_warns_when_stitch_rewrites_bulk():
     assert hit and "平均改动率" in hit[0]["message"], str(hit)
     assert rep["status"] == "warn"
     assert [w["file"] for w in rep["stitch"]["worst"]] == ["b", "a"]
+
+
+def test_stitch_warn_threshold_stays_below_reject_gate():
+    """提醒阈值必须低于拒绝闸门：闸门开着时已应用补丁的改动率不可能越过闸门值。
+
+    若把提醒阈值调到 0.35 以上，这条 warn 在默认配置下永远不会触发 —— 信号被写死。
+    """
+    from core.stitch import STITCH_MAX_CHANGE_RATE
+
+    assert STITCH_WARN_MEAN_RATE < STITCH_MAX_CHANGE_RATE
+
+
+def test_quality_report_states_which_stitch_guardrails_were_active():
+    """报告要自证当时生效的护栏：窗口封顶值 + 闸门开/关。"""
+    originals = [("原文第%d章。" % i) * 150 for i in range(1, 4)]
+    recons = [("重构第%d章故事继续。" % i) * 130 for i in range(1, 4)]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        on = _report(tmp, originals, recons)
+    with tempfile.TemporaryDirectory() as tmp:
+        off = _report(tmp, originals, recons,
+                      req=_req(refactor_gates={"stitch_minimal_change": False}))
+
+    assert "1200" in on["config"]["stitch_gate"]
+    assert "已开启" in on["config"]["stitch_gate"]
+    assert "已关闭" in off["config"]["stitch_gate"]
+    assert "0.5~3.0" in off["config"]["stitch_gate"]

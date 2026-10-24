@@ -23,6 +23,9 @@ FAIL = {"phase": None, "times": 0, "status": 500, "body": "injected",
 CTX_LIMIT = {"max_chapters": 0}
 # 内容级质检故障注入：下 N 次重构输出插入 "TODO" 占位，触发自动重写。
 BAD_CONTENT = {"times": 0}
+# 缝合内容注入：下 N 次缝合返回「等长但整段换写法」的补丁，
+# 用来验证最小改动闸门确实会拒绝长度合规的整段重写（而不是只挡住截断）。
+STITCH_BULK = {"times": 0}
 # 服务端上报的真实上下文窗口（供 /props、/api/v0/models、/models、/api/show 探测）。
 CONTEXT_REPORT = {"n_ctx": 4096}
 LOG = []
@@ -95,6 +98,20 @@ def chapter_count(user: str) -> int:
     return max(1, len(names))
 
 
+_BULK_FILLER = "（模拟整段重写）月色下的窗棂被重新描了一遍。"
+
+
+def _bulk_rewrite(seg: str) -> str:
+    """等长但每句都换掉的文本：长度比 0.5~3.0 放行，只有改动率闸门能抓住。
+
+    真实模型的「顺手重写整段」就是这个形状 —— 字数差不多，句子全换了。
+    """
+    if not seg:
+        return seg
+    n = max(1, len(seg) // len(_BULK_FILLER) + 1)
+    return (_BULK_FILLER * n)[:len(seg)]
+
+
 def make_text(user: str, phase: str) -> str:
     if phase == "blueprint_map":
         # 必须短于输入，否则压缩不收敛、phase2 会退化成抽样。
@@ -123,6 +140,10 @@ def make_text(user: str, phase: str) -> str:
         m = re.search(r'【前文结尾】\n(.*?)\n\n【后文开头】\n(.*)\Z', user, re.S)
         prev_seg = m.group(1) if m else ""
         next_seg = m.group(2) if m else ""
+        if STITCH_BULK.get("times", 0) > 0:
+            STITCH_BULK["times"] -= 1
+            prev_seg = _bulk_rewrite(prev_seg)
+            next_seg = _bulk_rewrite(next_seg)
         return (f"===PREV_END===\n{prev_seg}\n（缝合过渡：夜色里传来一阵脚步。）\n"
                 f"===NEXT_START===\n（缝合过渡：他深吸一口气，推门而入。）\n{next_seg}\n")
     if phase == "refactor":
@@ -137,7 +158,10 @@ def make_text(user: str, phase: str) -> str:
             ]
             segs.append("\n\n".join(paras))
         out = f"\n\n{BREAK}\n\n".join(segs)
-        if BAD_CONTENT.get("times", 0) > 0 and "结构性质检" not in user:
+        # 注入只针对**多章批次**：单章重生成（/api/regen_chapter）的提示词只含一章，
+        # 若也在这里注入，测试就无法区分「批次里的占位」与「重写后的干净正文」，
+        # 场景十三的断言会变成随机结果。
+        if BAD_CONTENT.get("times", 0) > 0 and "结构性质检" not in user and n > 1:
             BAD_CONTENT["times"] -= 1
             STATS["bad_content_injected"] = STATS.get("bad_content_injected", 0) + 1
             out = out.replace("【重构第1段·其一】", "TODO：此处待补。【重构第1段·其一】", 1)
@@ -218,6 +242,10 @@ class H(BaseHTTPRequestHandler):
             STATS["continuity_injected"] = STATS.get("continuity_injected", 0) + 1
         if "【前情摘要（仅用于保持事实一致）】" in user:
             STATS["story_memo_injected"] = STATS.get("story_memo_injected", 0) + 1
+        # 缝合契约纠正提示（core/stitch.py::_stitch_retry_hook）：只有上一次缝合
+        # 被拒后才会出现，用它证明「拒绝 → 带错因重试」这条链路真的走通了。
+        if "你上一次的缝合输出不合格" in user:
+            STATS["stitch_corrected"] = STATS.get("stitch_corrected", 0) + 1
         LOG.append({"phase": phase, "n_msgs": len(req.get("messages", [])),
                     "extra": FAIL.get("extra_breaks", 0),
                     "has_fix": CORRECTED_MARK in user})
@@ -285,10 +313,12 @@ class H(BaseHTTPRequestHandler):
             CTX_LIMIT.update(body["ctx_limit"])
         if "bad_content" in body:
             BAD_CONTENT.update(body["bad_content"])
+        if "stitch_bulk" in body:
+            STITCH_BULK.update(body["stitch_bulk"])
         if "context_report" in body:
             CONTEXT_REPORT.update(body["context_report"])
         self._json(200, {"stats": STATS, "fail": FAIL, "ctx_limit": CTX_LIMIT,
-                         "bad_content": BAD_CONTENT,
+                         "bad_content": BAD_CONTENT, "stitch_bulk": STITCH_BULK,
                          "context_report": CONTEXT_REPORT, "log": LOG[-12:]})
 
 

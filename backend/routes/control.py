@@ -7,6 +7,7 @@
 """
 import os, subprocess, sys
 from fastapi import APIRouter, HTTPException, Body
+from core.budget import blueprint_accept_max_chars
 from routes import state
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json as _atomic_write
@@ -237,8 +238,7 @@ async def blueprint_confirm(payload: dict = Body(...)):
         if progress.get('current_phase') != 'phase2_waiting':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认蓝图")
         context_window = progress["api_config"]["context_window"]
-        chars = context_window * 1.5
-        max_blueprint = int(chars * 0.20)
+        max_blueprint = blueprint_accept_max_chars(context_window)
         if len(blueprint) > max_blueprint:
             raise HTTPException(422, f"blueprint 超长: {len(blueprint)} > {max_blueprint}")
         if len(blueprint) < 100:

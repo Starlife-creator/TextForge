@@ -6,6 +6,7 @@ from utils.atomic import atomic_write_text, atomic_write_json
 from utils.sort import natural_sort_key
 from utils.tokens import estimate_tokens
 from core.batching import pack_groups
+from core.budget import MAX_CHAPTERS_PER_BATCH, OVERLAP_RATIO, window_char_capacity
 from routes import state
 from routes.events import sse_emit
 import chardet
@@ -89,6 +90,11 @@ _SPECIAL_PATTERN = re.compile(
     rf'(?:[{re.escape(_SEP_CH)}]+|(?![{_NUMCHR}\u4e00-\u9fff]))',
     re.MULTILINE,
 )
+
+# 拆章的两条结构判据：开跑前预估（core/estimate）要按同一口径数章，所以写在这里，
+# 预估侧 import 而不是另抄一份。
+FALLBACK_SEGMENT_CHARS = 3000   # 识别不到标题时的兜底段长
+EMPTY_CHAPTER_MIN_CHARS = 50    # 少于这么多字算空章，不入批
 
 def _read_txt_auto_encoding(path: Path) -> str:
     raw = path.read_bytes()
@@ -341,16 +347,17 @@ async def _split_single_file(req, full_text: str, run_id) -> tuple[list, dict]:
         logger.info(f"[phase0] 识别到 {len(chapters)} 章（方式={method}，置信={conf.get('level')}）")
         return chapters, detection
 
-    # 全都失败：明确上报后按 3000 字兜底（绝不静默丢结构）
-    parts = max(1, (len(full_text) + 2999) // 3000)
+    # 全都失败：明确上报后按兜底段长切分（绝不静默丢结构）
+    parts = max(1, (len(full_text) + FALLBACK_SEGMENT_CHARS - 1) // FALLBACK_SEGMENT_CHARS)
     msg = (f"未能识别到章节标题（已尝试编号/特殊章节名/缩进/引号/全角数字，"
-           f"AI 拆章也未成功），将退回按每 3000 字切分成 {parts} 段。"
+           f"AI 拆章也未成功），将退回按每 {FALLBACK_SEGMENT_CHARS} 字切分成 {parts} 段。"
            f"若这不是你期望的结构，可在拆书预览里填写「自定义章节标记」重新拆分。")
     logger.warning(f"[phase0] {msg}")
     sse_emit("error", {"kind": "warning", "code": "chapter_detect_fallback",
                        "message": msg, "detected": 0, "fallback_parts": parts}, run_id)
-    chapters = [{"id": str(i + 1), "filename": f"段{i+1:03d}.txt", "text": full_text[i:i+3000]}
-                for i in range(0, len(full_text), 3000)]
+    chapters = [{"id": str(i + 1), "filename": f"段{i+1:03d}.txt",
+                 "text": full_text[i:i + FALLBACK_SEGMENT_CHARS]}
+                for i in range(0, len(full_text), FALLBACK_SEGMENT_CHARS)]
     return chapters, {"mode": "fallback", "detected": 0, "confidence": "low",
                       "reason": "未识别到章节标题", "needs_review": True, "fallback_parts": parts}
 
@@ -409,11 +416,11 @@ def _materialize_chapters(chapters, split_dir: Path, req):
             old.unlink()
     for ch in chapters:
         atomic_write_text(split_dir / f"{ch['id']}.txt", ch['text'])
-        ch['is_empty'] = len(ch['text'].strip()) < 50
+        ch['is_empty'] = len(ch['text'].strip()) < EMPTY_CHAPTER_MIN_CHARS
         ch['hash'] = _sha256(ch['text'])
         ch['split_file'] = f"02_workspace/split/{ch['id']}.txt"
         ch.pop('text', None)
-    chars = req.context_window * 1.5
+    chars = window_char_capacity(req.context_window)
     chapters, virtual_map = _split_virtual_chapters(chapters, split_dir, chars)
     if not [c for c in chapters if not c['is_empty']]:
         return [], virtual_map
@@ -476,6 +483,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
     from core.budget import (
         body_token_budget,
         continuity_token_allowance,
+        diagnose_max_tokens,
         story_memo_token_allowance,
     )
     body_limit = body_token_budget(
@@ -484,8 +492,8 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
             continuity_token_allowance(req.context_window)
             + story_memo_token_allowance(req.context_window)
         ))
-    # 诊断阶段的「上一批尾巴」重叠上下文，按正文预算的 37.5% 取（与原 0.15/0.40 同比例）
-    overlap_limit = int(body_limit * 0.375)
+    # 诊断阶段的「上一批尾巴」重叠上下文，按正文预算的比例取（比例与预估同源）
+    overlap_limit = int(body_limit * OVERLAP_RATIO)
 
     batches = _load_batches(progress['chapters'], output_path, body_limit)
     # v8.8：恢复时若 batches 已存在，保留已有 output_files/status，不重建
@@ -527,7 +535,9 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
             with_json = bool(getattr(req, "diagnose_json", None))
             prompt = _build_diagnose_prompt(prev_context, batch_content, with_json=with_json)
             payload = {"model": ep["model"], "messages": [{"role": "user", "content": prompt}],
-                "temperature": req.temperatures.diagnose, "max_tokens": 2000, "stream": True}
+                "temperature": req.temperatures.diagnose,
+                "max_tokens": diagnose_max_tokens(len(chapter_ids), with_json),
+                "stream": True}
             logger.info(f"[phase1] batch {batch['batch_id']} 开始 章节={chapter_ids}")
             sse_emit("batch_start", {"batch_id": batch['batch_id'], "chapter_ids": chapter_ids}, run_id)
             try:
@@ -561,7 +571,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
                     atomic_write_json(diag_dir / f"diagnose_{batch['batch_id']:02d}.json", diag)
                     logger.info(f"[phase1] batch {batch['batch_id']} 诊断JSON -> {diag_dir / f'diagnose_{batch['batch_id']:02d}.json'}")
                 else:
-                    logger.warning(f"[phase1] batch {batch['batch_id']} 未解析出诊断 JSON，跳过落盘")
+                    _record_diag_json_miss(progress, batch['batch_id'], run_id)
             
             prev_context = _build_overlap(progress['chapters'], chapter_ids, output_path, overlap_limit)
             
@@ -582,6 +592,26 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
 
+def _record_diag_json_miss(progress, batch_id, run_id=None):
+    """结构化诊断解析不出来：记进进度并推给用户，而不是只留一行日志。
+
+    这条路径原本是静默的 —— 用户勾了「修断层」却拿到空清单，会以为工具在偷懒，
+    实际是模型没按契约输出（或被输出长度截掉）。仍然**不阻断**：正文与摘要都已落盘，
+    要不要继续由用户判断。
+    """
+    missed = progress.setdefault('diag_json_missing', [])
+    if batch_id not in missed:
+        missed.append(batch_id)
+    logger.warning(f"[phase1] batch {batch_id} 未解析出诊断 JSON，跳过落盘")
+    sse_emit("error", {
+        "kind": "warning",
+        "code": "diag_json_missing",
+        "message": (f"批次 {batch_id} 的诊断输出里没有可解析的结构化 JSON（可能被输出长度截掉，"
+                    f"或模型没按契约输出）。该批断层不会进入勾选清单；"
+                    f"若要用「修断层」，建议重跑该批或减小批次规模。"),
+    }, run_id)
+
+
 def _accum_usage(progress, usage):
     """v8.8 新增：累计 token 用量。
 
@@ -601,7 +631,8 @@ def _find_idx(chapters, cid):
         if c['id'] == cid: return i
     raise KeyError(cid)
 
-def _load_batches(chapters, output_path, body_token_limit, max_chapters=8):
+def _load_batches(chapters, output_path, body_token_limit,
+                  max_chapters=MAX_CHAPTERS_PER_BATCH):
     """按 original_id 分组；跳过 is_virtual_parent 父章；同一组不拆散。
 
     body_token_limit 是**单批正文的 token 上限**（不是字数）—— 由 core.budget

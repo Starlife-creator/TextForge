@@ -7,7 +7,13 @@ from routes.events import sse_emit
 from core.stitch import stitch_pipeline
 from core.api_client import (call_with_retry, RetryableBusinessError,
                              ContextOverflowError, pick_endpoint)
-from core.budget import output_token_reserve, story_memo_token_allowance
+from core.budget import (
+    blueprint_for_stitch_chars,
+    continuity_token_allowance,
+    output_token_reserve,
+    story_memo_token_allowance,
+    window_char_capacity,
+)
 from core.batching import split_batch_in_progress as _split_batch_in_progress
 from core.quality import assess_batch_texts, has_blocking_issues
 from utils.tokens import estimate_tokens
@@ -15,13 +21,19 @@ from utils.tokens import estimate_tokens
 logger = logging.getLogger("textforge")
 
 # 跨批连续性上下文的稳定标记（mock/测试据此判断提示词是否带上了上一批结尾）。
+# 片段长度按 **token** 裁剪，预算同一来源：core.budget.continuity_token_allowance
 CONTINUITY_MARK = "【上一批结尾（仅用于衔接）】"
-CONTINUITY_CHARS = 600
 # 前情摘要：补「事实/人物状态一致」，与结尾片段补「文风衔接」互补。
 STORY_MEMO_MARK = "【前情摘要（仅用于保持事实一致）】"
 
 # 自动重写只兜「结构性硬伤」：每批最多一次，整轮有上限，避免坏模型无限烧钱。
 AUTO_REWRITE_MAX_PER_RUN = 3
+
+# 逐章验收门放行时，必须从磁盘**并回内存**的键。
+# accepted_batches 是用户的选择；batch_qc / pre_stitch_issues 是「单章重生成」
+# （/api/regen_chapter）刷新后写盘的质检结论 —— 流水线随后会把内存 progress 整份写回，
+# 不并回来就等于把刷新结果丢掉（与当年 fix_list 静默失效同一个坑）。
+ACCEPT_ABSORB_KEYS = ('accepted_batches', 'batch_qc', 'pre_stitch_issues')
 
 class ChapterBreakMissingError(RetryableBusinessError):
     """v8.8 修正：继承 RetryableBusinessError，才能进入 call_with_retry 的重试路径。"""
@@ -33,8 +45,8 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     recon_dir.mkdir(parents=True, exist_ok=True)
     
     blueprint_text = (output_path / "Story_Bible.md").read_text(encoding='utf-8')
-    chars = req.context_window * 1.5
-    blueprint_for_stitch = blueprint_text[:int(chars * 0.10)]
+    chars = window_char_capacity(req.context_window)
+    blueprint_for_stitch = blueprint_text[:blueprint_for_stitch_chars(chars)]
 
     gates = getattr(req, "refactor_gates", {}) or {}
     from core.api_client import make_httpx_client, pick_endpoint
@@ -48,6 +60,9 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
         "payload": {"model": ep_stitch["model"], "temperature": req.temperatures.stitch, "stream": True},
         "progress": progress,      # v8.8：供 apply_batch_stitch 映射虚拟章父章
         "skip_smooth": bool(gates.get("skip_stitch_if_smooth")),
+        # 默认开启：闸门拒绝后的降级结果就是旧行为（保留原文交界），
+        # 所以误判的代价只是「没润色」，而漏判的代价是「整章被悄悄换掉」。
+        "minimal_change": bool(gates.get("stitch_minimal_change", True)),
     }
     
     # 断点恢复：逐章验收门开启时，若上次停在 phase3_accept 且该批未验收，
@@ -111,7 +126,9 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                 _run_refactor_batch(
                     client, req, output_path, recon_dir, blueprint_text,
                     progress, batch, run_id, ep_ref,
-                    continuity=_continuity_for_batch(output_path, progress, batch),
+                    continuity=_continuity_for_batch(
+                        output_path, progress, batch,
+                        token_limit=continuity_token_allowance(req.context_window)),
                 )
                 for batch in wave
             ], return_exceptions=True)
@@ -213,6 +230,45 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
 
+def _refresh_qc_after_regen(req, output_path, progress, chapter_id, new_text) -> list[dict]:
+    """单章重生成后刷新**这一章**的结构性质检结论，返回该章的新问题清单。
+
+    不刷新会同时错两个方向：旧 issues 让质量报告继续指控已经改好的章（假警报），
+    新产生的硬伤又没有任何地方记录（假清白）。`batch_qc` 是按批次存的，
+    所以只替换属于本章的条目，同批其他章的结论必须原样保留。
+
+    口径限制：跨章重复（本章 vs 同批其他章）这里不重算 —— 单章评估只看这一章。
+    最终质量报告在 phase4 会重读全部文件补上这一层。
+    """
+    cid = str(chapter_id)
+    fresh = assess_batch_texts(
+        chapters=progress.get("chapters") or [],
+        chapter_ids=[cid],
+        texts={cid: new_text},
+        output_path=output_path,
+        forbidden_canon=getattr(req, "forbidden_canon", []) or [],
+        name_map=getattr(req, "name_map", {}) or {},
+        refactor_mode=getattr(req, "refactor_mode", "full_rewrite"),
+        gates=getattr(req, "refactor_gates", {}) or {},
+    )
+    qc = progress.get("batch_qc") or {}
+    for b in progress.get("batches") or []:
+        if cid not in [str(x) for x in (b.get("chapter_ids") or [])]:
+            continue
+        bid = str(b.get("batch_id"))
+        if bid not in qc:
+            continue
+        kept = [i for i in (qc.get(bid) or []) if str(i.get("chapter_id")) != cid]
+        qc[bid] = (kept + fresh)[:50]
+    progress["batch_qc"] = qc
+    # pre_stitch_issues 是 batch_qc 的派生物：不同步刷新，报告里的「遗留硬伤」就是旧账
+    progress["pre_stitch_issues"] = [
+        i for issues in qc.values() for i in (issues or [])
+        if isinstance(i, dict) and i.get("severity") == "bad"
+    ][:200]
+    return fresh
+
+
 async def regen_single_chapter(req, output_path, chapter_id):
     """A1：单章重生成。复用运行中 req（含鉴权，仅内存），对单章重新走一次重构，
     覆盖 reconstructed/chapter_{chapter_id}.txt，返回新正文。用于逐章验收「驳回→重写」。"""
@@ -231,10 +287,12 @@ async def regen_single_chapter(req, output_path, chapter_id):
         progress = json.loads((output_path / "progress.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         progress = {}
-    continuity = _continuity_for_batch(output_path, progress, {"chapter_ids": [chapter_id]})
+    continuity = _continuity_for_batch(
+        output_path, progress, {"chapter_ids": [chapter_id]},
+        token_limit=continuity_token_allowance(req.context_window))
     story_memo = _story_memo_for_batch(
         output_path, progress, {"chapter_ids": [chapter_id]},
-        limit=story_memo_token_allowance(req.context_window))
+        token_limit=story_memo_token_allowance(req.context_window))
     gates = getattr(req, "refactor_gates", {}) or {}
     prompt = _build_refactor_prompt(
         getattr(req, "refactor_mode", "full_rewrite"),
@@ -267,7 +325,20 @@ async def regen_single_chapter(req, output_path, chapter_id):
     recon_dir = output_path / "02_workspace/reconstructed"
     recon_dir.mkdir(parents=True, exist_ok=True)
     atomic_write_text(recon_dir / f"chapter_{chapter_id}.txt", new_text)
-    logger.info(f"[regen] 单章重生成完成 chapter_{chapter_id}")
+    # 正文换了，质检结论也必须换：否则质量报告继续指控已经改好的章，
+    # 而重写新引入的硬伤没人记录。写完文件再刷新，保证评的是新正文。
+    fresh = _refresh_qc_after_regen(req, output_path, progress, chapter_id, new_text)
+    if progress:
+        async with state.progress_lock:
+            atomic_write_json(output_path / "progress.json", progress)
+    bad = [i for i in fresh if i.get("severity") == "bad"]
+    if bad:
+        sse_emit("qc_warning", {
+            "chapter_id": str(chapter_id), "count": len(bad), "issues": bad[:10],
+            "message": f"章节 {chapter_id} 重写后仍有 {len(bad)} 项结构性硬伤"
+                       f"（{'、'.join(str(i.get('code')) for i in bad[:3])}），可再次驳回重写",
+        }, state.current_run_id)
+    logger.info(f"[regen] 单章重生成完成 chapter_{chapter_id} qc_bad={len(bad)}")
     return new_text
 
 
@@ -296,14 +367,36 @@ def _read_optional(path: Path) -> str:
         return ""
 
 
-def _tail_for_prompt(text: str, limit: int = CONTINUITY_CHARS) -> str:
-    """取结尾片段，尽量从句子边界开始，避免把一句话拦腰截断。"""
+def _shrink(text: str, token_limit: int, *, keep: str) -> str:
+    """按 **token** 估算把文本收缩到预算内。keep 决定保留哪一头：
+
+    - `"tail"`：保留结尾（上一批结尾片段 —— 衔接要的是最后几段）
+    - `"head"`：保留开头（前情摘要 —— 摘要与人物状态排在前面）
+    中文约 1 字 ≈ 1 token，所以第一轮基本就到位；每轮至少前进 1 字，保证收敛。
+    """
+    cut = text
+    while len(cut) > 1 and estimate_tokens(cut) > token_limit:
+        over = max(1, estimate_tokens(cut) - token_limit)
+        step = min(len(cut) - 1, over)
+        cut = cut[step:] if keep == "tail" else cut[: len(cut) - step]
+    return cut
+
+
+def _tail_for_prompt(text: str, token_limit: int) -> str:
+    """取结尾片段，按 **token** 裁剪。
+
+    预算（`continuity_token_allowance`）本来就是按 token 留的，两边必须同一口径：
+    旧实现按 600 **字符**裁，8000 窗口只预留 320 token，注入的片段能超出预留近一倍，
+    最坏把请求顶过模型窗口，白跑一次拆批（一次失败调用在本地模型上就是几分钟）。
+    """
     text = (text or "").strip()
-    if not text:
+    if not text or token_limit <= 2:
         return ""
-    if len(text) <= limit:
-        return text
-    tail = text[-limit:]
+    if estimate_tokens(text) <= token_limit:
+        return text          # 整段都装得下，不加「……」+ 前缀，那是截断过的标记
+    tail = _shrink(text, token_limit - 2, keep="tail")   # 给前缀「……」留余量
+    if not tail:
+        return ""
     # 只在开头这段里找第一个句末标点；若切完剩不下多少内容，就保留完整尾巴。
     for pos in range(min(80, len(tail))):
         if tail[pos] in "。！？\n":
@@ -313,11 +406,13 @@ def _tail_for_prompt(text: str, limit: int = CONTINUITY_CHARS) -> str:
     return "……" + tail.strip()
 
 
-def _continuity_for_batch(output_path, progress, batch) -> str:
+def _continuity_for_batch(output_path, progress, batch, *, token_limit: int) -> str:
     """取当前批次之前最近一章的结尾，用于衔接称谓、语气与未回收伏笔。
 
     优先读该章的**重构稿**（文风最连续）；并发时同波次前批可能还没写完，
     自动退回该章**原文**，仍为空才继续向前找，避免跳过衔接。
+    token_limit 由调用方按 `continuity_token_allowance(req.context_window)` 传入 ——
+    必须与请求里预留的那个数是同一个来源。
     """
     chapters = progress.get("chapters") or []
     ids = [str(c.get("id")) for c in chapters]
@@ -334,7 +429,7 @@ def _continuity_for_batch(output_path, progress, batch) -> str:
         text = _read_optional(output_path / "02_workspace/reconstructed" / f"chapter_{cid}.txt")
         if not text.strip():
             text = _read_optional(output_path / split_file)
-        tail = _tail_for_prompt(text)
+        tail = _tail_for_prompt(text, token_limit)
         if tail:
             return tail
     return ""
@@ -343,7 +438,7 @@ def _continuity_for_batch(output_path, progress, batch) -> str:
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?[\s\S]*?```", re.IGNORECASE)
 
 
-def _compact_story_memo(text: str, limit: int) -> str:
+def _compact_story_memo(text: str, token_limit: int) -> str:
     """把上一批诊断压成「剧情 + 人物状态」两段，去掉 JSON 与断层建议。
 
     断层建议只针对上一批，本批不应再照着改；保留会误导模型重复修已经修过的地方。
@@ -364,12 +459,14 @@ def _compact_story_memo(text: str, limit: int) -> str:
         state = m.group(0).strip()
     merged = "\n".join(x for x in (summary, state) if x) or text
     merged = re.sub(r"\n{3,}", "\n\n", merged).strip()
-    if len(merged) <= limit:
+    # 裁剪口径与 continuity 一致：按 token 估算收，而不是按字符数硬切
+    # （调用方传进来的就是 story_memo_token_allowance 的预留值）。摘要在前，保留**开头**。
+    if estimate_tokens(merged) <= token_limit:
         return merged
-    return merged[: max(0, limit - 1)].rstrip() + "……"
+    return _shrink(merged, max(1, token_limit - 1), keep="head").rstrip() + "……"
 
 
-def _story_memo_for_batch(output_path, progress, batch, limit: int = 500) -> str:
+def _story_memo_for_batch(output_path, progress, batch, token_limit: int = 500) -> str:
     """取最近一个与当前批次无章节重叠的已诊断批次的摘要。"""
     batches = progress.get("batches") or []
     current = {str(c) for c in (batch.get("chapter_ids") or [])}
@@ -399,7 +496,7 @@ def _story_memo_for_batch(output_path, progress, batch, limit: int = 500) -> str
             text = _read_optional(output_path / f"01_summaries/batch_{int(sid):02d}.txt")
         except (TypeError, ValueError):
             continue
-        memo = _compact_story_memo(text, limit)
+        memo = _compact_story_memo(text, token_limit)
         if memo:
             return memo
     return ""
@@ -474,7 +571,7 @@ async def _request_refactor_text(client, req, output_path, blueprint_text,
         continuity=continuity,
         story_memo=_story_memo_for_batch(
             output_path, progress, batch,
-            limit=story_memo_token_allowance(req.context_window)),
+            token_limit=story_memo_token_allowance(req.context_window)),
     )
     payload = {
         "model": ep["model"], "messages": [{"role": "user", "content": prompt}],
@@ -956,7 +1053,11 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
     while not state.accept_confirm.is_set():
         if state.stop_requested: raise asyncio.CancelledError()
         await asyncio.sleep(1.0)
-    await state.absorb_gate_result(progress, progress_path, ['accepted_batches'])
+    # ACCEPT_ABSORB_KEYS 里有 batch_qc / pre_stitch_issues 的原因：单章重生成
+    # （/api/regen）会把刷新后的质检结论写进 progress.json，而流水线紧接着就把内存
+    # progress 整份写回磁盘。不并回来，用户重写掉的旧硬伤会被内存里的旧结论覆盖 ——
+    # 与 fix_list 当年的「静默失效」是同一个坑（见 routes/state.py::absorb_gate_result）。
+    await state.absorb_gate_result(progress, progress_path, list(ACCEPT_ABSORB_KEYS))
     progress['current_phase'] = 'phase3-1'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)

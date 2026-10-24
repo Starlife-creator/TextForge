@@ -61,7 +61,29 @@ def put(url, obj, timeout=30):
         return json.loads(r.read() or b"{}")
 
 
-_ALL_EVENTS = []   # 全局闸门驱动消费的事件队列
+# 队列放在 dict 里是为了能整体换掉（scene() 会重绑一个新列表），
+# 而驱动线程每次循环重新读取 —— 直接对列表 clear() 会让驱动的游标
+# 越界在旧长度上，从此再也看不到任何闸门事件（表现为整轮卡死）。
+_EVENTS = {"q": []}
+
+
+def scene(title):
+    """进入下一个场景：换掉事件队列、把驱动状态归零，再确认后端已空闲。
+
+    驱动是全局唯一的，事件队列若不清，上一轮迟到的闸门事件会被当作当前这轮去确认
+    —— 表现为场景标题下方凭空多出一串「已确认蓝图」（真实干扰过一次场景八的判读，
+    而它同时也是潜在的串台确认）。seen/run/_CUR_RUN 一起归零，等价于每个场景
+    拿到一个干净的驱动。
+    """
+    _EVENTS["q"] = []          # 换列表而不是 clear()：驱动按列表身份跟踪游标
+    _GATE.seen = set()
+    _GATE.run = None
+    _CUR_RUN["id"] = None      # 缓存的 run_id 也必须作废，否则 1 秒内会拿旧 run 去确认
+    _CUR_RUN["t"] = 0.0
+    if not wait_idle(API_PORT, timeout=60):
+        print("    [scene] 警告：上一轮 60s 内未释放（/api/start 会自行重试 409）")
+    print(f"\n--- {title} ---")
+
 
 
 def sse_events(port, seconds, stop_on=None):
@@ -89,7 +111,9 @@ def sse_events(port, seconds, stop_on=None):
                             out.append(_pair)
                             # 同时喂给全局闸门驱动：每个场景各开一条订阅，
                             # 驱动是全局唯一的，必须能看到所有场景的闸门事件。
-                            _ALL_EVENTS.append(_pair)
+                            # 读 _EVENTS["q"] 而不是固定列表：scene() 会整体换队列，
+                            # 绑死旧列表就等于把上一场景的残留继续灌进来。
+                            _EVENTS["q"].append(_pair)
                             if stop_on and ev.group(1) == stop_on:
                                 return
         except Exception:
@@ -140,7 +164,7 @@ def _cur_run(port):
     return rid
 
 
-def gate_driver(port, events, enabled=True):
+def gate_driver(port, enabled=True):
     """唯一的闸门驱动：像真实用户一样把所有人工闸门点掉。
 
     两条信号并行，任意一条先到就确认，天然免疫漏事件：
@@ -153,13 +177,23 @@ def gate_driver(port, events, enabled=True):
 
     run_id 变化即视为进入新一轮，清空去重状态 —— 必须在处理事件流**之前**完成，
     否则新一轮的闸门事件会拿上一轮的记录比对而被跳过。
+
+    队列每次循环重新取（_EVENTS["q"]）：scene() 会在场景边界整体换掉它，
+    游标按「列表身份」走 —— 换了列表就从 0 重新开始，于是上一场景迟到的事件
+    既不会被当成当前场景去确认，也不会把驱动卡死
+    （对同一个列表 clear() 才是会卡死的那种写法：长度清零而游标还在旧位置）。
     """
-    idx = 0
     t0 = time.time()
     _resume_ev = {"split": "split_ready", "fix": "fix_ready",
                   "accept": "accept_ready", "qc": "qc_failed"}
     gates = set(_resume_ev.values()) | {"blueprint_ready"}
+    q = None        # 游标跟着「列表身份」走：scene() 换列表时自然从 0 开始，
+    cursor = 0      # 也就不会拿旧列表的长度把新队列当成「已经超过」而永久停住
     while time.time() - t0 < 900:
+        if _EVENTS["q"] is not q:
+            q = _EVENTS["q"]
+            cursor = 0
+        events = q
         # ---- 先取一次状态，顺带做 run 切换检测 ----
         # 顺序很关键：run 切换必须在处理事件流**之前**完成去重清理。
         # 否则新一轮的 blueprint_ready 会拿上一轮的记录去比对而被跳过，
@@ -177,8 +211,8 @@ def gate_driver(port, events, enabled=True):
                 print(f"    [gate] 状态轮询异常（忽略）: {type(e).__name__} {e}")
 
         # ---- A. 事件流 ----
-        while idx < len(events):
-            ev, data = events[idx]; idx += 1
+        while cursor < len(events):
+            ev, data = events[cursor]; cursor += 1
             if ev not in gates:
                 continue
             try:
@@ -354,11 +388,12 @@ try:
     if not _up:
         err = api.stderr.read().decode("utf-8", "replace") if api.stderr else ""
         raise RuntimeError(f"后端/ mock 未就绪。api stderr:\n{err[-1500:]}")
-    # 所有场景共用同一个事件队列（_ALL_EVENTS），全局驱动据此按闸门事件行动
+    # 所有场景共用一个事件队列（_EVENTS["q"]），全局驱动据此按闸门事件行动；
+    # 队列在场景边界被 scene() 整体换掉，上一场景的残留不会灌进下一场景。
     print("mock / health:", get(f"{L}/v1/models")["data"][0]["id"], "|", get(f"{B}/api/health")["status"])
     # 全局唯一的闸门驱动：像真实用户那样把所有人工闸门都点掉。
-    threading.Thread(target=gate_driver, args=(API_PORT, _ALL_EVENTS),
-                     daemon=True).start()
+    # 队列放在 _EVENTS 里，由 scene() 在场景边界整体换掉（见 scene 的说明）。
+    threading.Thread(target=gate_driver, args=(API_PORT,), daemon=True).start()
 
     # ---------- 准备输入 ----------
     inp = tmp / "in"; outd = tmp / "out"
@@ -541,7 +576,7 @@ try:
           str(st.get("reconstructed_chapters")))
 
     # ---------- 场景二：docx 输入，覆盖 document.py 的排版路径 ----------
-    print("\n--- 场景二：docx 输入 ---")
+    scene("场景二：docx 输入")
     from docx import Document as _D
     dinp = tmp / "in_docx"; dinp.mkdir(parents=True, exist_ok=True)
     cn = "零一二三四五六七八九十"
@@ -593,7 +628,7 @@ try:
     # 对应用户实际遇到的报错「需要 3 个，实际 5 个」。
     # 注入前重试也是**完全相同的 prompt**，模型无从收敛；修复后 on_retry
     # 把错因喂回去，第二次应当正确收敛。
-    print("\n--- 场景三：分隔符数量不符 → 重试纠正 ---")
+    scene("场景三：分隔符数量不符 → 重试纠正")
     put(f"{L}/", {"fail": {"phase": None, "times": 0, "status": 500, "body": "", "extra_breaks": 1}})
     put(f"{L}/", {"reset": True, "log_clear": True})
     e3in = tmp / "in3"; make_novel(e3in, chapters=4)
@@ -628,7 +663,7 @@ try:
     # ---------- 场景四：上下文超限 → 自动拆批跑完 ----------
     # 对应用户真实报错：程序以为放得下（context_window 填得大），本地模型其实只有
     # 8448。要求：不许整轮报废，必须自动对半拆批直到放得下。
-    print("\n--- 场景四：上下文超限 → 自动拆批 ---")
+    scene("场景四：上下文超限 → 自动拆批")
     put(f"{L}/", {"fail": {"phase": None, "times": 0, "status": 500, "body": "", "extra_breaks": 0}})
     # 让 mock 只接受 ≤2 章的请求，而应用以为窗口很大（context_window=32768 → 一批全塞）
     put(f"{L}/", {"reset": True, "log_clear": True, "ctx_limit": {"max_chapters": 2}})
@@ -668,7 +703,7 @@ try:
     # ---------- 场景五：单文件章节识别 + 上下文窗口探测 ----------
     # 一个缩进风格、带序章、混入正文提及「第X章」的单文件，必须精确拆出 4 章 + 序章，
     # 且正文提及不得被误判成章节。
-    print("\n--- 场景五：单文件章节识别（缩进/序章/正文提及）---")
+    scene("场景五：单文件章节识别（缩进/序章/正文提及）")
     e5in = tmp / "in5"; e5in.mkdir(parents=True, exist_ok=True)
     single = e5in / "single_input.txt"
     _pad = "填充正文内容，确保每章都超过空章阈值五十个字，避免被判为空章。" * 3
@@ -717,7 +752,7 @@ try:
     # ---------- 场景六：无编号标题 → AI 辅助拆章 ----------
     # 一本书全用「纯标题行」分章（没有任何「第X章」），规则必然识别不出。
     # 期望：置信度低 → AI 只在候选行里挑边界 → 仍需人工确认后才继续。
-    print("\n--- 场景六：无编号标题 → AI 拆章 ---")
+    scene("场景六：无编号标题 → AI 拆章")
     e6in = tmp / "in6"; e6in.mkdir(parents=True, exist_ok=True)
     _p6 = "正文内容，需要足够长以免被判为空章。" * 4
     (e6in / "ai_book.txt").write_text(
@@ -752,7 +787,7 @@ try:
 
     # ---------- 场景七：规则与 AI 都搞不定 → 人工自定义标记重拆 ----------
     # 用「◆ 壹 ◆」这类创新排版，且关掉 AI（ai_split=False），只剩人工兜底。
-    print("\n--- 场景七：自定义章节标记重拆 ---")
+    scene("场景七：自定义章节标记重拆")
     e7in = tmp / "in7"; e7in.mkdir(parents=True, exist_ok=True)
     _p7 = "正文内容，需要足够长以免被判为空章。" * 4
     (e7in / "odd_book.txt").write_text(
@@ -820,7 +855,7 @@ try:
     #   1) 重跑识别为 resumed
     #   2) 已完成的批次**不再调用模型**（refactor 调用数 == 剩余批次数）
     #   3) 第一批的成品文件仍在，最终整本跑完
-    print("\n--- 场景八：中途失败 → 断点续跑 ---")
+    scene("场景八：中途失败 → 断点续跑")
     e8in = tmp / "in8"; make_novel(e8in, chapters=8, paras=5)
     o8 = tmp / "out8"
     put(f"{L}/", {"reset": True, "log_clear": True,
@@ -850,16 +885,25 @@ try:
         if prog8.get("error_logs") and not prog8.get("pipeline_running"):
             break
         time.sleep(0.5)
-    st8a = put(f"{L}/", {})["stats"]
+    _mock8a = put(f"{L}/", {})
+    st8a = _mock8a["stats"]
+    # mock 的请求日志是这一场景唯一的「第 1 次调用到底有没有被打回」证据：
+    # 场景八的判定完全建立在 arm_after=1（第 1 次放行、第 2 次起失败）上，
+    # 一旦这一前提没成立，后面的 done/files 断言会一起崩，而报错里看不出原因。
+    _log8a = [(x.get("phase"), x.get("has_fix")) for x in (_mock8a.get("log") or [])][-8:]
     check("注入的失败发生在第 2 次重构调用之后（第一批未被波及）",
           st8a.get("refactor", 0) >= 2, str(st8a))
-    st8a = put(f"{L}/", {})["stats"]
     done8 = [b for b in prog8.get("batches", []) if b.get("status") == "phase3_done"]
     recon8a = sorted((o8 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
     check("第一批成功后因错误中断", bool(prog8.get("error_logs")),
           f"error_logs={len(prog8.get('error_logs') or [])}")
     check("中断时第一批已标记完成且有成品", len(done8) >= 1 and len(recon8a) >= 1,
-          f"done={len(done8)} files={len(recon8a)}")
+          "done={0} files={1} statuses={2} errs={3} mock_log={4}".format(
+              len(done8), len(recon8a),
+              [(b.get("batch_id"), b.get("status")) for b in prog8.get("batches", [])],
+              str([(e.get("code"), (e.get("message") or "")[:80])
+                   for e in (prog8.get("error_logs") or []) if isinstance(e, dict)][:2])[:260],
+              str(_log8a)[:200]))
     check("中断时进度停在 phase3", (prog8.get("current_phase") or "").startswith("phase3"),
           str(prog8.get("current_phase")))
     saved_names = {p.name for p in recon8a}
@@ -902,7 +946,7 @@ try:
     check("续跑后有完整成品", len(final8) >= 1, str([p.name for p in final8]))
 
     # ---------- 场景九：并发波前 + 跨批连续性 + 硬伤自动重写 ----------
-    print("\n--- 场景九：并发重构 + 跨批连续性 + 硬伤自动重写 ---")
+    scene("场景九：并发重构 + 跨批连续性 + 硬伤自动重写")
     put(f"{L}/", {"reset": True, "log_clear": True,
                   "fail": {"phase": None, "times": 0, "status": 500, "body": "",
                            "skip": 0, "arm_after": 0, "extra_breaks": 0},
@@ -934,7 +978,7 @@ try:
     put(f"{L}/", {"bad_content": {"times": 0}})
 
     # ---------- 场景十：缝合全部失败 → 降级跳过，正文照常产出 ----------
-    print("\n--- 场景十：缝合失败降级 ---")
+    scene("场景十：缝合失败降级")
     put(f"{L}/", {"reset": True, "log_clear": True,
                   "fail": {"phase": "stitch", "times": 99, "status": 500,
                            "body": "injected stitch failure", "skip": 0,
@@ -965,7 +1009,7 @@ try:
                            "skip": 0, "arm_after": 0, "extra_breaks": 0}})
 
     # ---------- 场景十一：docx 富文本输出 ----------
-    print("\n--- 场景十一：docx 富文本 ---")
+    scene("场景十一：docx 富文本")
     o11 = tmp / "out_rich"
     ev11, th11 = sse_events(API_PORT, 300, stop_on="done")
     start_run(dict(body, input_path=str(dinp), output_path=str(o11), input_format="docx",
@@ -991,6 +1035,120 @@ try:
         from docx import Document as _PD
         check("未开富文本时保持旧排版（字面分隔线）",
               any(p.text.strip() == "---" for p in _PD(str(plain_merged)).paragraphs))
+
+    # ---------- 场景十二：缝合整段重写 → 最小改动闸门拒绝并保留原文 ----------
+    # 长度比护栏（0.5~3.0）对「等长但全换写法」完全不设防，只有改动率闸门能挡住。
+    # 这里用 mock 注入这种形状的补丁，验证整条链路：校验 → 带错因重试 → 降级保留原文。
+    scene("场景十二：缝合最小改动闸门")
+    put(f"{L}/", {"reset": True, "log_clear": True,
+                  "fail": {"phase": None, "times": 0, "status": 500, "body": "",
+                           "skip": 0, "arm_after": 0, "extra_breaks": 0},
+                  "ctx_limit": {"max_chapters": 0},
+                  "stitch_bulk": {"times": 99}})
+    e12in = tmp / "in12"; make_novel(e12in, chapters=8)
+    o12 = tmp / "out12"
+    ev12, th12 = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(e12in), output_path=str(o12), context_window=8000,
+                   novel_name="最小改动闸门", refactor_gates={}, compare_output=False,
+                   chapter_snapshots=False, max_concurrency=1))
+    ok12 = wait_done(ev12, th12, api_port=API_PORT)[0]
+    st12 = put(f"{L}/", {})["stats"]
+    prog12 = json.loads((o12 / "progress.json").read_text(encoding="utf-8"))
+    check("整段重写场景仍跑完整轮", ok12, str(st12))
+    _f12 = prog12.get("stitch_failures") or []
+    check("缝合确实被注入过整段重写补丁", len(_f12) >= 1, str(st12))
+    check("拒绝原因是最小改动闸门",
+          _f12 and all("改动过大" in (x.get("error") or "") for x in _f12),
+          str([x.get("error") for x in _f12][:2])[:200])
+    check("被拒后带错因重试过一次", st12.get("stitch_corrected", 0) >= 1, str(st12))
+    _b12 = [p for p in list((o12 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
+            + list((o12 / "03_final").glob("*.txt"))
+            if "模拟整段重写" in p.read_text(encoding="utf-8", newline="")]
+    check("整段重写补丁没有落进正文", not _b12, str([p.name for p in _b12]))
+    o12c = sorted((o12 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
+    check("闸门拒绝后 8 章正文仍完整",
+          len(o12c) == 8 and all(p.stat().st_size > 0 for p in o12c),
+          str([p.name for p in o12c]))
+    q12 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o12))}")
+    check("质量报告说明闸门当时是开着的",
+          "已开启" in ((q12.get("config") or {}).get("stitch_gate") or ""),
+          str(q12.get("config"))[:200])
+    put(f"{L}/", {"stitch_bulk": {"times": 0}})
+
+    # ---------- 场景十三：单章重生成必须刷新质检结论 ----------
+    # /api/regen_chapter 覆盖重构稿后若 batch_qc 不刷新，会两头错：已经改好的章继续
+    # 被报告指控（假警报），新引入的硬伤没人记录（假清白）。而且流水线紧接着会把内存
+    # progress 整份写回磁盘 —— 刷新结果还必须被「并回内存」，否则 1 秒内被心跳抹掉
+    # （与当年 fix_list 静默失效同一个坑）。
+    scene("场景十三：单章重生成后刷新质检")
+    put(f"{L}/", {"reset": True, "log_clear": True,
+                  "fail": {"phase": None, "times": 0, "status": 500, "body": "",
+                           "skip": 0, "arm_after": 0, "extra_breaks": 0},
+                  "ctx_limit": {"max_chapters": 0},
+                  # 前两批的首章各注入一个 TODO 占位：batch1 的第 1 章用来重写，
+                  # batch2 的第 5 章必须原样保留（证明只清了被重写的那一章）
+                  "bad_content": {"times": 2}})
+    e13in = tmp / "in13"; make_novel(e13in, chapters=6, paras=3)
+    o13 = tmp / "out13"
+    _GATE.suppress = {"accept_ready"}      # 验收门留给本场景自己点
+    ev13, th13 = sse_events(API_PORT, 300, stop_on="done")
+    start_run(dict(body, input_path=str(e13in), output_path=str(o13), context_window=8000,
+                   novel_name="单章重生成刷新质检",
+                   refactor_gates={"require_chapter_accept": True,
+                                   "auto_rewrite_bad_batch": False},
+                   compare_output=False, chapter_snapshots=False, max_concurrency=1))
+    t13 = time.time()
+    acc13 = None
+    while time.time() - t13 < 180:
+        acc13 = next((json.loads(d) for _e, d in reversed(ev13) if _e == "accept_ready"), None)
+        if acc13:
+            break
+        time.sleep(0.25)
+    check("验收门已弹出（第一批待验收）", bool(acc13), str(acc13)[:120])
+    _bid13 = str((acc13 or {}).get("batch_id"))
+
+    def _qc_keys(prog, bids=None):
+        pick = {str(k): v for k, v in (prog.get("batch_qc") or {}).items()
+                if bids is None or str(k) in bids}
+        return {(str(i.get("chapter_id")), i.get("code"))
+                for issues in pick.values() for i in (issues or [])}
+
+    p13 = json.loads((o13 / "progress.json").read_text(encoding="utf-8"))
+    _before = _qc_keys(p13, {_bid13})
+    check("注入的占位硬伤确实进了该批质检结论", ("1", "placeholder") in _before,
+          str(_before)[:200])
+    _file13 = o13 / "02_workspace" / "reconstructed" / "chapter_1.txt"
+    _text_before = _file13.read_text(encoding="utf-8", newline="")
+    try:
+        reg13 = post(f"{B}/api/regen_chapter", {"chapter_id": "1"})
+    except Exception as e:
+        reg13 = {"error": str(e)}
+    check("单章重生成接口应答成功", reg13.get("status") == "regenerated", str(reg13)[:200])
+    _text_after = _file13.read_text(encoding="utf-8", newline="")
+    check("重写后的正文替换了占位符",
+          "TODO" not in _text_after and _text_after != _text_before,
+          f"before={len(_text_before)} after={len(_text_after)}")
+    p13b = json.loads((o13 / "progress.json").read_text(encoding="utf-8"))
+    _after13 = _qc_keys(p13b, {_bid13})
+    check("该章的旧硬伤结论已随正文刷新", ("1", "placeholder") not in _after13,
+          str(_after13)[:200])
+    check("同批其他章的结论原样保留", _after13 == _before - {("1", "placeholder")},
+          f"before={_before} after={_after13}")
+    # 放行验收门，跑完整轮
+    _GATE.suppress = set()
+    post(f"{B}/api/accept", {})
+    ok13 = wait_done(ev13, th13, api_port=API_PORT)[0]
+    check("重生成后整轮跑完", ok13, str([e for e, _ in ev13][-2:]))
+    p13f = json.loads((o13 / "progress.json").read_text(encoding="utf-8"))
+    _allf = _qc_keys(p13f)
+    check("刷新结果没有被流水线写回覆盖", ("1", "placeholder") not in _allf, str(_allf)[:240])
+    check("另一批的占位硬伤仍在册（只清被重写的那一章）", ("5", "placeholder") in _allf,
+          str(_allf)[:240])
+    q13 = get(f"{B}/api/output/quality?output_path={urllib.request.quote(str(o13))}")
+    check("质量报告里的占位硬伤只剩未重写的那一章",
+          (q13.get("summary") or {}).get("placeholder_hits", 0) == 1,
+          str(q13.get("summary")))
+    put(f"{L}/", {"bad_content": {"times": 0}})
 
     # 输出目录管理端点（GUI 用）：HTTP 层验证
     from urllib.parse import quote

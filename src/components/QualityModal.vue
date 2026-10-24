@@ -151,6 +151,9 @@ function rowStatus(row: QualityChapterRow): string {
             <span class="hint">处</span>
           </div>
         </div>
+        <p v-if="report.config.stitch_gate" class="hint">
+          {{ report.config.stitch_gate }}
+        </p>
 
         <h4 class="q-h4">问题清单</h4>
         <div v-if="!report.issues.length" class="log-empty">未发现结构性问题</div>
