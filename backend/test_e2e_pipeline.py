@@ -343,6 +343,35 @@ def make_novel(path: Path, chapters: int, paras: int = 3):
         (path / f"第{name}章.txt").write_text("\n\n".join(body), encoding="utf-8")
 
 
+def is_terminal_event(event, data):
+    """这条 SSE 事件是否代表「本轮结束」。
+
+    产品把**可继续的告警**也发成 `event: error`（payload 里 `kind: "warning"`，
+    如缝合跳过 / 断层 JSON 缺失 / 拆章兜底）。把它们当终态会让 wait_done 在
+    流水线还在跑的时候就返回，后续断言便与 finalize 抢跑 —— 场景十会持续发
+    「缝合跳过」告警，v0.13.0 首发的 CI 上就是这样在质量报告写盘前拿到 404，
+    而且只有部分轮次撞上，看起来像随机失败。
+    """
+    if event in ("done", "stopped"):
+        return True
+    if event != "error":
+        return False
+    try:
+        payload = json.loads(data)
+    except (TypeError, ValueError):
+        return True
+    return not (isinstance(payload, dict) and payload.get("kind") == "warning")
+
+
+# 自检：这条谓词判错曾在 CI 上伪装成「随机丢报告」，改坏时必须立刻炸（脚本形态
+# 的用例被 pytest 收集不到，所以把断言放在这里）。
+assert is_terminal_event("error", json.dumps({"kind": "unknown", "code": "exception"}))
+assert is_terminal_event("done", "{}") and is_terminal_event("stopped", "{}")
+assert not is_terminal_event(
+    "error", json.dumps({"kind": "warning", "code": "stitch_skipped"}))
+assert not is_terminal_event("progress", "{}")
+
+
 def wait_done(events, t, timeout=240, api_port=None):
     """等终态。返回 (是否到达, 终态瞬间的 pipeline_running 快照)。
 
@@ -361,7 +390,7 @@ def wait_done(events, t, timeout=240, api_port=None):
     t0 = time.time()
     saw_running = False
     while time.time() - t0 < timeout:
-        if any(e in ("done", "stopped", "error") for e, _ in events):
+        if any(is_terminal_event(e, d) for e, d in events):
             snap = None
             if api_port:
                 try:
