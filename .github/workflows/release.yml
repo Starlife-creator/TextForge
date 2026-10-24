@@ -69,8 +69,10 @@ jobs:
           cd backend
           python -m venv venv
           source venv/Scripts/activate
-          pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          # `python -m pip` 而不是 `pip`：Windows 上正被执行的 pip.exe 是自己，
+          # 就地升级会替换不掉而退出 1 —— v0.13.0 的发布就卡死在这一步。
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
 
       - name: 后端 Lint (ruff)
         shell: bash
@@ -174,9 +176,9 @@ jobs:
           cd backend
           python -m venv venv
           source venv/Scripts/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
 
       - name: 构建 sidecar 后端（backend\build_sidecar.bat，onedir）
         shell: cmd

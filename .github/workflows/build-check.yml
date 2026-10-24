@@ -110,8 +110,12 @@ jobs:
           cd backend
           python -m venv venv
           source venv/Scripts/activate
-          pip install --upgrade pip
-          pip install -r requirements-dev.txt
+          # 一律用 `python -m pip`：Windows 上正被执行的 pip.exe 是自己，就地升级会因
+          # 无法替换在用的可执行文件而失败（pip 的报错原文也让你改用这种形式）。
+          # 上一轮直接写 `pip install --upgrade pip`，runner 镜像里 pip 一有小版本更新，
+          # 两条流水线就会同时卡在「准备虚拟环境」这一步，后端闸门全被跳过。
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
 
       - name: 后端 Lint (ruff)
         shell: bash
@@ -165,8 +169,8 @@ jobs:
           cd backend
           python -m venv venv
           source venv/Scripts/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
 
       # 端到端能抓到单元测试结构上抓不到的问题，例如 stitch.py 用了未导入的
       # sse_emit —— 那类 NameError 只有真正执行才会暴露。
