@@ -30,6 +30,8 @@ logger = logging.getLogger("textforge")
 CONTINUITY_MARK = "【上一批结尾（仅用于衔接）】"
 # 前情摘要：补「事实/人物状态一致」，与结尾片段补「文风衔接」互补。
 STORY_MEMO_MARK = "【前情摘要（仅用于保持事实一致）】"
+# #5 人物/伏笔档案：项目级持久条目，仅用于称谓/状态/伏笔连续性，不占正文预算外篇幅。
+CANON_MARK = "【人物伏笔档案（仅用于一致性参照）】"
 
 # 自动重写只兜「结构性硬伤」：每批最多一次，整轮有上限，避免坏模型无限烧钱。
 AUTO_REWRITE_MAX_PER_RUN = 3
@@ -589,6 +591,12 @@ async def _request_refactor_text(client, req, output_path, blueprint_text,
         .read_text(encoding='utf-8')
         for cid in chapter_ids
     )
+    # #5：档案命中条目按预算注入；关键词取改名映射旧称与本章标题。
+    from core.canon import load_canon, build_canon_context
+    chapter_meta = [progress['chapters'][_find_idx(progress['chapters'], cid)] for cid in chapter_ids]
+    keywords = list(getattr(req, "name_map", {}) or {}) + [
+        str(c.get("title") or c.get("filename") or "") for c in chapter_meta]
+    canon_context = build_canon_context(load_canon(output_path), keywords=keywords)
     prompt = _build_refactor_prompt(
         req.refactor_mode,
         blueprint_text, req.author_style, batch_content,
@@ -601,6 +609,7 @@ async def _request_refactor_text(client, req, output_path, blueprint_text,
         story_memo=_story_memo_for_batch(
             output_path, progress, batch,
             token_limit=story_memo_token_allowance(req.context_window)),
+        canon_context=canon_context,
     )
     payload = {
         "model": ep["model"], "messages": [{"role": "user", "content": prompt}],
@@ -705,6 +714,17 @@ async def _run_refactor_batch(client, req, output_path, recon_dir, blueprint_tex
 
     output_files = _persist_batch_outputs(req, output_path, recon_dir, progress, batch, chapter_texts)
     progress.setdefault('batch_qc', {})[str(batch.get('batch_id'))] = issues[:MAX_BATCH_QC_ISSUES]
+
+    # #5：定稿后增量更新人物/伏笔档案；失败不影响批次交付（LLM 深度抽取属后续范围）。
+    try:
+        from core.canon import load_canon, apply_batch, save_canon
+        canon = load_canon(output_path)
+        for cid, text in chapter_texts.items():
+            apply_batch(canon, str(cid), text)
+        save_canon(output_path, canon)
+    except Exception as e:
+        logger.warning(f"[phase3] 人物/伏笔档案增量更新失败（忽略）: {e}")
+
     return output_files, issues
 
 def _find_idx(chapters, cid):
@@ -780,7 +800,7 @@ def _break_feedback(n_chapters: int):
 
 def _build_refactor_prompt(mode, blueprint, author_style, batch_content, *,
                            forbidden_canon=(), name_map=None, fix_list=(), gates=None,
-                           n_chapters=1, continuity="", story_memo=""):
+                           n_chapters=1, continuity="", story_memo="", canon_context=""):
     """按重构档位选择提示词。缺省/未知 mode 一律回退 full_rewrite（原行为）。
     档位提示词构建后，若启用了任何「保护门」(lock_names/lock_plot/inject_forbidden)，
     追加一段强制规则；全关时完全不加，旧行为不变。
@@ -788,6 +808,7 @@ def _build_refactor_prompt(mode, blueprint, author_style, batch_content, *,
     n_chapters：本批实际章数，必须传真实值 —— 分隔条数契约（_common_tail）依赖它。
     continuity：上一批结尾片段，只用于跨批文风衔接。
     story_memo：上一批诊断摘要，只用于人物状态与已知事实的一致性。
+    canon_context：#5 人物/伏笔档案条目，只用于称谓/状态/伏笔连续性。
     """
     n_chapters = max(1, int(n_chapters or 1))
     mode = mode or "full_rewrite"
@@ -797,6 +818,12 @@ def _build_refactor_prompt(mode, blueprint, author_style, batch_content, *,
             f"{STORY_MEMO_MARK}\n{story_memo}\n\n"
             "【事实一致性要求】以上摘要只用于保持人物状态、称谓与已知事实一致；"
             "不要照抄、不要复述、不要把它当作待处理正文。\n"
+        )
+    if canon_context:
+        blocks.append(
+            f"{CANON_MARK}\n{canon_context}\n\n"
+            "【档案一致性要求】以上档案只用于保持人物称谓、状态与伏笔连续；"
+            "不要照抄、不要复述，也不要剧透未回收伏笔的安排。\n"
         )
     if continuity:
         blocks.append(
