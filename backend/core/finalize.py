@@ -142,7 +142,20 @@ def phase4_finalize(output_path: Path, progress: dict, req):
             _write_with_backup(output_file, [text], output_format, backup_dir, rich=rich)
         output_file = final_dir / f"{novel_name}_重构终稿.{output_format}"
         _write_with_backup(output_file, merged_texts, output_format, backup_dir, rich=rich)
-    
+
+    # #20：勾选 export_epub 时额外产出 EPUB（导航目录 + 粗斜体映射）；失败不阻断其他格式交付。
+    if getattr(req, "export_epub", False):
+        from core.epub import write_epub
+        epub_chapters = [
+            {"id": ch["id"], "title": ch.get("title") or ch.get("filename"), "text": text}
+            for ch, text in zip(original_chapters, merged_texts, strict=False)
+        ]
+        try:
+            write_epub(final_dir / f"{novel_name}_重构终稿.epub", epub_chapters,
+                       title=novel_name_raw)
+        except Exception as e:
+            logger.warning(f"[finalize] EPUB 导出失败（继续交付其他格式）: {e}", exc_info=True)
+
     _cleanup_backups(backup_dir)
     write_stitch_report(output_path, progress)
     write_quality_report_safely(
