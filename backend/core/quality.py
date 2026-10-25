@@ -695,6 +695,11 @@ def build_quality_report(
     for i in issues:
         code_counts[i["code"]] = code_counts.get(i["code"], 0) + 1
 
+    # #3：单章重生成次数进摘要（与 progress.regen_count 同源，供抽读定位反复驳回的章节）。
+    regen_count = progress.get("regen_count") or {}
+    regen_total = sum(int(v or 0) for v in regen_count.values())
+    regen_chapters = sum(1 for v in regen_count.values() if int(v or 0) > 0)
+
     report = {
         "schema": SCHEMA,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -717,6 +722,8 @@ def build_quality_report(
             "forbidden_hits": count_code("forbidden_canon"),
             "old_name_hits": count_code("old_name_residue"),
             "auto_rewrites": len(progress.get("auto_rewrite_log") or []),
+            "regen_total": regen_total,
+            "regen_chapters": regen_chapters,
             "pre_stitch_issues": len(progress.get("pre_stitch_issues") or []),
             "stitch_failures": len(progress.get("stitch_failures") or []),
             "stitch_patches": stitch["applied_patches"],

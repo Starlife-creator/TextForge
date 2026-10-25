@@ -269,21 +269,25 @@ async def final_files(output_path: str):
 
 
 def _list_comparisons(comp_dir: Path) -> list[dict]:
-    """列表模式：只返回文件名和大小，不读正文（线程内执行）。"""
+    """列表模式：只返回文件名和大小，不读正文（线程内执行）；拒绝符号链接条目。"""
     items: list[dict] = []
     for f in sorted(comp_dir.glob("chapter_*.comparison.md")):
+        if f.is_symlink():
+            continue
         items.append({"name": f.name, "size": f.stat().st_size})
     return items
 
 
 def _read_comparison(comp_dir: Path, name: str) -> list[dict]:
-    """单文件正文读取（线程内执行）；先做 #9 路径白名单与前缀断言。"""
+    """单文件正文读取（线程内执行）；先做 #9 路径白名单、前缀断言与符号链接拒绝。"""
     if not _COMPARISON_NAME_RE.match(name):
         return []
     try:
         f = (comp_dir / name).resolve()
         base = comp_dir.resolve()
         if not str(f).startswith(str(base) + os.sep):
+            return []
+        if f.is_symlink():
             return []
     except OSError:
         return []

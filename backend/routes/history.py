@@ -69,7 +69,7 @@ def upsert(output_path: str, meta: dict) -> None:
     e["output_path"] = output_path
     for k in ("novel_name", "input_path", "input_mode", "current_phase",
               "total_chapters", "batches_done", "batches_total", "finished",
-              "finished_at", "chapter_detection", "config_drift"):
+              "finished_at", "chapter_detection", "regen_total", "config_drift"):
         if k in meta and meta[k] is not None:
             # P0-1：历史注册表不得留存明文密钥；config_drift 落 runs.json 前兜底脱敏。
             e[k] = redact(meta[k]) if k == "config_drift" else meta[k]
@@ -94,6 +94,7 @@ def _meta_from_progress(progress: dict) -> dict:
     """从 progress.json 抽取注册表需要的元数据。"""
     batches = progress.get("batches") or []
     errs = progress.get("error_logs") or []
+    regen_count = progress.get("regen_count") or {}
     return {
         "novel_name": progress.get("novel_name"),
         "input_path": progress.get("input_path"),
@@ -105,6 +106,8 @@ def _meta_from_progress(progress: dict) -> dict:
         "finished": is_completed(progress),
         "finished_at": progress.get("finished_at"),
         "chapter_detection": progress.get("chapter_detection"),
+        # #3：单章重生成总次数随历史展示（与质量报告摘要同源）。
+        "regen_total": sum(int(v or 0) for v in regen_count.values()),
         # P0-1：抽取元数据时即脱敏，杜绝明文密钥写入 runs.json。
         "config_drift": redact(progress.get("config_drift") or []),
         "last_error": (errs[-1].get("message") if errs else None),
