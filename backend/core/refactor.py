@@ -15,7 +15,12 @@ from core.budget import (
     window_char_capacity,
 )
 from core.batching import split_batch_in_progress as _split_batch_in_progress
-from core.quality import assess_batch_texts, has_blocking_issues
+from core.quality import (
+    assess_batch_texts,
+    has_blocking_issues,
+    MAX_BATCH_QC_ISSUES,
+    MAX_PRE_STITCH_ISSUES,
+)
 from utils.tokens import estimate_tokens
 
 logger = logging.getLogger("textforge")
@@ -193,7 +198,8 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
             if issue.get("severity") == "bad"
         ]
         if pre_issues:
-            progress['pre_stitch_issues'] = pre_issues[:200]
+            progress['pre_stitch_issues'] = pre_issues[:MAX_PRE_STITCH_ISSUES]
+            # SSE 预览只取前 20 条（界面弹窗体量考虑，与留存上限不是一回事）。
             sse_emit("qc_warning", {"count": len(pre_issues),
                                     "issues": pre_issues[:20]}, run_id)
             logger.warning(f"[phase3] 质检遗留 {len(pre_issues)} 项，已写入质量报告")
@@ -263,13 +269,13 @@ def _refresh_qc_after_regen(req, output_path, progress, chapter_id, new_text) ->
         if bid not in qc:
             continue
         kept = [i for i in (qc.get(bid) or []) if str(i.get("chapter_id")) != cid]
-        qc[bid] = (kept + fresh)[:50]
+        qc[bid] = (kept + fresh)[:MAX_BATCH_QC_ISSUES]
     progress["batch_qc"] = qc
     # pre_stitch_issues 是 batch_qc 的派生物：不同步刷新，报告里的「遗留硬伤」就是旧账
     progress["pre_stitch_issues"] = [
         i for issues in qc.values() for i in (issues or [])
         if isinstance(i, dict) and i.get("severity") == "bad"
-    ][:200]
+    ][:MAX_PRE_STITCH_ISSUES]
     return fresh
 
 
@@ -679,7 +685,7 @@ async def _run_refactor_batch(client, req, output_path, recon_dir, blueprint_tex
             })
 
     output_files = _persist_batch_outputs(req, output_path, recon_dir, progress, batch, chapter_texts)
-    progress.setdefault('batch_qc', {})[str(batch.get('batch_id'))] = issues[:50]
+    progress.setdefault('batch_qc', {})[str(batch.get('batch_id'))] = issues[:MAX_BATCH_QC_ISSUES]
     return output_files, issues
 
 def _find_idx(chapters, cid):

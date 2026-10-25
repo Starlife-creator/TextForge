@@ -34,6 +34,29 @@ MAX_POSTINGS = 30
 STITCH_WARN_MEAN_RATE = 0.25
 STITCH_WORST_ITEMS = 5
 
+# ---- 篇幅 / 塌缩 / 膨胀判定阈值（#19：全部收口在本文件，取值依据写在注释里） ----
+# 触发塌缩/膨胀判定所需的最小原文字数：原文太短时篇幅比噪声大，不参与硬伤判定。
+COLLAPSE_MIN_ORIG_CHARS = 500
+# 塌缩：重构稿不足原文 30% —— 典型「摘要化」或整段丢失，判 BAD。
+COLLAPSE_RATIO = 0.30
+# 膨胀：重构稿超过原文 3 倍 —— 模型掺水扩写或把一章拆成多章篇幅，判 BAD。
+EXPANSION_RATIO = 3.0
+# 篇幅偏离提醒（WARN，不拦截）：落在 55%~180% 之外即提示抽读；硬伤判定另有上两条。
+WARN_LOW_RATIO = 0.55
+WARN_HIGH_RATIO = 1.8
+
+# ---- 报告容量上限 ----
+# 报告里 issues 最多留存多少条；超出部分仍计入 summary 计数（不在生成阶段截断统计）。
+MAX_ISSUES_REPORT = 200
+# 逐条拼接进 warn 提示的问题条数（qc_issues / pre_stitch_issues / config_drift 共用）。
+MAX_QC_ISSUE_PREVIEW = 10
+# 缝合失败清单拼接预览的条数。
+MAX_STITCH_FAILURE_PREVIEW = 5
+# 每批次留存的质检问题条数（refactor.py 的 batch_qc 共用同一口径）。
+MAX_BATCH_QC_ISSUES = 50
+# 批次质检汇总进 pre_stitch_issues 的条数上限。
+MAX_PRE_STITCH_ISSUES = 200
+
 RESIDUAL_MARKERS = ("===CHAPTER_BREAK===", "===PREV_END===", "===NEXT_START===")
 # 最后一组是模型元话术（不是小说正文）：出现即说明模型把「回复用户」的措辞
 # 写进了成品。只收几乎不可能出现在小说对白里的固定短语，避免误伤剧情。
@@ -302,21 +325,21 @@ def assess_batch_texts(
         orig_len, recon_len = len(orig), len(recon)
         ratio = recon_len / orig_len if orig_len else None
         if ratio is not None:
-            if orig_len >= 500 and ratio < 0.30:
+            if orig_len >= COLLAPSE_MIN_ORIG_CHARS and ratio < COLLAPSE_RATIO:
                 add(
                     BAD,
                     "content_collapse",
                     cid,
                     f"第 {cid} 章（{label}）明显塌缩：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
                 )
-            elif orig_len >= 500 and ratio > 3.0:
+            elif orig_len >= COLLAPSE_MIN_ORIG_CHARS and ratio > EXPANSION_RATIO:
                 add(
                     BAD,
                     "content_expansion",
                     cid,
                     f"第 {cid} 章（{label}）异常膨胀：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
                 )
-            elif ratio < 0.55 or ratio > 1.8:
+            elif ratio < WARN_LOW_RATIO or ratio > WARN_HIGH_RATIO:
                 add(
                     WARN,
                     "length_off",
@@ -474,19 +497,19 @@ def build_quality_report(
                     )
 
             if ratio is not None:
-                if orig_len >= 500 and ratio < 0.30:
+                if orig_len >= COLLAPSE_MIN_ORIG_CHARS and ratio < COLLAPSE_RATIO:
                     flag(
                         BAD,
                         "content_collapse",
                         f"第 {cid} 章（{label}）明显塌缩：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
                     )
-                elif orig_len >= 500 and ratio > 3.0:
+                elif orig_len >= COLLAPSE_MIN_ORIG_CHARS and ratio > EXPANSION_RATIO:
                     flag(
                         BAD,
                         "content_expansion",
                         f"第 {cid} 章（{label}）异常膨胀：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
                     )
-                elif ratio < 0.55 or ratio > 1.8:
+                elif ratio < WARN_LOW_RATIO or ratio > WARN_HIGH_RATIO:
                     flag(
                         WARN,
                         "length_off",
@@ -526,7 +549,8 @@ def build_quality_report(
         add_issue(
             WARN,
             "qc_issue",
-            "重构阶段质检记录：" + "；".join(str(x) for x in progress["qc_issues"][:10]),
+            "重构阶段质检记录："
+            + "；".join(str(x) for x in progress["qc_issues"][:MAX_QC_ISSUE_PREVIEW]),
         )
     if progress.get("pre_stitch_issues"):
         add_issue(
@@ -535,7 +559,7 @@ def build_quality_report(
             "批次质检仍有未消除的问题："
             + "；".join(
                 str(i.get("message") if isinstance(i, dict) else i)
-                for i in progress["pre_stitch_issues"][:10]
+                for i in progress["pre_stitch_issues"][:MAX_QC_ISSUE_PREVIEW]
             ),
         )
     if progress.get("auto_rewrite_log"):
@@ -549,7 +573,7 @@ def build_quality_report(
     if progress.get("stitch_failures"):
         preview = "；".join(
             f"{x.get('boundary')}: {x.get('error')}"
-            for x in progress["stitch_failures"][:5]
+            for x in progress["stitch_failures"][:MAX_STITCH_FAILURE_PREVIEW]
             if isinstance(x, dict)
         )
         add_issue(
@@ -577,7 +601,8 @@ def build_quality_report(
         add_issue(
             WARN,
             "config_drift",
-            "续跑时配置不一致：" + "；".join(str(x) for x in progress["config_drift"][:10]),
+            "续跑时配置不一致："
+            + "；".join(str(x) for x in progress["config_drift"][:MAX_QC_ISSUE_PREVIEW]),
         )
 
     issues.sort(key=lambda i: 0 if i["severity"] == BAD else 1)
@@ -630,8 +655,8 @@ def build_quality_report(
             "stitch_max_rate": stitch["max"],
             "issues_by_severity": counts,
         },
-        "issues": issues[:200],
-        "issues_truncated": len(issues) > 200,
+        "issues": issues[:MAX_ISSUES_REPORT],
+        "issues_truncated": len(issues) > MAX_ISSUES_REPORT,
         "chapters": rows,
         "duplicates": duplicates,
         "stitch": stitch,
