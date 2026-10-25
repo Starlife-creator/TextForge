@@ -166,3 +166,30 @@ async def history_clear():
     except Exception as e:
         raise HTTPException(500, f"清空失败：{e}")
     return {"status": "cleared"}
+
+
+def export_history() -> dict:
+    """导出全量历史注册表（纯同步，供线程池调用）。条目落库时已脱敏。"""
+    reg = _load()
+    entries = sorted(
+        reg["entries"].values(),
+        key=lambda e: e.get("updated_at", ""),
+        reverse=True,
+    )
+    return {
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "count": len(entries),
+        "entries": entries,
+    }
+
+
+@router.get("/api/history/export")
+async def history_export():
+    """#17：把历史注册表导出为 JSON 附件下载（备份/迁移用，不含 progress 正文）。"""
+    from fastapi.responses import JSONResponse
+    data = await asyncio.to_thread(export_history)
+    filename = f"textforge-history-{time.strftime('%Y%m%d-%H%M%S')}.json"
+    return JSONResponse(
+        content=data,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
