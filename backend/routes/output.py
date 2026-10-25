@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from routes import state
+from utils.errors import raise_internal_error
 
 logger = logging.getLogger("textforge")
 
@@ -242,5 +243,5 @@ async def versions_restore(payload: dict = Body(...)):
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
-        logger.exception("[versions] 恢复失败")
-        raise HTTPException(500, f"恢复失败：{e}")
+        # #6：500 不回传内部细节，异常已由 logger.exception 记录。
+        raise raise_internal_error(e, "版本恢复失败，详情请查看后端日志", "versions_restore")

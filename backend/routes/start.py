@@ -4,6 +4,7 @@ from routes import state
 from models.start_request import StartRequest
 from routes.pipeline_runner import run_pipeline
 from utils.paths import validate_request_paths, PathValidationError
+from utils.errors import raise_internal_error
 
 router = APIRouter()
 
@@ -26,7 +27,8 @@ async def estimate(req: StartRequest):
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
-        raise HTTPException(500, f"预估失败：{e}")
+        # #6：500 不回传内部细节。
+        raise raise_internal_error(e, "规模预估失败，详情请查看后端日志", "estimate_run")
 
 
 @router.post("/api/start")
