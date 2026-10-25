@@ -70,6 +70,10 @@ jobs:
       - name: 前端构建
         run: npm run build
 
+      # #24：前端依赖漏洞扫描，高危漏洞阻断合并（与后端 pip-audit、Rust cargo audit 对齐）。
+      - name: 前端依赖漏洞扫描 (npm audit)
+        run: npm audit --audit-level high
+
       # tauri-build 的构建脚本会校验 externalBin 指向的文件**存在**（供打包配置解析），
       # 找不到就直接失败。此前这个 job 靠「先真构建一遍 sidecar」顺带满足它，
       # 但 cargo check / cargo test 根本不会执行那个 exe —— 放个占位文件即可，
@@ -89,9 +93,15 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
   # ------------------------------------------------------------ 后端单元/回归/代码质量
-  backend-unit:
-    name: 后端单测 / 回归 / 事件流 / 代码质量
-    runs-on: windows-latest
+  # #16：跨平台矩阵。后端纯 Python 路径（winreg 读取包在 try/except 内，非 Windows
+  # 走本地化名兜底），Ubuntu/macOS 与 Windows 同口径跑 lint/类型/pytest/回归。
+  backend-check:
+    name: 后端单测 / 回归 / 事件流 / 代码质量 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - name: 检出代码
@@ -109,11 +119,9 @@ jobs:
         run: |
           cd backend
           python -m venv venv
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           # 一律用 `python -m pip`：Windows 上正被执行的 pip.exe 是自己，就地升级会因
           # 无法替换在用的可执行文件而失败（pip 的报错原文也让你改用这种形式）。
-          # 上一轮直接写 `pip install --upgrade pip`，runner 镜像里 pip 一有小版本更新，
-          # 两条流水线就会同时卡在「准备虚拟环境」这一步，后端闸门全被跳过。
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
@@ -121,21 +129,21 @@ jobs:
         shell: bash
         run: |
           cd backend
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           ruff check .
 
       - name: 后端类型检查 (mypy)
         shell: bash
         run: |
           cd backend
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           mypy --config-file mypy.ini .
 
       - name: pytest
         shell: bash
         run: |
           cd backend
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           python -m pytest tests -q
 
       # 脚本形态而非 pytest 收集：这两个文件在模块顶层执行并自行退出码。
@@ -143,9 +151,18 @@ jobs:
         shell: bash
         run: |
           cd backend
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           python regression_test.py
           python test_event_stream.py
+
+      # #24：后端依赖漏洞扫描，高危漏洞直接阻断合并。锁文件口径见 #14。
+      - name: 后端依赖漏洞扫描 (pip-audit)
+        shell: bash
+        run: |
+          cd backend
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
+          python -m pip install pip-audit
+          pip-audit --desc on
 
   # ------------------------------------------------------------------ 端到端
   e2e:
@@ -215,3 +232,9 @@ jobs:
 
       - name: Rust 编译检查
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      # #24：Rust 依赖漏洞扫描，高危漏洞阻断合并。cargo-audit 安装后在 src-tauri 执行。
+      - name: Rust 依赖漏洞扫描 (cargo audit)
+        run: |
+          cargo install cargo-audit
+          cargo audit --deny warnings --manifest-path src-tauri/Cargo.toml
