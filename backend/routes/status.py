@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 from pathlib import Path
 from collections import OrderedDict
-import json, logging, os
+import json, logging, os, re
 from routes import state
 from utils.progress_io import is_completed
 from utils.redact import redact
@@ -20,6 +20,9 @@ _PROGRESS_CACHE: "OrderedDict[str, tuple[tuple[int, int], dict]]" = OrderedDict(
 # 摘要预览缓存：按 (mtime_ns, size) 缓存前 200 字预览
 _MAX_SUMMARY_CACHE = 32
 _SUMMARY_CACHE: "OrderedDict[str, tuple[tuple[int, int], str]]" = OrderedDict()
+
+# #9：对照稿文件名严格白名单 chapter_<非分隔符>.comparison.md，禁止 ../ 与 \\。
+_COMPARISON_NAME_RE = re.compile(r"^chapter_[^/\\]+\.comparison\.md$")
 
 
 def _read_progress_cached(path: Path) -> dict:
@@ -262,9 +265,18 @@ async def comparisons(output_path: str, name: str | None = None):
         return {"items": []} if name is None else {"items": []}
 
     if name is not None:
-        # 单文件懒加载
-        f = comp_dir / name
-        if f.is_file() and f.suffix.lower() == ".md" and f.name.startswith("chapter_"):
+        # #9 路径校验加固：严格正则白名单 + resolve 后前缀断言，杜绝 ../ 穿越与
+        # 符号链接逃逸到 00_comparison 目录之外（此前仅靠 startswith 与后缀弱校验）。
+        if not _COMPARISON_NAME_RE.match(name):
+            return {"items": []}
+        try:
+            f = (comp_dir / name).resolve()
+            base = comp_dir.resolve()
+            if not str(f).startswith(str(base) + os.sep):
+                return {"items": []}
+        except OSError:
+            return {"items": []}
+        if f.is_file() and f.suffix.lower() == ".md":
             return {"items": [{"name": f.name, "text": f.read_text(encoding='utf-8', errors='replace')}]}
         return {"items": []}
 

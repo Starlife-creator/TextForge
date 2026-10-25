@@ -114,7 +114,7 @@ def phase4_finalize(output_path: Path, progress: dict, req):
     for ch in original_chapters:
         try:
             ch_file = find_reconstructed_chapter(output_path, ch['id'], progress)
-            merged_texts.append(ch_file.read_text(encoding='utf-8', newline=''))
+            merged_texts.append(ch_file.read_text(encoding='utf-8'))
         except FileNotFoundError:
             if ch.get('is_empty'): merged_texts.append("")
             else: raise

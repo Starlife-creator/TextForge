@@ -8,9 +8,11 @@
 import os, subprocess, sys
 from fastapi import APIRouter, HTTPException, Body
 from core.budget import blueprint_accept_max_chars
+from core.refactor import REGEN_MAX_PER_CHAPTER
 from routes import state
 from pathlib import Path
 from utils.atomic import atomic_write_text, atomic_write_json as _atomic_write
+from utils.errors import raise_internal_error
 import json
 
 router = APIRouter()
@@ -132,7 +134,8 @@ async def open_output(payload: dict = Body(...)):
         else:
             subprocess.Popen(["xdg-open", str(p)])
     except Exception as e:
-        raise HTTPException(500, f"打开目录失败: {e}")
+        # #6 错误信息泄露：500 不对客户端回传异常细节，仅记录到本地日志。
+        raise raise_internal_error(e, "打开目录失败，请检查系统文件管理器", "open_output")
     return {"status": "opened"}
 
 @router.post("/api/export/force")
@@ -184,13 +187,32 @@ async def regen_chapter(payload: dict = Body(...)):
                       for cid in b.get('chapter_ids', []))
         if not allowed:
             raise HTTPException(422, f"章节 {chapter_id} 不在当前待验收批次内")
+        # #3 单章重生成次数熔断：达到上限拒绝再次驳回，避免重复计费。
+        regen_count = progress.get('regen_count') or {}
+        used = int(regen_count.get(str(chapter_id), 0) or 0)
+        if used >= REGEN_MAX_PER_CHAPTER:
+            raise HTTPException(
+                409,
+                f"章节 {chapter_id} 已达重写上限（{REGEN_MAX_PER_CHAPTER} 次），"
+                "请人工定稿或停止任务")
     from core.refactor import regen_single_chapter
     try:
         new_text = await regen_single_chapter(req, output_path, str(chapter_id))
     except ValueError as e:
         raise HTTPException(409, str(e))
     except Exception as e:
-        raise HTTPException(500, f"单章重生成失败: {e}")
+        # #6：500 不回传内部异常细节，详情进日志。
+        raise raise_internal_error(e, "单章重生成失败，详情请查看后端日志", "regen_chapter")
+    # 成功后登记单章重写次数（与主路径整轮护栏口径一致）。
+    async with state.progress_lock:
+        try:
+            updated = json.loads(progress_path.read_text(encoding='utf-8-sig'))
+        except (json.JSONDecodeError, OSError):
+            updated = progress
+        updated.setdefault('regen_count', {})
+        cid = str(chapter_id)
+        updated['regen_count'][cid] = int(updated['regen_count'].get(cid, 0)) + 1
+        _atomic_write(progress_path, updated)
     return {"status": "regenerated", "chapter_id": chapter_id, "preview": new_text[:80]}
 
 @router.post("/api/accept")

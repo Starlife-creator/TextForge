@@ -29,6 +29,10 @@ STORY_MEMO_MARK = "【前情摘要（仅用于保持事实一致）】"
 # 自动重写只兜「结构性硬伤」：每批最多一次，整轮有上限，避免坏模型无限烧钱。
 AUTO_REWRITE_MAX_PER_RUN = 3
 
+# #3 成本控制·重写上限：逐章验收门单章重生成次数上限，与主路径整轮 3 次护栏
+# 对齐。达到上限端点返回 409，提示人工定稿或停止任务，防止同一章反复驳回烧钱。
+REGEN_MAX_PER_CHAPTER = 3
+
 # 逐章验收门放行时，必须从磁盘**并回内存**的键。
 # accepted_batches 是用户的选择；batch_qc / pre_stitch_issues 是「单章重生成」
 # （/api/regen_chapter）刷新后写盘的质检结论 —— 流水线随后会把内存 progress 整份写回，
@@ -278,7 +282,7 @@ async def regen_single_chapter(req, output_path, chapter_id):
     split_file = output_path / "02_workspace/split" / f"{chapter_id}.txt"
     if not split_file.exists():
         raise ValueError(f"章节原始文件不存在: chapter_{chapter_id}")
-    batch_content = split_file.read_text(encoding='utf-8', newline='')
+    batch_content = split_file.read_text(encoding='utf-8')
     try:
         blueprint_text = (output_path / "Story_Bible.md").read_text(encoding='utf-8')
     except OSError:
@@ -362,7 +366,7 @@ def _effective_concurrency(req, gates) -> int:
 
 def _read_optional(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8", newline="")
+        return path.read_text(encoding="utf-8")
     except OSError:
         return ""
 
@@ -557,7 +561,7 @@ async def _request_refactor_text(client, req, output_path, blueprint_text,
             f"progress.json 很可能来自不兼容的旧版本，建议换一个输出目录重跑")
     batch_content = "\n\n".join(
         (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file'])
-        .read_text(encoding='utf-8', newline='')
+        .read_text(encoding='utf-8')
         for cid in chapter_ids
     )
     prompt = _build_refactor_prompt(
@@ -969,7 +973,7 @@ def _write_snapshot_finals(output_path, progress):
         if not src.exists():
             logger.warning(f"[snapshot] 缺失最终稿，跳过章 {out_id}: {src.name}")
             continue
-        atomic_write_text(snap_dir / f"chapter_{out_id}.txt", src.read_text(encoding='utf-8', newline=''))
+        atomic_write_text(snap_dir / f"chapter_{out_id}.txt", src.read_text(encoding='utf-8'))
         written += 1
     return written
 
@@ -999,8 +1003,8 @@ def _write_comparison_outputs(output_path, progress):
             counts["skipped"] += 1
             logger.warning(f"[comparison] 缺失文件，跳过章 {out_id}: {original_file.name}/{recon_file.name}")
             continue
-        original = original_file.read_text(encoding='utf-8', newline='')
-        reconstructed = recon_file.read_text(encoding='utf-8', newline='')
+        original = original_file.read_text(encoding='utf-8')
+        reconstructed = recon_file.read_text(encoding='utf-8')
         _write_chapter_comparison(comp_dir, out_id, original, reconstructed)
         counts["written"] += 1
     return counts
@@ -1034,7 +1038,7 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
         recon_file = output_path / "02_workspace/reconstructed" / f"chapter_{cid}.txt"
         preview = ""
         try:
-            preview = recon_file.read_text(encoding='utf-8', newline='')[:80]
+            preview = recon_file.read_text(encoding='utf-8')[:80]
         except OSError:
             preview = ""
         chapters.append({"id": cid, "preview": preview})
@@ -1073,7 +1077,7 @@ def _run_qc(output_path, progress):
         if not recon_file.exists():
             issues.append(f"章 {out_id}: 缺少重构稿（reconstructed/chapter_{out_id}.txt）")
             continue
-        text = recon_file.read_text(encoding='utf-8', newline='').strip()
+        text = recon_file.read_text(encoding='utf-8').strip()
         if not text:
             issues.append(f"章 {out_id}: 为空章")
             continue

@@ -245,7 +245,7 @@ def _split_virtual_chapters(chapters, split_dir: Path, chars: float) -> tuple[li
     new_chapters = []
     virtual_map = []
     for ch in chapters:
-        text = (split_dir / f"{ch['id']}.txt").read_text(encoding='utf-8', newline='')
+        text = (split_dir / f"{ch['id']}.txt").read_text(encoding='utf-8')
         if len(text) >= trigger:
             segments = _split_by_paragraph(text, int(max_virtual))
             for i, seg in enumerate(segments):
@@ -528,7 +528,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
             await _wait_pause()
 
             batch_content = "\n\n".join(
-                (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file']).read_text(encoding='utf-8', newline='')
+                (output_path / progress['chapters'][_find_idx(progress['chapters'], cid)]['split_file']).read_text(encoding='utf-8')
                 for cid in chapter_ids
             )
             # P1.4：仅当设置了 diagnose_json 路径时才追加结构化 JSON 契约（缺省关）
@@ -664,7 +664,7 @@ def _load_batches(chapters, output_path, body_token_limit,
                 gk,
                 [ch['id'] for ch in glist],
                 sum(estimate_tokens((output_path / ch['split_file'])
-                                    .read_text(encoding='utf-8', newline='')) for ch in glist),
+                                    .read_text(encoding='utf-8')) for ch in glist),
             )
             for gk, glist in groups
         ],
@@ -701,7 +701,7 @@ def _build_overlap(chapters, prev_chapter_ids, output_path, overlap_limit):
         ch = chapters[_find_idx(chapters, cid)]
         if ch.get('is_empty'):
             continue
-        text = (output_path / ch['split_file']).read_text(encoding='utf-8', newline='')
+        text = (output_path / ch['split_file']).read_text(encoding='utf-8')
         if ch.get('is_virtual'):
             orig = ch.get('original_id')
             order = ch.get('order', 0)

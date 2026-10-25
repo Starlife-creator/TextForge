@@ -1,12 +1,22 @@
 import json, re, logging
 SENSITIVE_KEYS = {'api_key', 'token', 'authorization', 'password', 'secret'}
 
-# 字符串内嵌密钥（如 "api_key=xxx"、"token: xxx"、"Bearer xxx"）的脱敏模式；
-# 日志 SensitiveFilter 与 redact 兜底共用同一口径，避免两侧正则漂移。
+# 字符串内嵌密钥（如 "api_key=xxx"、"token: xxx"、"Bearer xxx"、URL 查询参数
+# "?api_key=xxx&token=yyy"）的脱敏模式；日志 SensitiveFilter 与 redact 兜底共用同一
+# 口径，避免两侧正则漂移。分隔符含 ? & 以覆盖 URL query；值截断字符含 & 避免连带
+# 脱敏到下一个参数。
 _SECRET_PATTERN = re.compile(
-    r'(api[_-]?key|token|authorization|password|secret)(["\s:=]+)([^\s",}]+)',
+    r'(api[_-]?key|token|authorization|password|secret)(["\s:=?&]+)([^\s",}&]+)',
     re.IGNORECASE,
 )
+# Bearer 形态：Authorization: Bearer <token>，整段凭据在 Bearer 之后。
+_BEARER_PATTERN = re.compile(r'(Bearer\s+)([^\s",}&]+)', re.IGNORECASE)
+
+
+def _mask_text(text: str) -> str:
+    text = _BEARER_PATTERN.sub(r"\1***", text)
+    return _SECRET_PATTERN.sub(r"\1\2***", text)
+
 
 def redact(data):
     if isinstance(data, dict):
@@ -16,7 +26,7 @@ def redact(data):
     # 字符串元素（如 config_drift 里 "模型 … api_key=xxx" 的人类可读差异串）也要兜底，
     # 否则历史残留明文会原样进入状态响应与 runs.json。
     if isinstance(data, str):
-        return _SECRET_PATTERN.sub(r'\1\2***', data)
+        return _mask_text(data)
     return data
 
 class SensitiveFilter(logging.Filter):
@@ -32,8 +42,11 @@ class SensitiveFilter(logging.Filter):
             obj = json.loads(msg)
             record.msg = json.dumps(redact(obj), ensure_ascii=False)
         except (json.JSONDecodeError, TypeError):
-            msg = _SECRET_PATTERN.sub(r'\1\2***', msg)
-            record.msg = msg
+            record.msg = _mask_text(msg)
+        # #12：异常栈文本（record.exc_text）是独立于消息的第二段落盘内容，
+        # 异常消息里以非常规格式拼接的密钥在这里再跑一遍正则兜底。
+        if getattr(record, "exc_text", None):
+            record.exc_text = _mask_text(record.exc_text)
         # 消息已合并进 record.msg，args 必须清空，否则格式化阶段会二次插值。
         record.args = ()
         return True
