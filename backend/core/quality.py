@@ -366,6 +366,58 @@ def has_blocking_issues(issues) -> bool:
     return any(i.get("severity") == BAD for i in issues or [])
 
 
+# ---- #13 章节健康分最小闭环 ----
+# 0~100 分：满分 100，按严重度与问题码扣分；空章直接 0 分。评分规则只机械可解释，
+# 不做文学质量判断。阈值后续用 quality_report.json 积累的真机分布回填。
+HEALTH_MAX = 100
+HEALTH_GOOD_MIN = 85
+HEALTH_WARN_MIN = 60
+HEALTH_BAD_PENALTY = 40
+HEALTH_WARN_PENALTY = 10
+# 问题码专属扣分：硬伤码比通用严重度扣分更细，避免「一个 BAD 抵 40 分」一刀切。
+HEALTH_CODE_PENALTY: dict[str, int] = {
+    "empty_chapter": 100,
+    "content_collapse": 35,
+    "content_expansion": 35,
+    "placeholder": 30,
+    "residual_marker": 30,
+    "forbidden_canon": 30,
+    "duplicate_chapter": 30,
+    "cross_chapter_duplicate": 30,
+}
+
+
+def health_grade(score: int) -> str:
+    """健康分档位：good ≥85，warn 60~84，bad <60。"""
+    if score >= HEALTH_GOOD_MIN:
+        return "good"
+    if score >= HEALTH_WARN_MIN:
+        return "warn"
+    return "bad"
+
+
+def chapter_health_score(row: dict, issues: list[dict] | None = None) -> int:
+    """按章节行与其问题清单算健康分（0~100），扣分制、不封顶下界。
+
+    - 空章（empty_chapter）直接 0 分；
+    - BAD 问题通用 -40、WARN 通用 -10；问题码专属扣分在严重度之上叠加；
+    - 篇幅落在提醒带之外再 -8（与既有 length_off 阈值同源）。
+    """
+    issues = list(issues or [])
+    score = HEALTH_MAX
+    if row.get("status") == "skipped":
+        return 0
+    # 篇幅偏离额外扣分（不与问题码重复叠加到致命程度）
+    ratio = row.get("ratio")
+    if isinstance(ratio, (int, float)) and (ratio < WARN_LOW_RATIO or ratio > WARN_HIGH_RATIO):
+        score -= 8
+    for issue in issues:
+        code = str(issue.get("code") or "")
+        score -= HEALTH_CODE_PENALTY.get(code, HEALTH_BAD_PENALTY if issue.get("severity") == BAD
+                                          else HEALTH_WARN_PENALTY)
+    return max(0, min(HEALTH_MAX, score))
+
+
 def build_quality_report(
     *,
     chapters: list[dict],
@@ -387,18 +439,21 @@ def build_quality_report(
     issues: list[dict] = []
     rows: list[dict] = []
     recon_texts: dict[str, str] = {}
+    # #13：按章节归集问题，供健康分逐章扣分；跨章重复问题在循环结束后补入。
+    chapter_issues: dict[str, list[dict]] = {}
 
     def add_issue(severity: str, code: str, message: str, *, chapter_id=None,
                   evidence: str = "") -> None:
-        issues.append(
-            {
-                "severity": severity,
-                "code": code,
-                "chapter_id": None if chapter_id is None else str(chapter_id),
-                "message": message,
-                "evidence": evidence,
-            }
-        )
+        entry = {
+            "severity": severity,
+            "code": code,
+            "chapter_id": None if chapter_id is None else str(chapter_id),
+            "message": message,
+            "evidence": evidence,
+        }
+        issues.append(entry)
+        if chapter_id is not None:
+            chapter_issues.setdefault(str(chapter_id), []).append(entry)
 
     total_orig = 0
     total_recon = 0
@@ -431,6 +486,8 @@ def build_quality_report(
                     "ratio": None,
                     "status": "skipped",
                     "issue_codes": [],
+                    "health_score": 0,
+                    "health_grade": "bad",
                 }
             )
             continue
@@ -516,34 +573,41 @@ def build_quality_report(
                         f"第 {cid} 章（{label}）篇幅偏离较大：{orig_len} 字 → {recon_len} 字（{ratio:.0%}）",
                     )
 
-        rows.append(
-            {
-                "id": cid,
-                "title": label,
-                "original_chars": orig_len,
-                "reconstructed_chars": recon_len,
-                "ratio": ratio,
-                "status": BAD if chapter_bad else (WARN if chapter_warn else "ok"),
-                "issue_codes": codes,
-            }
-        )
+        row = {
+            "id": cid,
+            "title": label,
+            "original_chars": orig_len,
+            "reconstructed_chars": recon_len,
+            "ratio": ratio,
+            "status": BAD if chapter_bad else (WARN if chapter_warn else "ok"),
+            "issue_codes": codes,
+        }
+        row["health_score"] = chapter_health_score(row, chapter_issues.get(cid, []))
+        row["health_grade"] = health_grade(row["health_score"])
+        rows.append(row)
 
     duplicates = find_duplicate_pairs(recon_texts)
     if duplicates:
         by_id = {r["id"]: r for r in rows}
         for d in duplicates:
-            add_issue(
-                BAD,
-                "cross_chapter_duplicate",
+            dup_msg = (
                 f"第 {d['a']} 章与第 {d['b']} 章存在 {d['shared_shingles']} 处相同长片段"
-                f"（占较短章 {d['containment']:.0%}）",
+                f"（占较短章 {d['containment']:.0%}）"
             )
+            add_issue(BAD, "cross_chapter_duplicate", dup_msg)
             for cid in (d["a"], d["b"]):
                 row = by_id.get(cid)
                 if row is not None:
                     if "duplicate" not in row["issue_codes"]:
                         row["issue_codes"].append("duplicate")
                     row["status"] = BAD
+                    chapter_issues.setdefault(cid, []).append(
+                        {"severity": BAD, "code": "cross_chapter_duplicate",
+                         "chapter_id": cid, "message": dup_msg, "evidence": ""}
+                    )
+                    row["health_score"] = chapter_health_score(
+                        row, chapter_issues.get(cid, []))
+                    row["health_grade"] = health_grade(row["health_score"])
 
     if progress.get("qc_issues"):
         add_issue(
@@ -620,6 +684,17 @@ def build_quality_report(
     def count_code(code: str) -> int:
         return sum(1 for i in issues if i["code"] == code)
 
+    # #13：健康分聚合与指标快照。issues_total 与 issue_code_counts 对**全量**问题计数，
+    # 不受报告 issues 列表 MAX_ISSUES_REPORT 截断影响，供真机分布积累后回填阈值。
+    scores = [r["health_score"] for r in rows]
+    avg_health = round(sum(scores) / len(scores), 1) if scores else None
+    health_good = sum(s >= HEALTH_GOOD_MIN for s in scores)
+    health_warn = sum(HEALTH_WARN_MIN <= s < HEALTH_GOOD_MIN for s in scores)
+    health_bad = sum(s < HEALTH_WARN_MIN for s in scores)
+    code_counts: dict[str, int] = {}
+    for i in issues:
+        code_counts[i["code"]] = code_counts.get(i["code"], 0) + 1
+
     report = {
         "schema": SCHEMA,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -654,6 +729,13 @@ def build_quality_report(
             "stitch_p90_rate": stitch["p90"],
             "stitch_max_rate": stitch["max"],
             "issues_by_severity": counts,
+            "issues_total": len(issues),
+            "issue_code_counts": code_counts,
+            "avg_health": avg_health,
+            "health_trend": [r["health_score"] for r in rows],
+            "health_good": health_good,
+            "health_warn": health_warn,
+            "health_bad": health_bad,
         },
         "issues": issues[:MAX_ISSUES_REPORT],
         "issues_truncated": len(issues) > MAX_ISSUES_REPORT,
