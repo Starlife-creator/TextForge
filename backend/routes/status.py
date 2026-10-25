@@ -65,19 +65,23 @@ async def status(output_path: str | None = None):
     用途：前端刷新或 SSE 重连后恢复 UI（阶段、暂停态、待确认蓝图、用量、错误）。"""
     target = output_path or state.current_output_path
     paused = not state.pause_event.is_set()
+    # #2：闸门等待态只活在内存（与心跳同口径），无 progress.json 时也必须能上报。
+    gate_mem = {"active_gate": state.active_gate(),
+                "waiting_seconds": state.gate_wait_seconds()}
     if not target:
         return {"pipeline_running": state.pipeline_running, "paused": paused,
-                "run_id": state.current_run_id, "has_progress": False}
+                "run_id": state.current_run_id, "has_progress": False, **gate_mem}
 
     progress_path = Path(target) / "progress.json"
     if not progress_path.exists():
         return {"pipeline_running": state.pipeline_running, "paused": paused,
-                "run_id": state.current_run_id, "has_progress": False}
+                "run_id": state.current_run_id, "has_progress": False, **gate_mem}
     try:
         progress = _read_progress_cached(progress_path)
     except (json.JSONDecodeError, OSError) as e:
         return {"pipeline_running": state.pipeline_running, "paused": paused,
-                "has_progress": True, "progress_error": f"progress.json 无法读取: {e}"}
+                "has_progress": True, "progress_error": f"progress.json 无法读取: {e}",
+                **gate_mem}
 
     batches = progress.get("batches", [])
     # #2 章级进度：按逻辑章（虚拟章组折叠到父章）统计总数与已重构数
@@ -117,6 +121,12 @@ async def status(output_path: str | None = None):
             "phase3_done": sum(1 for b in batches if b["status"] == "phase3_done"),
         },
         "error_logs": progress.get("error_logs", [])[-5:],
+        # #2：当前等待闸门、已等待时长、本轮是否发生过闸门超时。
+        "active_gate": state.active_gate(),
+        "waiting_seconds": state.gate_wait_seconds(),
+        "gate_timed_out": bool(progress.get("gate_timed_out")),
+        "gate_timeout_gate": progress.get("gate_timeout_gate"),
+        "gate_wait_seconds": progress.get("gate_wait_seconds"),
     }
 
     # 仅在等待蓝图确认时回传蓝图全文，供前端重新弹窗

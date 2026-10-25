@@ -1054,9 +1054,9 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
     sse_emit("accept_ready", {"batch_id": batch['batch_id'], "chapters": chapters,
         "accepted": progress.get('accepted_batches', [])}, run_id)
     logger.info(f"[accept] 批次 {batch['batch_id']} 待验收（{len(chapters)} 章）")
-    while not state.accept_confirm.is_set():
-        if state.stop_requested: raise asyncio.CancelledError()
-        await asyncio.sleep(1.0)
+    await state.wait_gate(
+        state.accept_confirm, gate=state.GATE_ACCEPT,
+        progress=progress, progress_path=progress_path, tick=1.0)
     # ACCEPT_ABSORB_KEYS 里有 batch_qc / pre_stitch_issues 的原因：单章重生成
     # （/api/regen）会把刷新后的质检结论写进 progress.json，而流水线紧接着就把内存
     # progress 整份写回磁盘。不并回来，用户重写掉的旧硬伤会被内存里的旧结论覆盖 ——
@@ -1105,9 +1105,9 @@ def _run_qc(output_path, progress):
 async def _wait_qc_confirm(progress, progress_path, run_id):
     """质检决策等待：等待用户选择强制导出或停止。"""
     state.qc_confirm.clear()
-    while not state.qc_confirm.is_set():
-        if state.stop_requested: raise asyncio.CancelledError()
-        await asyncio.sleep(1.0)
+    await state.wait_gate(
+        state.qc_confirm, gate=state.GATE_QC,
+        progress=progress, progress_path=progress_path, tick=1.0)
 
 
 async def _wait_pause():

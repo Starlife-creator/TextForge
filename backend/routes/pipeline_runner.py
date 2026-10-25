@@ -107,6 +107,13 @@ async def run_pipeline(req, run_id: str):
         sse_emit("error", {"kind": "gate_read_failed", "code": "progress_unreadable",
                            "message": str(e)}, run_id)
         await log_error(progress_path, e, progress)
+    except state.GateTimeoutError as e:
+        # #2 闸门超时：事件丢失/前端未弹窗导致的永久挂起由超时兜底，安全暂停并留痕。
+        logger.warning(f"[run_pipeline] 闸门超时暂停 run_id={run_id}: {e}")
+        sse_emit("gate_timeout", {"gate": progress.get("gate_timeout_gate") if progress else None,
+                                  "waiting_seconds": progress.get("gate_wait_seconds") if progress else None,
+                                  "message": str(e)}, run_id)
+        await log_error(progress_path, e, progress)
     except asyncio.CancelledError:
         logger.info(f"[run_pipeline] 已停止 run_id={run_id}")
         sse_emit("stopped", {"incomplete": True}, run_id)
@@ -328,9 +335,10 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
 
     while True:
         _push_preview()
-        while not state.split_confirm.is_set() and not state.split_redo.is_set():
-            if state.stop_requested: raise asyncio.CancelledError()
-            await asyncio.sleep(0.5)
+        await state.wait_gate(
+            state.split_confirm, alternative=state.split_redo,
+            gate=state.GATE_SPLIT, progress=progress, progress_path=progress_path,
+            tick=0.5, release_events=(state.split_redo,))
         if state.split_confirm.is_set():
             break
         # 用户要求按自定义标记重新拆分：原地重拆后重新预览（不退出本门）
@@ -370,9 +378,9 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     state.fix_review_confirm.clear()
     sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
     logger.info(f"[fix_review] 断层勾选等待确认（{len(gaps)} 项）run_id={run_id}")
-    while not state.fix_review_confirm.is_set():
-        if state.stop_requested: raise asyncio.CancelledError()
-        await asyncio.sleep(1.0)
+    await state.wait_gate(
+        state.fix_review_confirm, gate=state.GATE_FIX,
+        progress=progress, progress_path=progress_path, tick=1.0)
     # 用户勾选的断层清单由控制端点写入 progress.json，这里并回内存（否则会被本循环的写盘覆盖）
     await state.absorb_gate_result(progress, progress_path, ['fix_list'])
     logger.info(f"[fix_review] 已吸收用户勾选 fix_list={progress.get('fix_list')}")
