@@ -7,7 +7,7 @@
 import codecs
 import os, sys, time, platform, json, asyncio, subprocess, threading
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Body, Query
+from fastapi import APIRouter, HTTPException, Body, Query, Response
 import httpx
 from routes import state
 from utils.appdir import data_dir
@@ -224,6 +224,25 @@ async def system_logs(lines: int = Query(200, ge=10, le=5000), offset: int = Que
     except OSError as e:
         # #6：500 不回传内部细节，异常进日志。
         raise raise_internal_error(e, "读取日志失败，详情请查看后端日志", "system_logs")
+
+
+@router.get("/api/system/diagnostic_bundle")
+async def system_diagnostic_bundle(output_path: str | None = Query(None)):
+    """#18：下载后端诊断包（系统信息 + 日志尾部 + progress 脱敏摘要 + 质量报告）。
+
+    供「上报问题」一键打包；不下载 progress.json 全文，密钥/模型配置一律脱敏。
+    打包属磁盘读取 + zip 压缩，经线程池执行，不阻塞事件循环。
+    """
+    from utils.diagnostics import build_diagnostic_bundle
+    blob = await asyncio.to_thread(
+        build_diagnostic_bundle, output_path,
+        log_path=_path("LOG_PATH"),
+    )
+    filename = f"textforge-diagnostic-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    return Response(
+        content=blob, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/api/system/open")
