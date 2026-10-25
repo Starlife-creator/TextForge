@@ -143,7 +143,8 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
             ], return_exceptions=True)
 
             for batch, result in zip(wave, results, strict=False):
-                if isinstance(result, ContextOverflowError):
+                kind = classify_batch_result(result)
+                if kind == "overflow":
                     # 第 2 层：上下文超限 → 对半拆批重跑
                     parts = _split_batch_in_progress(
                         progress, batch, reason="overflow",
@@ -160,7 +161,7 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                             + "请调大模型上下文长度，或在导入时把该章拆成更小的文件。") from result
                     queue.extendleft(reversed(parts))
                     continue
-                if isinstance(result, ChapterBreakMissingError):
+                if kind == "contract":
                     # 第 4 层：小模型在长上下文里维持不住分隔符契约 → 同样降级拆批，
                     # 让每批章数更少、要吐的分隔符更少，而不是重发同样大小的请求碰运气。
                     parts = _split_batch_in_progress(
@@ -170,7 +171,7 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                         raise result  # 单章还失败：交给上层报错（此时拆无可拆）
                     queue.extendleft(reversed(parts))
                     continue
-                if isinstance(result, BaseException):
+                if kind == "raise":
                     raise result
 
                 output_files, batch_issues = result
@@ -368,6 +369,24 @@ def _effective_concurrency(req, gates) -> int:
         logger.info("[phase3] 逐章验收开启，强制串行")
         return 1
     return n
+
+
+def classify_batch_result(result) -> str:
+    """phase3 批次 gather 结果分类（#8：抽成纯函数便于状态机/恢复路径回归）。
+
+    返回：
+      - "overflow"：上下文超限，对半拆批重跑；
+      - "contract"：分隔符契约失败，拆批降级；
+      - "raise"：其余 BaseException，上抛终止本轮；
+      - "done"：成功产出（(output_files, issues) 元组或其他成功返回值）。
+    """
+    if isinstance(result, ContextOverflowError):
+        return "overflow"
+    if isinstance(result, ChapterBreakMissingError):
+        return "contract"
+    if isinstance(result, BaseException):
+        return "raise"
+    return "done"
 
 
 def _read_optional(path: Path) -> str:

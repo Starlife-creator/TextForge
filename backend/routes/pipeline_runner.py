@@ -308,8 +308,9 @@ def _load_or_init_progress(req, run_id, progress_path):
             existing['completed'] = False
             drifts = _config_drift(existing, req)
             if drifts:
-                # 记进 progress 供界面展示；不阻断（用户可能是有意换的）
-                existing.setdefault('config_drift', drifts)
+                # 记进 progress 供界面展示；不阻断（用户可能是有意换的）。
+                # 直接覆盖本次漂移：迁移回填的空列表会挡住 setdefault，旧漂移不应残留。
+                existing["config_drift"] = drifts
                 logger.warning(f"[run_pipeline] 续跑配置与上次不一致：{drifts}")
             logger.info(f"[run_pipeline] 恢复进度 phase={existing['current_phase']}")
             return existing
