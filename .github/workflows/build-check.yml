@@ -93,10 +93,11 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
   # ------------------------------------------------------------ 后端单元/回归/代码质量
-  # #16：跨平台矩阵。后端纯 Python 路径（winreg 读取包在 try/except 内，非 Windows
-  # 走本地化名兜底），Ubuntu/macOS 与 Windows 同口径跑 lint/类型/pytest/回归。
+  # #16：跨平台矩阵。pytest / ruff / mypy 为纯 Python 检查，三平台同口径执行；
+  # regression_test.py / test_event_stream.py 仍含 Windows 专属断言（%APPDATA%、winreg），
+  # 暂只在 Windows runner 运行，待脚本去平台耦合后再纳入 Ubuntu/macOS（#16 剩余项）。
   backend-check:
-    name: 后端单测 / 回归 / 事件流 / 代码质量 (${{ matrix.os }})
+    name: 后端单测 / 代码质量 (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -147,11 +148,13 @@ jobs:
           python -m pytest tests -q
 
       # 脚本形态而非 pytest 收集：这两个文件在模块顶层执行并自行退出码。
-      - name: 回归 / 事件流
+      # 仅 Windows：脚本内含 %APPDATA%/winreg 专属断言，去平台耦合前不在非 Windows 运行。
+      - name: 回归 / 事件流（Windows 专属）
+        if: matrix.os == 'windows-latest'
         shell: bash
         run: |
           cd backend
-          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
+          source venv/Scripts/activate
           python regression_test.py
           python test_event_stream.py
 
