@@ -10,7 +10,7 @@ from core.finalize import phase4_finalize
 from utils.atomic import atomic_write_json
 from utils.redact import redact
 from utils.version import VERSION
-from core.prompt_version import PROMPT_VERSION
+from core.prompt_registry import PROMPT_VERSION, stage_versions, load_registry
 
 logger = logging.getLogger("textforge")
 
@@ -246,10 +246,19 @@ def _config_drift(existing: dict, req) -> list[str]:
             str(existing["input_path"]) != str(req.input_path):
         diffs.append(f"输入路径已变更（{existing['input_path']} → {req.input_path}）")
 
-    # 提示词版本只影响尚未生成的阶段；旧 progress 没有该字段时无法判断，跳过。
-    prev_pv = existing.get("prompt_version")
-    if prev_pv and str(prev_pv) != PROMPT_VERSION:
-        diffs.append(f"提示词版本：{prev_pv} → {PROMPT_VERSION}")
+    # #7：逐阶段比对提示词版本；新 progress 存 prompt_versions 映射。
+    prev_versions = existing.get("prompt_versions") or {}
+    current_versions = stage_versions()
+    if prev_versions:
+        for stage, cur in current_versions.items():
+            prev = prev_versions.get(stage)
+            if prev is not None and str(prev) != str(cur):
+                diffs.append(f"提示词·{stage}：{prev} → {cur}")
+    else:
+        # 旧 progress 只有全局串：保留兼容比对；没有该字段则跳过（无法判断）。
+        prev_pv = existing.get("prompt_version")
+        if prev_pv and str(prev_pv) != PROMPT_VERSION:
+            diffs.append(f"提示词版本：{prev_pv} → {PROMPT_VERSION}")
 
     # 其余会影响产出的字段：只比较旧 progress 里确实存在的键
     for key, label in (
@@ -426,11 +435,15 @@ async def check_pause(run_id):
         sse_emit("resumed", {}, run_id)
 
 def init_progress(req, run_id):
+    # #7：启动期校验注册表条目齐全；缺失即 fail-fast，不静默退回内联旧文本。
+    load_registry()
     novel_name = req.novel_name or (
         Path(req.input_path).parent.name if req.input_mode == "single_file" else Path(req.input_path).name
     ) or "重构终稿"
     return {
-        "schema_version": VERSION, "prompt_version": PROMPT_VERSION, "run_id": run_id,
+        "schema_version": VERSION, "prompt_version": PROMPT_VERSION,
+        # #7：各阶段实际使用版本随 run 落盘，续跑时按阶段比对漂移。
+        "prompt_versions": stage_versions(), "run_id": run_id,
         "input_mode": req.input_mode,
         "input_format": req.input_format, "input_path": req.input_path, "output_path": req.output_path,
         "api_config": {"api_url": req.api_url, "model": req.model, "context_window": req.context_window},
