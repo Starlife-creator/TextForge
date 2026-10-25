@@ -5,14 +5,17 @@
 端点若也去写 current_phase，会与等待循环的写盘互相覆盖，且历史上曾错误地回退到
 'phase2'，导致断点恢复时蓝图被重新生成（见 routes/state.py:absorb_gate_result 注释）。
 """
-import os, subprocess, sys
+import asyncio, os, subprocess, sys
 from fastapi import APIRouter, HTTPException, Body
 from core.budget import blueprint_accept_max_chars
 from core.refactor import REGEN_MAX_PER_CHAPTER
 from routes import state
 from pathlib import Path
-from utils.atomic import atomic_write_text, atomic_write_json as _atomic_write
+from utils.atomic import atomic_write_text
 from utils.errors import raise_internal_error
+from utils.progress_io import (
+    load_progress_dict, save_progress_dict, ProgressUnreadable,
+)
 import json
 
 router = APIRouter()
@@ -56,8 +59,9 @@ async def split_confirm(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError) as e:
+            # #4：progress.json 读取与 JSON 解析移出事件循环（可达数十 MB）。
+            progress = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase0_confirm':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认拆分")
@@ -85,8 +89,9 @@ async def split_redo(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError) as e:
+            # #4：progress.json 读取与 JSON 解析移出事件循环（可达数十 MB）。
+            progress = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase0_confirm':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许重新拆分")
@@ -109,13 +114,14 @@ async def fix_confirm(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError) as e:
+            # #4：progress.json 读取与 JSON 解析移出事件循环（可达数十 MB）。
+            progress = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase1_fixreview':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认断层")
         progress['fix_list'] = fix_list
-        _atomic_write(progress_path, progress)
+        await asyncio.to_thread(save_progress_dict, progress_path, progress)
     state.fix_review_confirm.set()
     return {"status": "confirmed", "fix_list": fix_list}
 
@@ -150,13 +156,14 @@ async def export_force(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError) as e:
+            # #4：progress.json 读取与 JSON 解析移出事件循环（可达数十 MB）。
+            progress = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase3_qc':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许强制导出")
         progress['_qc_force'] = True
-        _atomic_write(progress_path, progress)
+        await asyncio.to_thread(save_progress_dict, progress_path, progress)
     state.qc_confirm.set()
     return {"status": "exporting"}
 
@@ -176,8 +183,9 @@ async def regen_chapter(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError) as e:
+            # #4：progress.json 读取与 JSON 解析移出事件循环（可达数十 MB）。
+            progress = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase3_accept':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许重生成")
@@ -206,13 +214,13 @@ async def regen_chapter(payload: dict = Body(...)):
     # 成功后登记单章重写次数（与主路径整轮护栏口径一致）。
     async with state.progress_lock:
         try:
-            updated = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError):
+            updated = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError):
             updated = progress
         updated.setdefault('regen_count', {})
         cid = str(chapter_id)
         updated['regen_count'][cid] = int(updated['regen_count'].get(cid, 0)) + 1
-        _atomic_write(progress_path, updated)
+        await asyncio.to_thread(save_progress_dict, progress_path, updated)
     return {"status": "regenerated", "chapter_id": chapter_id, "preview": new_text[:80]}
 
 @router.post("/api/accept")
@@ -226,8 +234,9 @@ async def accept(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError) as e:
+            # #4：progress.json 读取与 JSON 解析移出事件循环（可达数十 MB）。
+            progress = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         if progress.get('current_phase') != 'phase3_accept':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许验收")
@@ -235,7 +244,7 @@ async def accept(payload: dict = Body(...)):
         pend = progress.get('accept_pending_batch')
         if pend is not None and pend not in progress['accepted_batches']:
             progress['accepted_batches'].append(pend)
-        _atomic_write(progress_path, progress)
+        await asyncio.to_thread(save_progress_dict, progress_path, progress)
     state.accept_confirm.set()
     return {"status": "accepted"}
 
@@ -253,8 +262,9 @@ async def blueprint_confirm(payload: dict = Body(...)):
         if not progress_path.exists():
             raise HTTPException(409, "progress.json 不存在，可能输出目录已被清理")
         try:
-            progress = json.loads(progress_path.read_text(encoding='utf-8-sig'))
-        except (json.JSONDecodeError, OSError) as e:
+            # #4：progress.json 读取与 JSON 解析移出事件循环（可达数十 MB）。
+            progress = await asyncio.to_thread(load_progress_dict, progress_path)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
         # 只在 phase2_waiting 阶段允许确认
         if progress.get('current_phase') != 'phase2_waiting':
@@ -266,10 +276,11 @@ async def blueprint_confirm(payload: dict = Body(...)):
         if len(blueprint) < 100:
             raise HTTPException(422, "blueprint 过短")
         story_bible = Path(output_path) / "Story_Bible.md"
-        atomic_write_text(story_bible, blueprint)
+        # #4：同步原子写（含 fsync）移出事件循环线程。
+        await asyncio.to_thread(atomic_write_text, story_bible, blueprint)
         progress["blueprint_confirmed"] = True
         progress["blueprint_user_edited"] = user_edited
-        _atomic_write(progress_path, progress)
+        await asyncio.to_thread(save_progress_dict, progress_path, progress)
     
     state.blueprint_confirmed.set()
     return {"status": "confirmed"}

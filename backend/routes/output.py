@@ -8,6 +8,7 @@
 用户完全可能把输出目录设成桌面/文档/某个已有项目目录，一把梭会毁掉无关数据。
 """
 
+import asyncio
 import json
 import logging
 import shutil
@@ -86,7 +87,8 @@ async def output_inspect(output_path: str = Query(...)):
     """查看输出目录里的进度状态：是否可续跑、已完成批次、失败原因等。"""
     if not output_path.strip():
         raise HTTPException(422, "缺少 output_path")
-    return _summarize(output_path.strip())
+    # #4：progress.json 与质量报告的读取/解析移出事件循环。
+    return await asyncio.to_thread(_summarize, output_path.strip())
 
 
 @router.get("/api/output/quality")
@@ -99,9 +101,9 @@ async def output_quality(output_path: str = Query(...)):
     if not output_path.strip():
         raise HTTPException(422, "缺少 output_path")
     from core.quality import read_quality_report
-    report = read_quality_report(output_path.strip())
+    report = await asyncio.to_thread(read_quality_report, output_path.strip())
     if report is None:
-        raise HTTPException(404, _missing_report_detail(output_path.strip()))
+        raise HTTPException(404, await asyncio.to_thread(_missing_report_detail, output_path.strip()))
     return report
 
 
@@ -197,7 +199,15 @@ async def output_clear(payload: dict = Body(...)):
         raise HTTPException(
             400, "该目录不像 TextForge 输出目录（缺少 progress.json / 02_workspace），拒绝清空")
 
-    removed, failed = [], []
+    removed, failed = await asyncio.to_thread(_clear_artifacts, p)
+    logger.info(f"[output] 已清理输出目录 {output_path}：removed={removed} failed={failed}")
+    return {"status": "cleared", "removed": removed, "failed": failed}
+
+
+def _clear_artifacts(p: Path) -> tuple[list[str], list[str]]:
+    """白名单逐个删除产物；目录 rmtree / 文件 unlink 属阻塞磁盘 I/O，由线程池执行。"""
+    removed: list[str] = []
+    failed: list[str] = []
     for name in ARTIFACTS:
         target = p / name
         if not target.exists():
@@ -211,8 +221,7 @@ async def output_clear(payload: dict = Body(...)):
         except Exception as e:
             logger.warning(f"[output] 清理 {name} 失败: {e}")
             failed.append(name)
-    logger.info(f"[output] 已清理输出目录 {output_path}：removed={removed} failed={failed}")
-    return {"status": "cleared", "removed": removed, "failed": failed}
+    return removed, failed
 
 
 # ---------------- 成品版本管理（重跑前的整版快照 / 回滚） ----------------
@@ -223,7 +232,8 @@ async def versions_list(output_path: str = Query(...)):
     if not output_path.strip():
         raise HTTPException(422, "缺少 output_path")
     from core.versions import list_versions
-    return {"versions": list_versions(Path(output_path.strip()))}
+    # #4：目录扫描移出事件循环。
+    return {"versions": await asyncio.to_thread(list_versions, Path(output_path.strip()))}
 
 
 @router.post("/api/versions/restore")
@@ -237,7 +247,8 @@ async def versions_restore(payload: dict = Body(...)):
         raise HTTPException(409, "pipeline_already_running：请先停止当前任务再回滚")
     from core.versions import restore
     try:
-        return restore(Path(output_path), version_id)
+        # #4：快照/回滚涉及批量文件复制，阻塞 I/O 移出事件循环。
+        return await asyncio.to_thread(restore, Path(output_path), version_id)
     except ValueError as e:
         raise HTTPException(400, str(e))
     except FileNotFoundError as e:

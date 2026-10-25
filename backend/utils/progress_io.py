@@ -17,7 +17,11 @@
 """
 
 import json
+import threading
+from collections import OrderedDict
 from pathlib import Path
+
+from utils.atomic import atomic_write_json
 
 
 class ProgressUnreadable(RuntimeError):
@@ -64,3 +68,64 @@ def is_completed(progress: dict) -> bool:
     if "completed" in progress:
         return bool(progress.get("completed"))
     return bool(progress.get("finished_at")) and progress.get("current_phase") == "phase4"
+
+
+# ---------------------------------------------------------------------------
+# #4 阻塞 I/O 线程化配套同步原语
+#
+# 事件循环里原本直接 read_text / json.loads / rmtree / unlink / restore：
+# progress.json 可达数十 MB，一次 json.loads 就能在事件循环里阻塞数十毫秒，
+# SSE 心跳抖动、pause/stop 端点排队。这里提供纯同步读写函数，路由层用
+# asyncio.to_thread 调用，把磁盘与解析开销移出事件循环线程。
+# ---------------------------------------------------------------------------
+
+def load_progress_dict(path: Path) -> dict:
+    """同步读取 progress.json 的薄封装（供 asyncio.to_thread 调用）。"""
+    return read_progress(path)
+
+
+def save_progress_dict(path: Path, data: dict) -> None:
+    """同步原子写 progress.json 的薄封装（供 asyncio.to_thread 调用）。
+
+    写后剔除该路径的缓存条目：write 由 progress_lock 串行化，但读侧缓存若按旧
+    mtime/size 命中，会在同一秒快速连写时返回上一版内容。
+    """
+    atomic_write_json(Path(path), data)
+    with _CACHE_LOCK:
+        _progress_cache.pop(Path(path), None)
+
+
+_CACHE_LOCK = threading.Lock()
+# 缓存值 = ((mtime_ns, size), 解析后的 dict)；按 mtime_ns + size 双条件失效。
+_progress_cache: OrderedDict[Path, tuple[tuple[int, int], dict]] = OrderedDict()
+_CACHE_MAX_ENTRIES = 32
+
+
+def read_progress_cached(path: Path) -> dict:
+    """线程安全的 progress.json 缓存读取。
+
+    缓存键 = 路径；失效依据 mtime + size。供路由层经 asyncio.to_thread 调用，
+    避免在事件循环线程里做磁盘读取与 JSON 解析。LRU 上限 32 条，防止长进程
+    跨多本书运行时缓存无限增长。
+    """
+    path = Path(path)
+    stat = path.stat()
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    with _CACHE_LOCK:
+        cached = _progress_cache.get(path)
+        if cached and cached[0] == stamp:
+            _progress_cache.move_to_end(path)
+            return cached[1]
+    data = read_progress(path)
+    with _CACHE_LOCK:
+        _progress_cache[path] = (stamp, data)
+        _progress_cache.move_to_end(path)
+        while len(_progress_cache) > _CACHE_MAX_ENTRIES:
+            _progress_cache.popitem(last=False)
+    return data
+
+
+def clear_progress_cache() -> None:
+    """测试辅助：清空状态缓存。"""
+    with _CACHE_LOCK:
+        _progress_cache.clear()

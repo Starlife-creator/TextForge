@@ -11,6 +11,7 @@ exe 旁的 data/ 子目录，随包移动；安装版回退 %APPDATA%/TextForge/
 （心跳/起止/错误）主动 upsert 进来。
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -119,10 +120,16 @@ def record_progress(progress_path: Path, progress: dict) -> None:
         logger.warning(f"[history] record_progress 失败：{e}")
 
 
+def _write_registry(reg: dict) -> None:
+    """同步写注册表（供 asyncio.to_thread 调用）。"""
+    atomic_write_json(_registry_path(), reg)
+
+
 @router.get("/api/history")
 async def history_list(limit: int = Query(30)):
     """任务历史列表（最近优先）。额外标注当前正在跑的那条。"""
-    reg = _load()
+    # #4：runs.json 读取移出事件循环。
+    reg = await asyncio.to_thread(_load)
     items = list(reg["entries"].values())
     items.sort(key=lambda e: e.get("updated_at", ""), reverse=True)
     cur = _norm(state.current_output_path or "")
@@ -142,10 +149,10 @@ async def history_forget(payload: dict = Body(...)):
     output_path = (payload.get("output_path") or "").strip()
     if not output_path:
         raise HTTPException(422, "缺少 output_path")
-    reg = _load()
+    reg = await asyncio.to_thread(_load)
     reg["entries"].pop(_norm(output_path), None)
     try:
-        atomic_write_json(_registry_path(), reg)
+        await asyncio.to_thread(_write_registry, reg)
     except Exception as e:
         raise HTTPException(500, f"写入失败：{e}")
     return {"status": "forgotten"}
@@ -155,7 +162,7 @@ async def history_forget(payload: dict = Body(...)):
 async def history_clear():
     """清空整个历史注册表（只清注册表，不动任何磁盘文件）。"""
     try:
-        atomic_write_json(_registry_path(), {"entries": {}})
+        await asyncio.to_thread(_write_registry, {"entries": {}})
     except Exception as e:
         raise HTTPException(500, f"清空失败：{e}")
     return {"status": "cleared"}
