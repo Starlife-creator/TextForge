@@ -1,0 +1,17 @@
+# #14 运行时直接依赖清单（pip-compile 输入；只列直接依赖，传递依赖由工具解析）。
+#
+# 哈希锁生成（需联网；在有网环境执行一次，把生成的 requirements.txt 与哈希提交入库）：
+#   python -m pip install pip-tools
+#   pip-compile --generate-hashes requirements.in -o requirements.txt
+#
+# 离线/无网环境本轮只维护直依赖版本，传递依赖由 pip 依上层约束解析（#14 🟡：
+# 带哈希的全量锁文件待联网 pip-compile 后替换 requirements.txt）。
+# 前端依赖复现由 package-lock.json + `npm ci` 保证；Rust 侧由 Cargo.lock 保证。
+
+fastapi==0.141.1
+uvicorn==0.53.0
+httpx[socks]==0.28.1
+python-docx==1.2.0
+pydantic==2.13.5
+chardet==7.6.0
+cn2an==0.5.24
