@@ -1,6 +1,5 @@
 """#5 人物/伏笔档案最小闭环：持久化、增量更新、按预算注入与 Markdown 渲染回归。"""
 
-import json
 from pathlib import Path
 
 import pytest

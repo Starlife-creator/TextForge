@@ -28,7 +28,7 @@ from pathlib import Path
 
 from utils.appdir import data_dir
 from utils.progress_io import ProgressUnreadable, read_progress
-from utils.redact import redact
+from utils.redact import _mask_text, redact
 from utils.version import VERSION
 
 # 附进诊断包的日志行数上限；超过只取尾部，避免一个包塞几十 MB。
@@ -116,8 +116,9 @@ def _readme(manifest: dict) -> str:
 {chr(10).join(f"- `{m}`" for m in manifest['members'])}
 
 ## 脱敏说明
-- 本包**不包含** progress.json 全文；模型 API URL / 密钥 / 令牌均已遮罩为 `***`。
-- `backend.log` 为后端日志尾部（默认最后 {MAX_LOG_LINES} 行），错误日志附最近 {MAX_ERROR_LOGS} 条。
+- 本包**不包含** progress.json 全文；模型 API URL / 密钥 / 令牌均已脱敏为 `***`。
+- `backend.log` 为后端日志尾部（默认最后 {MAX_LOG_LINES} 行）：写入期由 SensitiveFilter 脱敏，入包前再对字符串模式扫一遍；但修复前落盘的历史日志不保证完全干净，上报前请人工扫一眼。
+- 错误日志附最近 {MAX_ERROR_LOGS} 条。
 - 上报前请再次人工扫一遍 `system_info.json` 与 `progress_summary.json`，确认无个人敏感路径需要打码。
 
 ## 问题上报
@@ -125,7 +126,8 @@ def _readme(manifest: dict) -> str:
 """
 
 
-def build_diagnostic_bundle(output_dir=None, *, log_path=None,
+def build_diagnostic_bundle(output_dir: str | os.PathLike | None = None,
+                            *, log_path: str | os.PathLike | None = None,
                             max_log_lines: int = MAX_LOG_LINES) -> bytes:
     """生成诊断包 zip 字节流。纯同步函数，路由层经 asyncio.to_thread 调用。
 
@@ -142,7 +144,10 @@ def build_diagnostic_bundle(output_dir=None, *, log_path=None,
     members: dict[str, bytes] = {}
     members["system_info.json"] = json.dumps(
         system_info, ensure_ascii=False, indent=2).encode("utf-8")
-    members["backend.log"] = _read_log_tail(log_file, max_log_lines).encode("utf-8")
+    # 日志成员过 _mask_text 兜底：写入期的 SensitiveFilter 只覆盖修复之后的日志，
+    # 修复前落盘的历史日志可能含明文密钥，这里再扫一遍字符串模式。
+    raw_log = _read_log_tail(log_file, max_log_lines)
+    members["backend.log"] = _mask_text(raw_log).encode("utf-8")
     if progress_summary is not None:
         members["progress_summary.json"] = json.dumps(
             progress_summary, ensure_ascii=False, indent=2).encode("utf-8")

@@ -1,7 +1,6 @@
 """#17 历史注册表与导出单测：排序、脱敏、条数上限、损坏重置、路径归一化。"""
 
 import json
-from pathlib import Path
 
 import pytest
 

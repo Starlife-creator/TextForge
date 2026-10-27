@@ -47,7 +47,12 @@ def _canon_json_path(output_path: Path) -> Path:
 
 
 def load_canon(output_path: Path) -> dict:
-    """读取档案；文件缺失 / 损坏 / 结构不符时返回空骨架，不抛到流水线主循环。"""
+    """读取档案；文件缺失 / 损坏 / 结构不符时返回空骨架，不抛到流水线主循环。
+
+    手改过的 canon.json 可能缺 chapters 键或含缺 name 的脏条目：这里就地清洗，
+    让后续 `person["name"]` / `person["chapters"]` 不会 KeyError，也不把脏数据
+    静默带进批次提示词。
+    """
     path = _canon_json_path(output_path)
     if not path.exists():
         return empty_canon()
@@ -57,7 +62,18 @@ def load_canon(output_path: Path) -> dict:
         return empty_canon()
     if not isinstance(data, dict) or not isinstance(data.get("persons"), list):
         return empty_canon()
-    data.setdefault("foreshadows", [])
+    cleaned_persons: list[dict] = []
+    for p in data["persons"]:
+        if not isinstance(p, dict) or not str(p.get("name") or "").strip():
+            continue  # 缺 name 的脏条目直接丢弃，不进后续索引
+        p.setdefault("aliases", [])
+        p.setdefault("identity", "")
+        p.setdefault("status", "")
+        p.setdefault("chapters", [])
+        cleaned_persons.append(p)
+    data["persons"] = cleaned_persons
+    if not isinstance(data.get("foreshadows"), list):
+        data["foreshadows"] = []
     data.setdefault("version", 1)
     return data
 

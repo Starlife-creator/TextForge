@@ -5,10 +5,8 @@ import json
 import zipfile
 from pathlib import Path
 
-import pytest
 
 from utils.diagnostics import (
-    MAX_ERROR_LOGS,
     build_diagnostic_bundle,
     _system_snapshot,
 )

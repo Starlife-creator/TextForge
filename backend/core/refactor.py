@@ -594,8 +594,8 @@ async def _request_refactor_text(client, req, output_path, blueprint_text,
     # #5：档案命中条目按预算注入；关键词取改名映射旧称与本章标题。
     from core.canon import load_canon, build_canon_context
     chapter_meta = [progress['chapters'][_find_idx(progress['chapters'], cid)] for cid in chapter_ids]
-    keywords = list(getattr(req, "name_map", {}) or {}) + [
-        str(c.get("title") or c.get("filename") or "") for c in chapter_meta]
+    keywords = tuple(list(getattr(req, "name_map", {}) or {}) + [
+        str(c.get("title") or c.get("filename") or "") for c in chapter_meta])
     canon_context = build_canon_context(load_canon(output_path), keywords=keywords)
     prompt = _build_refactor_prompt(
         req.refactor_mode,

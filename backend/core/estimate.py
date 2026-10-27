@@ -32,6 +32,7 @@ import copy
 import hashlib
 import json
 import unicodedata
+from collections import OrderedDict
 from pathlib import Path
 
 from core import blueprint
@@ -172,7 +173,8 @@ def _blueprint_calls(context_window: int, summary_sizes: list[int]) -> tuple[int
 
 # #15：预估结果内存 LRU 缓存。同一份输入（路径 + mtime/size + 影响算式的配置）
 # 重复请求不重扫原文；大对象高频状态拆分属架构级改动，本轮只落 estimate 缓存。
-_ESTIMATE_CACHE: dict[str, dict] = {}
+# 用 OrderedDict：命中 move_to_end，淘汰 popitem(last=False)，真正 LRU。
+_ESTIMATE_CACHE: OrderedDict[str, dict] = OrderedDict()
 _ESTIMATE_CACHE_MAX = 16
 
 
@@ -208,11 +210,13 @@ def estimate_run(req) -> dict:
     ).hexdigest()
     cached = _ESTIMATE_CACHE.get(key)
     if cached is not None:
+        _ESTIMATE_CACHE.move_to_end(key)  # 命中即 touch，真 LRU
         return copy.deepcopy(cached)
     result = _estimate_run_uncached(req)
     _ESTIMATE_CACHE[key] = result
+    _ESTIMATE_CACHE.move_to_end(key)
     while len(_ESTIMATE_CACHE) > _ESTIMATE_CACHE_MAX:
-        _ESTIMATE_CACHE.pop(next(iter(_ESTIMATE_CACHE)))
+        _ESTIMATE_CACHE.popitem(last=False)  # 淘汰最久未用
     return copy.deepcopy(result)
 
 

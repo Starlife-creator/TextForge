@@ -72,7 +72,7 @@ async def run_pipeline(req, run_id: str):
             progress["completed"] = True
             progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             async with state.progress_lock:
-                atomic_write_json(progress_path, progress)
+                await asyncio.to_thread(atomic_write_json, progress_path, progress)
             logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
             # 记录历史必须在 done 事件之前，确保前端/测试拉取历史时已是完成态
             _history_record(progress_path, progress)
@@ -142,7 +142,7 @@ async def run_pipeline(req, run_id: str):
                 progress["pipeline_running"] = False
                 progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 async with state.progress_lock:
-                    atomic_write_json(progress_path, progress)
+                    await asyncio.to_thread(atomic_write_json, progress_path, progress)
                 logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
                 # 完成态已在 try 块中记录历史；失败/中止态需要在此补记
                 if not progress.get("completed"):
@@ -288,16 +288,18 @@ def _load_or_init_progress(req, run_id, progress_path):
     表现为"重开像什么都没保存"。现在读不了就明确报错并停下，交由用户处理。
     """
     from utils.progress_io import (
-        ProgressUnreadable, is_completed, try_read_progress, migrate_progress_file,
+        ProgressUnreadable, is_completed, migrate_progress_file,
     )
-    try:
-        existing = try_read_progress(progress_path)
-    except ProgressUnreadable as e:
-        raise RuntimeError(str(e)) from e
+    existing = None
+    if progress_path.exists():
+        # 只读一次盘：migrate_progress_file 内部已 json.loads，不再先 try_read_progress
+        # 预检一遍数十 MB 文件（#14 消除事件循环里的重复解析）。文件损坏按
+        # ProgressUnreadable 上抛，不静默重建。
+        try:
+            existing, _migrations = migrate_progress_file(progress_path)
+        except ProgressUnreadable as e:
+            raise RuntimeError(str(e)) from e
     if existing is not None:
-        # #17：旧版本 progress 缺字段先回填默认并升级 schema 版本（留 .bak），
-        # 避免下游直接索引抛 KeyError；迁移失败按 ProgressUnreadable 上抛，不静默重建。
-        existing, _migrations = migrate_progress_file(progress_path)
         # 旧判据是 current_phase != 'phase4'，但 phase4 在 finalize 之前就写入，
         # 渲染失败时会被误判为「已完成、不可续跑」。现在只认显式 completed。
         if existing.get('current_phase') and not is_completed(existing):
@@ -345,7 +347,7 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
 
     progress['current_phase'] = 'phase0_confirm'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        await asyncio.to_thread(atomic_write_json, progress_path, progress)
     logger.info(f"[phase0] 拆书预览等待确认 run_id={run_id}（{det.get('reason') or det.get('mode')}）")
 
     while True:
@@ -375,7 +377,7 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
 
     progress['current_phase'] = 'phase1'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        await asyncio.to_thread(atomic_write_json, progress_path, progress)
 
 async def wait_fix_review(req, progress, progress_path, run_id):
     """fix_gaps 闭环：仅 diagnose_json 已配置且重构模式为 fix_gaps 时，
@@ -388,7 +390,7 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     gaps = _collect_diagnosed_gaps(req.diagnose_json)
     progress['current_phase'] = 'phase1_fixreview'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        await asyncio.to_thread(atomic_write_json, progress_path, progress)
     # 同 wait_split_confirm：先 clear 再推送，否则确认会被紧随的 clear() 抹掉。
     state.fix_review_confirm.clear()
     sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
@@ -401,7 +403,7 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     logger.info(f"[fix_review] 已吸收用户勾选 fix_list={progress.get('fix_list')}")
     progress['current_phase'] = 'phase2'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        await asyncio.to_thread(atomic_write_json, progress_path, progress)
 
 def _collect_diagnosed_gaps(diag_path: str) -> list:
     """读取 diagnose_json 目录下诊断批次文件的 gaps，汇总为前端可选清单。"""
@@ -502,10 +504,10 @@ async def log_error(progress_path: Path, error, progress: dict | None = None):
     try:
         async with state.progress_lock:
             from utils.progress_io import read_progress
-            disk = read_progress(progress_path)
+            disk = await asyncio.to_thread(read_progress, progress_path)
             disk.setdefault("error_logs", []).append(entry)
             disk["error_logs"] = disk["error_logs"][-100:]
-            atomic_write_json(progress_path, disk)
+            await asyncio.to_thread(atomic_write_json, progress_path, disk)
     except Exception as e:
         # 不能静默：写盘失败时 run_pipeline 的 finally 会用内存副本覆盖 progress.json，
         # 届时错误原因会彻底丢失，界面只显示「失败」却无因。

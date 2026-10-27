@@ -22,13 +22,24 @@ _BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 _ITALIC_RE = re.compile(r"(?<!\*)\*([^*\n]+?)\*(?!\*)")
 _UNDERLINE_ITALIC_RE = re.compile(r"_([^_\n]+?)_")
 
+# XML 1.0 合法字符：#x9 / #xA / #xD / #x21-#xD7FF / #xE000-#xFFFD。
+# 其余控制字符（含 \x00-\x08 \x0b \x0c \x0e-\x1f）会让阅读器解析 chapter.xhtml
+# 时抛 ExpatError。OCR / 老 novel 文本里 \x0c（换页）很常见，必须写盘前剥掉。
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _sanitize_xml_text(text: str) -> str:
+    """剥除 XML 1.0 非法控制字符；保留 \t \n \r。"""
+    return _XML_ILLEGAL_RE.sub("", text)
+
 
 def md_to_html(text: str) -> str:
     """把极简 Markdown 正文转成 HTML 段落；粗体 **x**、斜体 *x* / _x_。
 
     先整体转义，再替换行内标记；行内换行保留为 <br/>。
     """
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text or "") if p.strip()]
+    text = _sanitize_xml_text(text or "")
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     blocks: list[str] = []
     for para in paragraphs:
         escaped = html.escape(para)
@@ -104,8 +115,15 @@ def _chapter_xhtml(ch: dict, index: int) -> str:
 
 
 def build_epub(chapters: list[dict], *, title: str, author: str = "") -> bytes:
-    """构建 EPUB 字节流。chapters: [{id, title, text}]；空文本章节自动跳过。"""
+    """构建 EPUB 字节流。chapters: [{id, title, text}]；空文本章节自动跳过。
+
+    全部章节正文为空时显式报错（生成空 spine 违反 EPUB 规范，阅读器会拒开）。
+    """
     valid = [c for c in chapters if str(c.get("text") or "").strip()]
+    if not valid:
+        raise ValueError("没有非空章节可导出：全书正文为空，拒绝生成空 EPUB")
+    title = _sanitize_xml_text(title or "")
+    author = _sanitize_xml_text(author or "")
     book_id = f"urn:uuid:{uuid.uuid4()}"
 
     container_xml = (

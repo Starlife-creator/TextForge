@@ -140,17 +140,17 @@ def _special_dirs(home: Path) -> set:
     """
     names = ["Desktop", "桌面"]
     try:
-        import winreg
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
+        import winreg  # type: ignore[import-not-found]
+        key = winreg.OpenKey(  # type: ignore[attr-defined]
+            winreg.HKEY_CURRENT_USER,  # type: ignore[attr-defined]
             r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
         )
         try:
-            val, _ = winreg.QueryValueEx(key, "Desktop")
+            val, _ = winreg.QueryValueEx(key, "Desktop")  # type: ignore[attr-defined]
             if val:
                 names.insert(0, val)
         finally:
-            winreg.CloseKey(key)
+            winreg.CloseKey(key)  # type: ignore[attr-defined]
     except Exception:
         # 非 Windows 或注册表不可读：下面按本地化名兜底即可
         pass

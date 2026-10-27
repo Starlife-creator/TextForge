@@ -1113,7 +1113,7 @@ try:
     check("被拒后带错因重试过一次", st12.get("stitch_corrected", 0) >= 1, str(st12))
     _b12 = [p for p in list((o12 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
             + list((o12 / "03_final").glob("*.txt"))
-            if "模拟整段重写" in p.read_text(encoding="utf-8", newline="")]
+            if "模拟整段重写" in p.read_text(encoding="utf-8")]
     check("整段重写补丁没有落进正文", not _b12, str([p.name for p in _b12]))
     o12c = sorted((o12 / "02_workspace" / "reconstructed").glob("chapter_*.txt"))
     check("闸门拒绝后 8 章正文仍完整",
@@ -1168,13 +1168,13 @@ try:
     check("注入的占位硬伤确实进了该批质检结论", ("1", "placeholder") in _before,
           str(_before)[:200])
     _file13 = o13 / "02_workspace" / "reconstructed" / "chapter_1.txt"
-    _text_before = _file13.read_text(encoding="utf-8", newline="")
+    _text_before = _file13.read_text(encoding="utf-8")
     try:
         reg13 = post(f"{B}/api/regen_chapter", {"chapter_id": "1"})
     except Exception as e:
         reg13 = {"error": str(e)}
     check("单章重生成接口应答成功", reg13.get("status") == "regenerated", str(reg13)[:200])
-    _text_after = _file13.read_text(encoding="utf-8", newline="")
+    _text_after = _file13.read_text(encoding="utf-8")
     check("重写后的正文替换了占位符",
           "TODO" not in _text_after and _text_after != _text_before,
           f"before={len(_text_before)} after={len(_text_after)}")

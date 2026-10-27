@@ -157,7 +157,8 @@ def _parse_starts(text: str):
 
 def _chunks(cands, payload_chars=CAND_PAYLOAD_CHARS):
     """把候选行按体积切成若干块，避免单次提示词撑爆小窗口。"""
-    cur, size = [], 0
+    cur: list = []
+    size = 0
     for ln, s in cands:
         line_len = len(s) + len(str(ln)) + 2
         if cur and size + line_len > payload_chars:

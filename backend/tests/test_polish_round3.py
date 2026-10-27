@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from routes import history
 from routes.status import _list_comparisons, _read_comparison
 from utils.errors import classify_exception, raise_internal_error
@@ -20,7 +22,12 @@ def test_comparison_read_rejects_symlink_and_lists_only_real_files(tmp_path):
     outside = tmp_path / "secret.md"
     outside.write_text("目录外部文件", encoding="utf-8")
     link = comp / "chapter_9.comparison.md"
-    os.symlink(outside, link)
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError) as e:
+        # Windows 非开发者模式下 os.symlink 抛 OSError 1314（缺符号链接特权）；
+        # 这种环境测不了符号链接拒绝，直接 skip 而不是让整套测试红。
+        pytest.skip(f"当前环境不支持创建符号链接：{e}")
 
     ok = _read_comparison(comp, "chapter_1.comparison.md")
     assert ok == [{"name": "chapter_1.comparison.md", "text": "正常对照稿"}]

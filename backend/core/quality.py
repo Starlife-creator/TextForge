@@ -583,12 +583,12 @@ def build_quality_report(
             "issue_codes": codes,
         }
         row["health_score"] = chapter_health_score(row, chapter_issues.get(cid, []))
-        row["health_grade"] = health_grade(row["health_score"])
+        row["health_grade"] = health_grade(int(row["health_score"]))  # type: ignore[call-overload]
         rows.append(row)
 
     duplicates = find_duplicate_pairs(recon_texts)
     if duplicates:
-        by_id = {r["id"]: r for r in rows}
+        by_id: dict = {r["id"]: r for r in rows}
         for d in duplicates:
             dup_msg = (
                 f"第 {d['a']} 章与第 {d['b']} 章存在 {d['shared_shingles']} 处相同长片段"
@@ -596,10 +596,14 @@ def build_quality_report(
             )
             add_issue(BAD, "cross_chapter_duplicate", dup_msg)
             for cid in (d["a"], d["b"]):
-                row = by_id.get(cid)
+                row = by_id.get(cid)  # type: ignore[assignment]
                 if row is not None:
-                    if "duplicate" not in row["issue_codes"]:
-                        row["issue_codes"].append("duplicate")
+                    issue_codes = row["issue_codes"]
+                    if not isinstance(issue_codes, list):
+                        issue_codes = []
+                        row["issue_codes"] = issue_codes
+                    if "duplicate" not in issue_codes:
+                        issue_codes.append("duplicate")
                     row["status"] = BAD
                     chapter_issues.setdefault(cid, []).append(
                         {"severity": BAD, "code": "cross_chapter_duplicate",
@@ -607,7 +611,7 @@ def build_quality_report(
                     )
                     row["health_score"] = chapter_health_score(
                         row, chapter_issues.get(cid, []))
-                    row["health_grade"] = health_grade(row["health_score"])
+                    row["health_grade"] = health_grade(int(row["health_score"]))  # type: ignore[call-overload]
 
     if progress.get("qc_issues"):
         add_issue(

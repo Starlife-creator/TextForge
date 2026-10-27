@@ -77,3 +77,22 @@ def test_upsert_never_writes_plaintext_key(tmp_path, monkeypatch) -> None:
     blob = (tmp_path / "runs.json").read_text(encoding="utf-8")
     assert SECRET not in blob
     assert "***" in blob
+
+
+def test_redact_normalizes_key_separators_and_camelcase() -> None:
+    """#6 review：apiKey / API-KEY / access_token 等变体必须命中脱敏。"""
+    payload = {
+        "apiKey": SECRET,
+        "API-KEY": SECRET,
+        "access_token": SECOND_SECRET,
+        "openai_api_key": SECRET,
+        "nested": {"APIKey": SECRET},
+        "keyword": "keyword_should_survive",  # 不应误伤普通词
+    }
+    out = redact(payload)
+    assert out["apiKey"] == "***"
+    assert out["API-KEY"] == "***"
+    assert out["access_token"] == "***"
+    assert out["openai_api_key"] == "***"
+    assert out["nested"]["APIKey"] == "***"
+    assert out["keyword"] == "keyword_should_survive"

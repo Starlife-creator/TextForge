@@ -16,6 +16,7 @@
 - 读取一律用 `utf-8-sig`（兼容有无 BOM）。
 """
 
+import copy
 import json
 import logging
 import threading
@@ -100,8 +101,21 @@ def save_progress_dict(path: Path, data: dict) -> None:
 
 _CACHE_LOCK = threading.Lock()
 # 缓存值 = ((mtime_ns, size), 解析后的 dict)；按 mtime_ns + size 双条件失效。
+# 命中一律返回 deepcopy：调用方可能原地改 dict（routes/control.py 会改 regen_count
+# 等），若返回缓存本体，下次命中会读到上一次调用方的副作用。
 _progress_cache: OrderedDict[Path, tuple[tuple[int, int], dict]] = OrderedDict()
 _CACHE_MAX_ENTRIES = 32
+# 单条目超过该字节数（近似）时不进缓存，避免单个几十 MB 的 progress.json 把
+# 其余条目挤掉；同时作为缓存总软上限的粗估锚点。
+_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
+
+
+def _approx_size(obj) -> int:
+    """粗估对象字节数（json 序列化长度）；只用于缓存淘汰阈值，不必精确。"""
+    try:
+        return len(json.dumps(obj, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return 0
 
 
 def read_progress_cached(path: Path) -> dict:
@@ -109,7 +123,7 @@ def read_progress_cached(path: Path) -> dict:
 
     缓存键 = 路径；失效依据 mtime + size。供路由层经 asyncio.to_thread 调用，
     避免在事件循环线程里做磁盘读取与 JSON 解析。LRU 上限 32 条，防止长进程
-    跨多本书运行时缓存无限增长。
+    跨多本书运行时缓存无限增长。命中返回深拷贝，调用方可自由改写。
     """
     path = Path(path)
     stat = path.stat()
@@ -118,14 +132,15 @@ def read_progress_cached(path: Path) -> dict:
         cached = _progress_cache.get(path)
         if cached and cached[0] == stamp:
             _progress_cache.move_to_end(path)
-            return cached[1]
+            return copy.deepcopy(cached[1])
     data = read_progress(path)
-    with _CACHE_LOCK:
-        _progress_cache[path] = (stamp, data)
-        _progress_cache.move_to_end(path)
-        while len(_progress_cache) > _CACHE_MAX_ENTRIES:
-            _progress_cache.popitem(last=False)
-    return data
+    if _approx_size(data) <= _CACHE_MAX_ITEM_BYTES:
+        with _CACHE_LOCK:
+            _progress_cache[path] = (stamp, data)
+            _progress_cache.move_to_end(path)
+            while len(_progress_cache) > _CACHE_MAX_ENTRIES:
+                _progress_cache.popitem(last=False)
+    return copy.deepcopy(data)
 
 
 def clear_progress_cache() -> None:
@@ -165,6 +180,11 @@ def migrate_progress(data: dict) -> tuple[dict, list[str]]:
 
     已是当前 schema 版本时原样返回、空列表；旧文件缺字段按 `_PROGRESS_DEFAULTS`
     补回，**不覆盖已有值**。
+
+    注意：默认值里含可变对象（list/dict），必须 deepcopy 后再挂进 data ——
+    直接引用模块级 `_PROGRESS_DEFAULTS` 会让多本书共享同一对象，A 书 append
+    chapters / 改 usage 会污染 B 书（人工确认闸门 accepted_batches 也会因此
+    被跨书静默跳过）。
     """
     if not isinstance(data, dict):
         raise ProgressUnreadable("progress 顶层不是对象，无法迁移")
@@ -173,9 +193,25 @@ def migrate_progress(data: dict) -> tuple[dict, list[str]]:
         applied.append(f"backfill_defaults_v{PROGRESS_SCHEMA_VERSION}")
         for key, default in _PROGRESS_DEFAULTS.items():
             if key not in data or data[key] is None:
-                data[key] = default
+                data[key] = copy.deepcopy(default)
         data["progress_schema_version"] = PROGRESS_SCHEMA_VERSION
+    # 历史明文一次性清洗：修复前写出的 progress.json 里 models[*].api_key 等
+    # 字段是明文落盘的，迁移时就地脱敏，避免跨进程重启后仍从磁盘读回明文。
+    scrub_models(data)
     return data, applied
+
+
+def scrub_models(data: dict) -> None:
+    """就地清洗 data['models'] 里的敏感键（历史明文一次性修复）。
+
+    models 形如 {"phase1": {"api_key": "sk-..."}, ...}；递归遍历，把命中的
+    敏感键值替换为 '***'。无 models 字段时 no-op。
+    """
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return
+    from utils.redact import redact  # 延迟导入，避免循环依赖
+    data["models"] = redact(models)
 
 
 def migrate_progress_file(progress_path: Path, *, backup: bool = True

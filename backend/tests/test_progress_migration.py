@@ -87,3 +87,28 @@ def test_migrate_preserves_existing_container_values():
     assert data["chapters"] == [{"id": "9"}]
     assert data["batches"] == [{"batch_id": 1, "status": "phase3_done"}]
     assert data["usage"] == {"prompt_tokens": 42}
+
+
+def test_migrate_does_not_share_default_mutable_between_runs() -> None:
+    """#2 review：两本书回填默认值后互不影响（chapters/usage/accepted_batches 不串数据）。"""
+    from utils.progress_io import migrate_progress
+    a, _ = migrate_progress({"novel_name": "A", "progress_schema_version": 1})
+    b, _ = migrate_progress({"novel_name": "B", "progress_schema_version": 1})
+    assert a["chapters"] is not b["chapters"]
+    assert a["usage"] is not b["usage"]
+    assert a["accepted_batches"] is not b["accepted_batches"]
+    a["chapters"].append({"id": 1})
+    a["usage"]["prompt_tokens"] = 99999
+    a["accepted_batches"].append("batch-1")
+    assert b["chapters"] == []
+    assert b["usage"]["prompt_tokens"] == 0
+    assert b["accepted_batches"] == []
+
+
+def test_migrate_scrubs_historical_plaintext_models() -> None:
+    """#6 review：迁移时一次性清洗历史明文 models。"""
+    from utils.progress_io import migrate_progress
+    data = {"novel_name": "old", "progress_schema_version": 1,
+            "models": {"phase1": {"api_key": "sk-leaked-old"}}}
+    out, _ = migrate_progress(data)
+    assert out["models"]["phase1"]["api_key"] == "***"
