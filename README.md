@@ -57,7 +57,7 @@ Tauri + Vue 3 + FastAPI，后端以 sidecar 随应用分发。
 ## 目录结构
 
 ```
-backend/               FastAPI 后端（Python 3.12+）
+backend/               FastAPI 后端（Python 3.13+）
   core/                流水线各阶段：拆章、诊断、蓝图、重构、缝合、收尾
   routes/              HTTP 接口
   utils/               appdir（数据目录）、auth（调用方鉴权）、日志、token 估算

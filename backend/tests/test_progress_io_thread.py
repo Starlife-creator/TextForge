@@ -42,9 +42,18 @@ def test_load_corrupted_raises_unreadable(tmp_path: Path):
         load_progress_dict(p)
 
 
-def test_read_progress_cached_hits_cache_on_unchanged_file(tmp_path: Path):
+def test_read_progress_cached_hits_cache_on_unchanged_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     p = tmp_path / "progress.json"
     p.write_text(json.dumps({"a": 1, "nested": {"x": [1, 2]}}), encoding="utf-8")
+    clear_progress_cache()
+    # 计数真实读盘：第二次调用必须命中缓存、不再走 read_progress。
+    calls = {"n": 0}
+    import utils.progress_io as m
+    real = m.read_progress
+    def counting(path):
+        calls["n"] += 1
+        return real(path)
+    monkeypatch.setattr(m, "read_progress", counting)
     first = read_progress_cached(p)
     second = read_progress_cached(p)
     # 命中缓存但返回深拷贝：内容相等，调用方改 second 不影响 first（也不污染缓存本体）。
@@ -52,6 +61,7 @@ def test_read_progress_cached_hits_cache_on_unchanged_file(tmp_path: Path):
     assert second["a"] == 1
     second["nested"]["x"].append(999)
     assert first["nested"]["x"] == [1, 2]
+    assert calls["n"] == 1, f"缓存未命中：read_progress 被调用 {calls['n']} 次"
 
 
 def test_read_progress_cached_reloads_after_file_change(tmp_path: Path):

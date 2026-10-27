@@ -6,7 +6,7 @@ import logging
 
 import pytest
 
-from core.refactor import REGEN_MAX_PER_CHAPTER
+from core.refactor import AUTO_REWRITE_MAX_PER_RUN, REGEN_MAX_PER_CHAPTER
 from routes.status import _COMPARISON_NAME_RE
 from utils.errors import raise_internal_error
 from utils.redact import SensitiveFilter, redact
@@ -59,6 +59,7 @@ def test_comparison_name_whitelist(name, allowed):
 def test_regen_limit_aligned_with_rewrite_guard():
     # 与主路径 AUTO_REWRITE_MAX_PER_RUN=3 对齐，防止单章无限驳回计费。
     assert REGEN_MAX_PER_CHAPTER == 3
+    assert AUTO_REWRITE_MAX_PER_RUN == REGEN_MAX_PER_CHAPTER
 
 
 # ---------- #6 错误出口不泄露内部细节 ----------

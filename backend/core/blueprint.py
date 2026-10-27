@@ -186,17 +186,24 @@ def _evict_cache_lru(cache_dir: Path) -> int:
     """
     if not cache_dir.is_dir():
         return 0
-    files = [p for p in cache_dir.glob("arc_*.json") if p.is_file()]
+    # 收集时 stat 包 try：glob 与 stat 之间文件可能被另一进程/杀软删掉，
+    # 直接 p.stat() 会把整轮淘汰炸成未捕获异常。
+    files = []
+    for p in cache_dir.glob("arc_*.json"):
+        try:
+            if p.is_file():
+                files.append((p.stat().st_mtime_ns, p.stat().st_size, p))
+        except OSError:
+            continue
     if not files:
         return 0
     # 最旧在前，淘汰时从队首删
-    files.sort(key=lambda p: p.stat().st_mtime_ns)
-    total = sum(p.stat().st_size for p in files)
+    files.sort(key=lambda t: t[0])
+    total = sum(t[1] for t in files)
     evicted = 0
     while files and (len(files) > CACHE_MAX_ENTRIES or total > CACHE_MAX_BYTES):
-        oldest = files.pop(0)
+        _mtime, size, oldest = files.pop(0)
         try:
-            size = oldest.stat().st_size
             oldest.unlink()
             total -= size
             evicted += 1

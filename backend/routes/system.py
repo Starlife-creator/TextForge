@@ -234,6 +234,13 @@ async def system_diagnostic_bundle(output_path: str | None = Query(None)):
     打包属磁盘读取 + zip 压缩，经线程池执行，不阻塞事件循环。
     """
     from utils.diagnostics import build_diagnostic_bundle
+    # output_path 由 query 直接进入磁盘读取：存在性与类型先校验，避免把
+    # 任意字符串透传给 Path() 后在 build 内部炸成未包装的 500。
+    if output_path:
+        from pathlib import Path as _P
+        _out = _P(output_path)
+        if not _out.is_dir():
+            raise HTTPException(400, f"output_path 不是存在的目录：{output_path}")
     blob = await asyncio.to_thread(
         build_diagnostic_bundle, output_path,
         log_path=_path("LOG_PATH"),
