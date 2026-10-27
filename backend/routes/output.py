@@ -139,21 +139,23 @@ def _special_dirs(home: Path) -> set:
     再把常见本地化名兜底加上，任一命中即拒绝。
     """
     names = ["Desktop", "桌面"]
-    try:
-        import winreg  # type: ignore[import-not-found]
-        key = winreg.OpenKey(  # type: ignore[attr-defined]
-            winreg.HKEY_CURRENT_USER,  # type: ignore[attr-defined]
-            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
-        )
+    import sys
+    if sys.platform == "win32":
         try:
-            val, _ = winreg.QueryValueEx(key, "Desktop")  # type: ignore[attr-defined]
-            if val:
-                names.insert(0, val)
-        finally:
-            winreg.CloseKey(key)  # type: ignore[attr-defined]
-    except Exception:
-        # 非 Windows 或注册表不可读：下面按本地化名兜底即可
-        pass
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            )
+            try:
+                val, _ = winreg.QueryValueEx(key, "Desktop")
+                if val:
+                    names.insert(0, val)
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
+            # 非 Windows 或注册表不可读：下面按本地化名兜底即可
+            pass
 
     out = set()
     for name in names:

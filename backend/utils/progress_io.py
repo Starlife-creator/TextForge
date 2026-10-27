@@ -101,52 +101,50 @@ def save_progress_dict(path: Path, data: dict) -> None:
 
 _CACHE_LOCK = threading.Lock()
 # 缓存值 = ((mtime_ns, size), 解析后的 dict)；按 mtime_ns + size 双条件失效。
-# 命中一律返回 deepcopy：调用方可能原地改 dict（routes/control.py 会改 regen_count
-# 等），若返回缓存本体，下次命中会读到上一次调用方的副作用。
+# 命中返回 deepcopy：经缓存的读方（routes/status.py）虽只读，但 deepcopy 让调用方
+# 自由改写也不会污染缓存本体，成本约 1ms。
 _progress_cache: OrderedDict[Path, tuple[tuple[int, int], dict]] = OrderedDict()
-_CACHE_MAX_ENTRIES = 32
-# 单条目超过该字节数（近似）时不进缓存，避免单个几十 MB 的 progress.json 把
-# 其余条目挤掉；同时作为缓存总软上限的粗估锚点。
-_CACHE_MAX_ITEM_BYTES = 4 * 1024 * 1024
-
-
-def _approx_size(obj) -> int:
-    """粗估对象字节数（json 序列化长度）；只用于缓存淘汰阈值，不必精确。"""
-    try:
-        return len(json.dumps(obj, ensure_ascii=False))
-    except (TypeError, ValueError):
-        return 0
+# 缓存总字节软上限：用 stat().st_size（免费）记账，超阈值按 LRU 淘汰最旧条目，
+# 而不是「单文件 >4MB 就永不缓存」——后者让最大的书每次轮询都全价解析。
+_CACHE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
+_cache_bytes = 0
 
 
 def read_progress_cached(path: Path) -> dict:
     """线程安全的 progress.json 缓存读取。
 
-    缓存键 = 路径；失效依据 mtime + size。供路由层经 asyncio.to_thread 调用，
-    避免在事件循环线程里做磁盘读取与 JSON 解析。LRU 上限 32 条，防止长进程
-    跨多本书运行时缓存无限增长。命中返回深拷贝，调用方可自由改写。
+    缓存键 = 路径；失效依据 mtime + size。LRU 按总字节（stat.st_size）淘汰，
+    不做二次 json.dumps 估算大小（那会在 11MB 文件上多花 34ms）。
     """
     path = Path(path)
-    stat = path.stat()
-    stamp = (stat.st_mtime_ns, stat.st_size)
+    st = path.stat()
+    stamp = (st.st_mtime_ns, st.st_size)
     with _CACHE_LOCK:
         cached = _progress_cache.get(path)
         if cached and cached[0] == stamp:
             _progress_cache.move_to_end(path)
             return copy.deepcopy(cached[1])
     data = read_progress(path)
-    if _approx_size(data) <= _CACHE_MAX_ITEM_BYTES:
-        with _CACHE_LOCK:
-            _progress_cache[path] = (stamp, data)
-            _progress_cache.move_to_end(path)
-            while len(_progress_cache) > _CACHE_MAX_ENTRIES:
-                _progress_cache.popitem(last=False)
+    global _cache_bytes
+    with _CACHE_LOCK:
+        old = _progress_cache.get(path)
+        if old:
+            _cache_bytes -= old[0][1]
+        _progress_cache[path] = (stamp, data)
+        _progress_cache.move_to_end(path)
+        _cache_bytes += st.st_size
+        while _cache_bytes > _CACHE_MAX_TOTAL_BYTES and len(_progress_cache) > 1:
+            _k, _v = _progress_cache.popitem(last=False)
+            _cache_bytes -= _v[0][1]
     return copy.deepcopy(data)
 
 
 def clear_progress_cache() -> None:
     """测试辅助：清空状态缓存。"""
+    global _cache_bytes
     with _CACHE_LOCK:
         _progress_cache.clear()
+        _cache_bytes = 0
 
 
 # ---------------------------------------------------------------------------

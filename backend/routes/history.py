@@ -44,9 +44,20 @@ def _load() -> dict:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+            # 历史一次性清洗：修复前落盘的 config_drift 可能含明文密钥，读侧兜底脱敏。
+            for e in data["entries"].values():
+                if isinstance(e, dict) and "config_drift" in e:
+                    e["config_drift"] = redact(e["config_drift"])
             return data
     except Exception as e:
-        logger.warning(f"[history] runs.json 无法解析，重置：{e}")
+        # 与 progress.json 同一口径：读失败不静默清空，先把坏文件留 .bak，
+        # 避免一次半截写入/杀软扫盘就丢掉全部历史且无可恢复副本。
+        try:
+            import shutil
+            shutil.copy2(p, p.with_suffix(".json.bak"))
+        except OSError:
+            pass
+        logger.warning(f"[history] runs.json 无法解析，已备份为 .bak 后重置：{e}")
     return {"entries": {}}
 
 

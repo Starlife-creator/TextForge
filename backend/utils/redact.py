@@ -2,10 +2,10 @@ import json, re, logging
 
 # 归一化后的敏感键名集合：键名先 lower、再去掉 _ - 空格，命中即脱敏。
 # 这样 `api_key` / `apiKey` / `API-KEY` / `access_token` 都能命中；
-# 同时不会误伤 `keyword` / `tokenize` 这类普通词（归一化后不在集合内）。
+# 同时不会误伤 `keyword` / `tokenize` / 人名 `Auth` / `Token`（归一化后不在集合内）。
 _SENSITIVE_KEYS_NORMALIZED = {
     "apikey", "token", "authorization", "password", "secret",
-    "accesstoken", "secretkey", "auth", "credential",
+    "accesstoken", "secretkey",
 }
 
 
@@ -21,12 +21,12 @@ def _is_sensitive_key(k) -> bool:
     # 归一化后是 `openaiapikey`，精确集合不命中，但子串命中。
     return any(s in n for s in ("apikey", "accesstoken", "authorization", "password", "secretkey"))
 
-# 字符串内嵌密钥（如 "api_key=xxx"、"token: xxx"、"Bearer xxx"、URL 查询参数
-# "?api_key=xxx&token=yyy"）的脱敏模式；日志 SensitiveFilter 与 redact 兜底共用同一
-# 口径，避免两侧正则漂移。分隔符含 ? & 以覆盖 URL query；值截断字符含 & 避免连带
-# 脱敏到下一个参数。
+# 字符串内嵌密钥（如 "api_key=xxx"、"token: xxx"、"?api_key=xxx&token=yyy"）的脱敏模式。
+# 关键收紧：分隔符必须是 = / : / ? / & 这类赋值或 URL 语境，不能只是空格——否则
+# 自由文本里的 "secret identity"、"每章 token 数量上限" 会被误改成 "secret ***"。
+# 值也要求像凭据（ASCII 6 字符以上），避免吃掉中文叙述。
 _SECRET_PATTERN = re.compile(
-    r'(api[_-]?key|token|authorization|password|secret)(["\s:=?&]+)([^\s",}&]+)',
+    r'(api[_-]?key|token|authorization|password|secret)(\s*[=:?&]\s*["\']?)([A-Za-z0-9_\-.]{6,})',
     re.IGNORECASE,
 )
 # Bearer 形态：Authorization: Bearer <token>，整段凭据在 Bearer 之后。

@@ -153,7 +153,16 @@ def phase4_finalize(output_path: Path, progress: dict, req):
         try:
             write_epub(final_dir / f"{novel_name}_重构终稿.epub", epub_chapters,
                        title=novel_name_raw)
+            progress["epub_export"] = {"status": "ok",
+                                       "generated_at": datetime.datetime.now().isoformat(timespec="seconds")}
         except Exception as e:
+            # 与质量报告同一口径：失败不拖垮其他格式，但必须留痕，否则用户勾了
+            # export_epub 却没拿到产物时界面仍显示完成、历史里无任何线索。
+            progress["epub_export"] = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}"[:500],
+                "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
             logger.warning(f"[finalize] EPUB 导出失败（继续交付其他格式）: {e}", exc_info=True)
 
     _cleanup_backups(backup_dir)

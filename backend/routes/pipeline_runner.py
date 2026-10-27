@@ -72,7 +72,7 @@ async def run_pipeline(req, run_id: str):
             progress["completed"] = True
             progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             async with state.progress_lock:
-                await asyncio.to_thread(atomic_write_json, progress_path, progress)
+                atomic_write_json(progress_path, progress)
             logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
             # 记录历史必须在 done 事件之前，确保前端/测试拉取历史时已是完成态
             _history_record(progress_path, progress)
@@ -142,7 +142,7 @@ async def run_pipeline(req, run_id: str):
                 progress["pipeline_running"] = False
                 progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 async with state.progress_lock:
-                    await asyncio.to_thread(atomic_write_json, progress_path, progress)
+                    atomic_write_json(progress_path, progress)
                 logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
                 # 完成态已在 try 块中记录历史；失败/中止态需要在此补记
                 if not progress.get("completed"):
@@ -347,7 +347,7 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
 
     progress['current_phase'] = 'phase0_confirm'
     async with state.progress_lock:
-        await asyncio.to_thread(atomic_write_json, progress_path, progress)
+        atomic_write_json(progress_path, progress)
     logger.info(f"[phase0] 拆书预览等待确认 run_id={run_id}（{det.get('reason') or det.get('mode')}）")
 
     while True:
@@ -377,7 +377,7 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
 
     progress['current_phase'] = 'phase1'
     async with state.progress_lock:
-        await asyncio.to_thread(atomic_write_json, progress_path, progress)
+        atomic_write_json(progress_path, progress)
 
 async def wait_fix_review(req, progress, progress_path, run_id):
     """fix_gaps 闭环：仅 diagnose_json 已配置且重构模式为 fix_gaps 时，
@@ -390,7 +390,7 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     gaps = _collect_diagnosed_gaps(req.diagnose_json)
     progress['current_phase'] = 'phase1_fixreview'
     async with state.progress_lock:
-        await asyncio.to_thread(atomic_write_json, progress_path, progress)
+        atomic_write_json(progress_path, progress)
     # 同 wait_split_confirm：先 clear 再推送，否则确认会被紧随的 clear() 抹掉。
     state.fix_review_confirm.clear()
     sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
@@ -403,7 +403,7 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     logger.info(f"[fix_review] 已吸收用户勾选 fix_list={progress.get('fix_list')}")
     progress['current_phase'] = 'phase2'
     async with state.progress_lock:
-        await asyncio.to_thread(atomic_write_json, progress_path, progress)
+        atomic_write_json(progress_path, progress)
 
 def _collect_diagnosed_gaps(diag_path: str) -> list:
     """读取 diagnose_json 目录下诊断批次文件的 gaps，汇总为前端可选清单。"""
@@ -504,10 +504,10 @@ async def log_error(progress_path: Path, error, progress: dict | None = None):
     try:
         async with state.progress_lock:
             from utils.progress_io import read_progress
-            disk = await asyncio.to_thread(read_progress, progress_path)
+            disk = read_progress(progress_path)
             disk.setdefault("error_logs", []).append(entry)
             disk["error_logs"] = disk["error_logs"][-100:]
-            await asyncio.to_thread(atomic_write_json, progress_path, disk)
+            atomic_write_json(progress_path, disk)
     except Exception as e:
         # 不能静默：写盘失败时 run_pipeline 的 finally 会用内存副本覆盖 progress.json，
         # 届时错误原因会彻底丢失，界面只显示「失败」却无因。
