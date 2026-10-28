@@ -113,24 +113,49 @@ def restore(output_path: Path, version_id: str) -> dict:
     # 先快照当前成品，保证「恢复」这个动作本身可被回退
     cur_name = snapshot(output_path, novel_name="恢复前")
     final_dir = output_path / "03_final"
-    tmp = output_path / ("._restore_tmp")
+    # 临时/备份名带时间戳：上一轮删不掉的残留（杀软、Word 占用）不该让此后每次
+    # 恢复都卡在预清理上。
+    _ts = time.strftime("%Y%m%d_%H%M%S")
+    tmp = output_path / f"._restore_tmp_{_ts}"
     # backup_dir 必须在 try 之前绑定：否则 copytree 一旦抛错，finally 里引用
     # 未绑定的名字会再抛 NameError，把真实异常盖掉、还残留临时目录。
-    backup_dir = output_path / "._restore_old"
+    backup_dir = output_path / f"._restore_old_{_ts}"
+    replaced = False
     try:
-        if tmp.exists():
-            shutil.rmtree(tmp)
         shutil.copytree(src, tmp)
-        # 原子替换 03_final
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir)
         if final_dir.exists():
             shutil.move(str(final_dir), str(backup_dir))
-        shutil.move(str(tmp), str(final_dir))
+        # shutil.move 在目标目录**已存在**时不抛异常，而是把源嵌进去（实测返回
+        # "<dst>/tmpdir"）——另一个写者当场重建 03_final 就会走到这一支。所以成功
+        # 与否必须按返回值判：拿「没抛错」当依据，下一步就会删掉装着用户现有成品
+        # 的 backup_dir，界面却显示恢复成功。
+        landed = Path(shutil.move(str(tmp), str(final_dir)))
+        if landed != final_dir:
+            raise RuntimeError(f"成品替换没有落到原位，新内容停在 {landed}")
+        replaced = True
+    except Exception as e:
+        # 失败：先把用户现有成品放回原位。回滚可能被同一个占用再次挡住，那时
+        # 保留完整现场并在报错里给出存活路径，绝不装作没事。
+        if backup_dir.exists():
+            try:
+                if final_dir.exists():
+                    shutil.rmtree(final_dir)
+                shutil.move(str(backup_dir), str(final_dir))
+            except OSError as roll_err:
+                raise RuntimeError(
+                    f"恢复失败，且旧成品无法放回原位：完整副本保留在 {backup_dir}，"
+                    f"请关闭正在占用 03_final 的程序后手动移回"
+                    f"（原因：{type(e).__name__}: {e} / 回滚：{roll_err}）") from e
+        raise
     finally:
         if tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
-        if backup_dir.exists():
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        if replaced and backup_dir.exists():
+            if cur_name is None:
+                # 恢复前的快照没做成（snapshot 只 warning 返回 None）⇒ 这里是旧成品
+                # 的唯一副本，即使替换成功也不能删。
+                logger.warning(f"[versions] 恢复前快照失败，旧成品完整保留在 {backup_dir}")
+            else:
+                shutil.rmtree(backup_dir, ignore_errors=True)
     logger.info(f"[versions] 已恢复成品版本 {version_id}")
     return {"restored": version_id, "snapshot_before_restore": cur_name}
