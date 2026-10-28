@@ -41,6 +41,13 @@ COMPRESS_MIN_BUDGET_CHARS = 400   # 预算地板：低于此值不值得再分�
 MAX_COMPRESS_ROUNDS = 4           # 不收敛就转等距抽样
 GAP_DIGEST_MAX_CHARS = 3000       # 断层清单在蓝图上下文里的预留上限
 
+# #22 压缩缓存 LRU 上限：条目数与总字节双口径淘汰。
+# 作用域 = 单本书的输出目录：缓存目录是 <输出目录>/_diagnostics/blueprint_map，
+# 书与书之间物理隔离；缓存 key = 内容哈希 + 模型 + 提示词版本，避免换模型/换版本
+# 后误命中旧压缩结果。
+CACHE_MAX_ENTRIES = 50
+CACHE_MAX_BYTES = 20 * 1024 * 1024
+
 MapCall = Callable[[str, int], Awaitable[str]]
 ProgressFn = Callable[[int, int, int], None]
 
@@ -171,6 +178,40 @@ def _save_cached(path: Path, *, key: str, text: str, model: str) -> None:
         logger.warning(f"[blueprint] 写压缩缓存失败（忽略）{path}: {e}")
 
 
+def _evict_cache_lru(cache_dir: Path) -> int:
+    """按 mtime 最旧优先淘汰缓存条目，直到条目数与总字节都在限额内；返回淘汰条数。
+
+    淘汰以最旧 mtime 为准（LRU 的近似：写回即刷新 mtime，最近用过的条目保留）。
+    目录不存在或无条目时返回 0；单条删除失败只记日志，不中断整轮淘汰。
+    """
+    if not cache_dir.is_dir():
+        return 0
+    # 收集时 stat 包 try：glob 与 stat 之间文件可能被另一进程/杀软删掉，
+    # 直接 p.stat() 会把整轮淘汰炸成未捕获异常。
+    files = []
+    for p in cache_dir.glob("arc_*.json"):
+        try:
+            if p.is_file():
+                files.append((p.stat().st_mtime_ns, p.stat().st_size, p))
+        except OSError:
+            continue
+    if not files:
+        return 0
+    # 最旧在前，淘汰时从队首删
+    files.sort(key=lambda t: t[0])
+    total = sum(t[1] for t in files)
+    evicted = 0
+    while files and (len(files) > CACHE_MAX_ENTRIES or total > CACHE_MAX_BYTES):
+        _mtime, size, oldest = files.pop(0)
+        try:
+            oldest.unlink()
+            total -= size
+            evicted += 1
+        except OSError as e:
+            logger.warning(f"[blueprint] 淘汰缓存失败 {oldest}: {e}")
+    return evicted
+
+
 def _clean_map_output(text: str) -> str:
     text = (text or "").strip()
     m = re.fullmatch(r"```(?:[a-zA-Z]+)?\s*([\s\S]*?)```", text)
@@ -195,6 +236,7 @@ async def _map_one(
     if cached is not None:
         meta["cache_hits"] += 1
         return cached
+    meta["cache_misses"] += 1
 
     target = max(MAP_TARGET_MIN_CHARS,
                  min(MAP_TARGET_MAX_CHARS, int(len(text) * MAP_TARGET_RATIO)))
@@ -207,6 +249,8 @@ async def _map_one(
         meta["fallback_items"] += 1
     else:
         _save_cached(path, key=key, text=out, model=model)
+        # #22：写回后按条目数/字节双口径 LRU 淘汰，避免长进程跨多本书无限累积。
+        _evict_cache_lru(path.parent)
     return out
 
 
@@ -233,6 +277,7 @@ async def compress_summaries(
         "rounds": 0,
         "map_calls": 0,
         "cache_hits": 0,
+        "cache_misses": 0,
         "fallback_items": 0,
         "sampled": False,
     }
@@ -402,6 +447,7 @@ async def build_blueprint_context(
         f"[phase2] 蓝图上下文：摘要 {len(pairs)} 段 / {meta['original_chars']} 字 → "
         f"{meta['final_items']} 段 / {meta['final_chars']} 字；"
         f"map 调用 {meta['map_calls']} 次、缓存命中 {meta['cache_hits']} 次、"
+        f"未命中 {meta['cache_misses']} 次、"
         f"抽样={meta['sampled']}；断层 {gap['included']}/{gap['total']}"
     )
     if meta["sampled"] and emit:

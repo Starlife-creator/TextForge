@@ -114,7 +114,7 @@ def phase4_finalize(output_path: Path, progress: dict, req):
     for ch in original_chapters:
         try:
             ch_file = find_reconstructed_chapter(output_path, ch['id'], progress)
-            merged_texts.append(ch_file.read_text(encoding='utf-8', newline=''))
+            merged_texts.append(ch_file.read_text(encoding='utf-8'))
         except FileNotFoundError:
             if ch.get('is_empty'): merged_texts.append("")
             else: raise
@@ -142,7 +142,29 @@ def phase4_finalize(output_path: Path, progress: dict, req):
             _write_with_backup(output_file, [text], output_format, backup_dir, rich=rich)
         output_file = final_dir / f"{novel_name}_重构终稿.{output_format}"
         _write_with_backup(output_file, merged_texts, output_format, backup_dir, rich=rich)
-    
+
+    # #20：勾选 export_epub 时额外产出 EPUB（导航目录 + 粗斜体映射）；失败不阻断其他格式交付。
+    if getattr(req, "export_epub", False):
+        from core.epub import write_epub
+        epub_chapters = [
+            {"id": ch["id"], "title": ch.get("title") or ch.get("filename"), "text": text}
+            for ch, text in zip(original_chapters, merged_texts, strict=False)
+        ]
+        try:
+            write_epub(final_dir / f"{novel_name}_重构终稿.epub", epub_chapters,
+                       title=novel_name_raw)
+            progress["epub_export"] = {"status": "ok",
+                                       "generated_at": datetime.datetime.now().isoformat(timespec="seconds")}
+        except Exception as e:
+            # 与质量报告同一口径：失败不拖垮其他格式，但必须留痕，否则用户勾了
+            # export_epub 却没拿到产物时界面仍显示完成、历史里无任何线索。
+            progress["epub_export"] = {
+                "status": "failed",
+                "error": f"{type(e).__name__}: {e}"[:500],
+                "generated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+            logger.warning(f"[finalize] EPUB 导出失败（继续交付其他格式）: {e}", exc_info=True)
+
     _cleanup_backups(backup_dir)
     write_stitch_report(output_path, progress)
     write_quality_report_safely(

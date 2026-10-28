@@ -88,10 +88,23 @@ jobs:
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
+      # #24：前端依赖漏洞扫描，放 job 最后——audit 红不该吃掉前面 Rust 编译/测试门。
+      # 口径：--omit=dev 只审计进 Tauri 产物的运行时依赖。
+      - name: 前端依赖漏洞扫描 (npm audit)
+        if: always()
+        run: npm audit --omit=dev --audit-level high
+
   # ------------------------------------------------------------ 后端单元/回归/代码质量
-  backend-unit:
-    name: 后端单测 / 回归 / 事件流 / 代码质量
-    runs-on: windows-latest
+  # #16：跨平台矩阵。pytest / ruff / mypy 为纯 Python 检查，三平台同口径执行；
+  # regression_test.py / test_event_stream.py 仍含 Windows 专属断言（%APPDATA%、winreg），
+  # 暂只在 Windows runner 运行，待脚本去平台耦合后再纳入 Ubuntu/macOS（#16 剩余项）。
+  backend-check:
+    name: 后端单测 / 代码质量 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - name: 检出代码
@@ -109,11 +122,9 @@ jobs:
         run: |
           cd backend
           python -m venv venv
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           # 一律用 `python -m pip`：Windows 上正被执行的 pip.exe 是自己，就地升级会因
           # 无法替换在用的可执行文件而失败（pip 的报错原文也让你改用这种形式）。
-          # 上一轮直接写 `pip install --upgrade pip`，runner 镜像里 pip 一有小版本更新，
-          # 两条流水线就会同时卡在「准备虚拟环境」这一步，后端闸门全被跳过。
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
@@ -121,31 +132,53 @@ jobs:
         shell: bash
         run: |
           cd backend
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           ruff check .
 
       - name: 后端类型检查 (mypy)
         shell: bash
         run: |
           cd backend
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           mypy --config-file mypy.ini .
 
       - name: pytest
         shell: bash
         run: |
           cd backend
-          source venv/Scripts/activate
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           python -m pytest tests -q
 
       # 脚本形态而非 pytest 收集：这两个文件在模块顶层执行并自行退出码。
-      - name: 回归 / 事件流
+      # 仅 Windows：脚本内含 %APPDATA%/winreg 专属断言，去平台耦合前不在非 Windows 运行。
+      - name: 回归 / 事件流（Windows 专属）
+        if: matrix.os == 'windows-latest'
         shell: bash
         run: |
           cd backend
           source venv/Scripts/activate
           python regression_test.py
           python test_event_stream.py
+
+      # #24：后端依赖漏洞扫描，高危漏洞直接阻断合并。锁文件口径见 #14。
+      # 口径：只审 requirements.txt（进 PyInstaller 产物的运行时直依赖）；
+      # pytest 等 dev 工具链不进最终 app，单开一条 continue-on-error 的记录步，
+      # 避免把"测试框架本地提权"这种公告挡在合并上。
+      - name: 后端依赖漏洞扫描 (pip-audit)
+        shell: bash
+        run: |
+          cd backend
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
+          python -m pip install pip-audit
+          pip-audit -r requirements.txt --desc on
+      - name: dev 工具链漏洞扫描（记录不阻断）
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd backend
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
+          pip-audit -r requirements-dev.txt --desc on
 
   # ------------------------------------------------------------------ 端到端
   e2e:
@@ -215,3 +248,15 @@ jobs:
 
       - name: Rust 编译检查
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      # #24：Rust 依赖漏洞扫描，真实漏洞阻断合并。
+      # 注意：cargo-audit 没有 --manifest-path 选项（原命令 exit 2、从未真审计过）；
+      # 必须用 working-directory 切到 src-tauri，让它读当前目录的 Cargo.toml。
+      # 不挂 --deny warnings：unmaintained/yanked/unsound 类警告仍全打日志供追踪，
+      # 但 yoke-derive 等 yanked 条目没有 RUSTSEC ID、无法 --ignore；一个永久红的
+      # 闸门最后会被整条删掉，那是当初加它的反面。
+      - name: Rust 依赖漏洞扫描 (cargo audit)
+        working-directory: src-tauri
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

@@ -94,7 +94,7 @@ def apply_stitches(output_path: Path, stitches_by_file: dict) -> None:
     """v8.8 幂等版：哈希不匹配时先判断补丁是否已应用（恢复场景），已应用则跳过，否则才报错。"""
     for file_rel, patches in stitches_by_file.items():
         file_path = output_path / file_rel
-        text = file_path.read_text(encoding='utf-8', newline='')
+        text = file_path.read_text(encoding='utf-8')
         text = unicodedata.normalize('NFC', text)
 
         sorted_patches = sorted(patches, key=lambda s: s['start'], reverse=True)
@@ -106,7 +106,16 @@ def apply_stitches(output_path: Path, stitches_by_file: dict) -> None:
 
         for s in sorted_patches:
             current_segment = text[s['start']:s['end']]
-            if sha256_of(current_segment) == s['before_hash']:
+            # 跨版本续跑：旧 progress 的 before_hash 可能是在 CRLF 文本上算的，
+            # 而 read_text(universal newlines) 已把 CRLF 折成 LF。双向归一：
+            # 原样、LF 版、CRLF 版各算一次哈希，任一匹配即应用；都不匹配才走
+            # 「已应用」兜底或抛错——避免一次行尾差异就整轮缝合失败。
+            seg_lf = current_segment.replace("\r\n", "\n").replace("\r", "\n")
+            seg_crlf = seg_lf.replace("\n", "\r\n")
+            seg_hash = sha256_of(current_segment)
+            if (seg_hash == s['before_hash']
+                    or sha256_of(seg_lf) == s['before_hash']
+                    or sha256_of(seg_crlf) == s['before_hash']):
                 text = text[:s['start']] + s['replacement'] + text[s['end']:]
                 s['applied'] = True
             elif _segment_already_applied(text, s):
@@ -149,8 +158,8 @@ async def _stitch_common(prev_file_rel, next_file_rel, output_path, payload_base
     from core.api_client import call_with_retry, RetryableBusinessError
     prev_file = output_path / prev_file_rel
     next_file = output_path / next_file_rel
-    prev_text = unicodedata.normalize('NFC', prev_file.read_text(encoding='utf-8', newline=''))
-    next_text = unicodedata.normalize('NFC', next_file.read_text(encoding='utf-8', newline=''))
+    prev_text = unicodedata.normalize('NFC', prev_file.read_text(encoding='utf-8'))
+    next_text = unicodedata.normalize('NFC', next_file.read_text(encoding='utf-8'))
     
     stitch_extract_limit = stitch_window_chars(chars)
     prev_seg = prev_text[-stitch_extract_limit:]
@@ -254,7 +263,7 @@ async def apply_batch_stitch(prev_batch, next_batch, client, payload_base, sse_e
     if payload_base.get('skip_smooth'):
         next_file = Path(payload_base['output_path']) / next_file_rel
         if next_file.exists():
-            head = unicodedata.normalize('NFC', next_file.read_text(encoding='utf-8', newline=''))[:400]
+            head = unicodedata.normalize('NFC', next_file.read_text(encoding='utf-8'))[:400]
             if _is_hard_break(head):
                 logger.info(f"[stitch] skip_smooth：边界 {prev_batch['batch_id']}->{next_batch['batch_id']} 为硬分章断点，跳过缝合")
                 return []
@@ -284,7 +293,7 @@ def _is_hard_break(text: str) -> bool:
 
 def merge_virtual_chapters(virtuals_sorted, output_path, progress):
     """v8.8 修正：用 \n\n 拼接避免粘连；合并后更新父章 hash。"""
-    merged = "\n\n".join((output_path / _virtual_output_rel(v)).read_text(encoding='utf-8', newline='') for v in virtuals_sorted)
+    merged = "\n\n".join((output_path / _virtual_output_rel(v)).read_text(encoding='utf-8') for v in virtuals_sorted)
     original_id = virtuals_sorted[0]['original_id']
     merged_file = output_path / "02_workspace/reconstructed" / f"chapter_{original_id}.txt"
     atomic_write_text(merged_file, merged)

@@ -1,4 +1,4 @@
-import asyncio, json, time, logging
+import asyncio, json, time, logging, hashlib
 from pathlib import Path
 from routes import state
 from routes.events import sse_emit
@@ -8,8 +8,9 @@ from core.pipeline import phase2_blueprint
 from core.refactor import phase3_refactor_stitch
 from core.finalize import phase4_finalize
 from utils.atomic import atomic_write_json
+from utils.redact import redact
 from utils.version import VERSION
-from core.prompt_version import PROMPT_VERSION
+from core.prompt_registry import PROMPT_VERSION, stage_versions, load_registry
 
 logger = logging.getLogger("textforge")
 
@@ -105,6 +106,13 @@ async def run_pipeline(req, run_id: str):
         logger.error(f"[run_pipeline] 闸门回读失败 run_id={run_id}: {e}")
         sse_emit("error", {"kind": "gate_read_failed", "code": "progress_unreadable",
                            "message": str(e)}, run_id)
+        await log_error(progress_path, e, progress)
+    except state.GateTimeoutError as e:
+        # #2 闸门超时：事件丢失/前端未弹窗导致的永久挂起由超时兜底，安全暂停并留痕。
+        logger.warning(f"[run_pipeline] 闸门超时暂停 run_id={run_id}: {e}")
+        sse_emit("gate_timeout", {"gate": progress.get("gate_timeout_gate") if progress else None,
+                                  "waiting_seconds": progress.get("gate_wait_seconds") if progress else None,
+                                  "message": str(e)}, run_id)
         await log_error(progress_path, e, progress)
     except asyncio.CancelledError:
         logger.info(f"[run_pipeline] 已停止 run_id={run_id}")
@@ -202,12 +210,38 @@ def _history_record(progress_path: Path, progress: dict) -> None:
         logger.warning(f"[history] 记录失败（忽略）: {e}")
 
 def _cfg_brief(value) -> str:
-    """把配置值压成一行短文本，避免把整份人名映射/模型表塞进提示。"""
+    """把配置值压成一行短文本，避免把整份人名映射/模型表塞进提示。
+
+    P0-1：序列化前先递归脱敏——分阶段模型表 models 可携带 api_key/token，
+    否则明文会进入 config_drift 差异文案、progress 与状态回传。
+    """
+    value = redact(value)
     if isinstance(value, (dict, list)):
         text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     else:
         text = str(value)
     return text if len(text) <= 120 else text[:117] + "..."
+
+
+def _fingerprint(value) -> str:
+    """结构指纹：敏感键（api_key/token 等）取 sha256(str(v))[:8]，非敏感键取原值。
+
+    与 _cfg_brief 的区别：brief 先 redact 成 *** 再比，于是「只换密钥不换模型」
+    两侧都是 ***、比较相等、漂移漏报。指纹保留敏感键的「不同」（哈希不同即可检出），
+    但哈希是单向的——明文既不落盘也不回传，满足 P0-1。
+    """
+    from utils.redact import _is_sensitive_key
+    def walk(v):
+        if isinstance(v, dict):
+            return {
+                k: (hashlib.sha256(str(val).encode("utf-8")).hexdigest()[:8]
+                    if _is_sensitive_key(k) else walk(val))
+                for k, val in v.items()
+            }
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+    return json.dumps(walk(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _config_drift(existing: dict, req) -> list[str]:
@@ -233,10 +267,19 @@ def _config_drift(existing: dict, req) -> list[str]:
             str(existing["input_path"]) != str(req.input_path):
         diffs.append(f"输入路径已变更（{existing['input_path']} → {req.input_path}）")
 
-    # 提示词版本只影响尚未生成的阶段；旧 progress 没有该字段时无法判断，跳过。
-    prev_pv = existing.get("prompt_version")
-    if prev_pv and str(prev_pv) != PROMPT_VERSION:
-        diffs.append(f"提示词版本：{prev_pv} → {PROMPT_VERSION}")
+    # #7：逐阶段比对提示词版本；新 progress 存 prompt_versions 映射。
+    prev_versions = existing.get("prompt_versions") or {}
+    current_versions = stage_versions()
+    if prev_versions:
+        for stage, cur in current_versions.items():
+            prev = prev_versions.get(stage)
+            if prev is not None and str(prev) != str(cur):
+                diffs.append(f"提示词·{stage}：{prev} → {cur}")
+    else:
+        # 旧 progress 只有全局串：保留兼容比对；没有该字段则跳过（无法判断）。
+        prev_pv = existing.get("prompt_version")
+        if prev_pv and str(prev_pv) != PROMPT_VERSION:
+            diffs.append(f"提示词版本：{prev_pv} → {PROMPT_VERSION}")
 
     # 其余会影响产出的字段：只比较旧 progress 里确实存在的键
     for key, label in (
@@ -253,7 +296,7 @@ def _config_drift(existing: dict, req) -> list[str]:
         if key not in existing:
             continue
         prev, cur = existing.get(key), getattr(req, key, None)
-        if _cfg_brief(prev) != _cfg_brief(cur):
+        if _fingerprint(prev) != _fingerprint(cur):
             diffs.append(f"{label}：{_cfg_brief(prev)} → {_cfg_brief(cur)}")
     return diffs
 
@@ -265,11 +308,18 @@ def _load_or_init_progress(req, run_id, progress_path):
     失败（文件被占用 / 杀软扫描 / 崩溃半截文件）直接重建并覆盖用户的进度，
     表现为"重开像什么都没保存"。现在读不了就明确报错并停下，交由用户处理。
     """
-    from utils.progress_io import ProgressUnreadable, is_completed, try_read_progress
-    try:
-        existing = try_read_progress(progress_path)
-    except ProgressUnreadable as e:
-        raise RuntimeError(str(e)) from e
+    from utils.progress_io import (
+        ProgressUnreadable, is_completed, migrate_progress_file,
+    )
+    existing = None
+    if progress_path.exists():
+        # 只读一次盘：migrate_progress_file 内部已 json.loads，不再先 try_read_progress
+        # 预检一遍数十 MB 文件（#14 消除事件循环里的重复解析）。文件损坏按
+        # ProgressUnreadable 上抛，不静默重建。
+        try:
+            existing, _migrations = migrate_progress_file(progress_path)
+        except ProgressUnreadable as e:
+            raise RuntimeError(str(e)) from e
     if existing is not None:
         # 旧判据是 current_phase != 'phase4'，但 phase4 在 finalize 之前就写入，
         # 渲染失败时会被误判为「已完成、不可续跑」。现在只认显式 completed。
@@ -281,8 +331,9 @@ def _load_or_init_progress(req, run_id, progress_path):
             existing['completed'] = False
             drifts = _config_drift(existing, req)
             if drifts:
-                # 记进 progress 供界面展示；不阻断（用户可能是有意换的）
-                existing.setdefault('config_drift', drifts)
+                # 记进 progress 供界面展示；不阻断（用户可能是有意换的）。
+                # 直接覆盖本次漂移：迁移回填的空列表会挡住 setdefault，旧漂移不应残留。
+                existing["config_drift"] = drifts
                 logger.warning(f"[run_pipeline] 续跑配置与上次不一致：{drifts}")
             logger.info(f"[run_pipeline] 恢复进度 phase={existing['current_phase']}")
             return existing
@@ -322,9 +373,10 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
 
     while True:
         _push_preview()
-        while not state.split_confirm.is_set() and not state.split_redo.is_set():
-            if state.stop_requested: raise asyncio.CancelledError()
-            await asyncio.sleep(0.5)
+        await state.wait_gate(
+            state.split_confirm, alternative=state.split_redo,
+            gate=state.GATE_SPLIT, progress=progress, progress_path=progress_path,
+            tick=0.5, release_events=(state.split_redo,))
         if state.split_confirm.is_set():
             break
         # 用户要求按自定义标记重新拆分：原地重拆后重新预览（不退出本门）
@@ -364,9 +416,9 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     state.fix_review_confirm.clear()
     sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
     logger.info(f"[fix_review] 断层勾选等待确认（{len(gaps)} 项）run_id={run_id}")
-    while not state.fix_review_confirm.is_set():
-        if state.stop_requested: raise asyncio.CancelledError()
-        await asyncio.sleep(1.0)
+    await state.wait_gate(
+        state.fix_review_confirm, gate=state.GATE_FIX,
+        progress=progress, progress_path=progress_path, tick=1.0)
     # 用户勾选的断层清单由控制端点写入 progress.json，这里并回内存（否则会被本循环的写盘覆盖）
     await state.absorb_gate_result(progress, progress_path, ['fix_list'])
     logger.info(f"[fix_review] 已吸收用户勾选 fix_list={progress.get('fix_list')}")
@@ -407,11 +459,15 @@ async def check_pause(run_id):
         sse_emit("resumed", {}, run_id)
 
 def init_progress(req, run_id):
+    # #7：启动期校验注册表条目齐全；缺失即 fail-fast，不静默退回内联旧文本。
+    load_registry()
     novel_name = req.novel_name or (
         Path(req.input_path).parent.name if req.input_mode == "single_file" else Path(req.input_path).name
     ) or "重构终稿"
     return {
-        "schema_version": VERSION, "prompt_version": PROMPT_VERSION, "run_id": run_id,
+        "schema_version": VERSION, "prompt_version": PROMPT_VERSION,
+        # #7：各阶段实际使用版本随 run 落盘，续跑时按阶段比对漂移。
+        "prompt_versions": stage_versions(), "run_id": run_id,
         "input_mode": req.input_mode,
         "input_format": req.input_format, "input_path": req.input_path, "output_path": req.output_path,
         "api_config": {"api_url": req.api_url, "model": req.model, "context_window": req.context_window},
@@ -423,7 +479,8 @@ def init_progress(req, run_id):
         "name_map": getattr(req, "name_map", {}),
         "fix_list": getattr(req, "fix_list", []),
         "diagnose_json": getattr(req, "diagnose_json", None),
-        "models": getattr(req, "models", {}),
+        # P0-1：progress.json 不落盘明文 api_key/token；密钥仅留存于本次运行内存。
+        "models": redact(getattr(req, "models", {})),
         "max_concurrency": getattr(req, "max_concurrency", 1),
         "auto_rewrite_count": 0,
         "auto_rewritten_batches": [],

@@ -1,5 +1,36 @@
-import tempfile, os, json
+import tempfile, os, json, time
 from pathlib import Path
+
+
+def replace_with_retry(tmp: str, path: Path) -> None:
+    """os.replace 的 Windows 容错版本。
+
+    Windows 上杀软/资源管理器/另一个线程正打开目标文件时，os.replace 会抛
+    PermissionError [WinError 5]，而不是 POSIX 上的原子替换。e2e 实测：控制端点把
+    Story_Bible.md 的写丢进 worker 线程，同时 status 线程正在读它，无互斥即撞。
+
+    只对 PermissionError 退避重试（20/40/80/160/320ms，总上界 ~620ms，远小于
+    任何闸门超时）；FileNotFoundError/其他 OSError 直接上抛，不吞真问题。
+    """
+    delays = (0.02, 0.04, 0.08, 0.16, 0.32)
+    last = None
+    for i in range(len(delays) + 1):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as e:
+            last = e
+            if i < len(delays):
+                time.sleep(delays[i])
+            else:
+                raise
+    if last is not None:
+        raise last
+
+
+# 内部别名（旧调用点保留 _replace_with_retry 名称）
+_replace_with_retry = replace_with_retry
+
 
 def atomic_write_json(path: Path, data: dict, *, pretty: bool = True):
     """原子写 JSON（临时文件 + os.replace）。
@@ -22,7 +53,7 @@ def atomic_write_json(path: Path, data: dict, *, pretty: bool = True):
             else:
                 json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
                 f.flush()
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except Exception:
         try:
             if os.path.exists(tmp):
@@ -39,7 +70,7 @@ def atomic_write_text(path: Path, text: str):
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     except Exception:
         if os.path.exists(tmp):
             os.unlink(tmp)

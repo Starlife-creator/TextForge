@@ -17,6 +17,9 @@ def setup_logging():
     file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
     file_handler.setLevel(logging.INFO)
     file_handler.addFilter(SensitiveFilter())
+    # #12：第三方库（httpx/starlette 等）日志传播到 root，此前过滤器只挂在
+    # textforge 的文件 handler 上会被绕过；root logger 同样挂过滤器兜底脱敏。
+    logging.getLogger().addFilter(SensitiveFilter())
     log_queue = queue.Queue(-1)
     queue_handler = QueueHandler(log_queue)
     logger.addHandler(queue_handler)

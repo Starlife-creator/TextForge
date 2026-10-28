@@ -7,11 +7,12 @@
 import codecs
 import os, sys, time, platform, json, asyncio, subprocess, threading
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, Body, Query
+from fastapi import APIRouter, HTTPException, Body, Query, Response
 import httpx
 from routes import state
 from utils.appdir import data_dir
 from utils.version import VERSION
+from utils.errors import raise_internal_error
 import logging
 
 router = APIRouter()
@@ -221,7 +222,34 @@ async def system_logs(lines: int = Query(200, ge=10, le=5000), offset: int = Que
         # 纯文件 I/O 放线程池：日志最多 10MB，不应阻塞事件循环/SSE 心跳
         return await asyncio.to_thread(_read_log_slice, log_path, lines, offset)
     except OSError as e:
-        raise HTTPException(500, f"读取日志失败: {e}")
+        # #6：500 不回传内部细节，异常进日志。
+        raise raise_internal_error(e, "读取日志失败，详情请查看后端日志", "system_logs")
+
+
+@router.get("/api/system/diagnostic_bundle")
+async def system_diagnostic_bundle(output_path: str | None = Query(None)):
+    """#18：下载后端诊断包（系统信息 + 日志尾部 + progress 脱敏摘要 + 质量报告）。
+
+    供「上报问题」一键打包；不下载 progress.json 全文，密钥/模型配置一律脱敏。
+    打包属磁盘读取 + zip 压缩，经线程池执行，不阻塞事件循环。
+    """
+    from utils.diagnostics import build_diagnostic_bundle
+    # output_path 由 query 直接进入磁盘读取：存在性与类型先校验，避免把
+    # 任意字符串透传给 Path() 后在 build 内部炸成未包装的 500。
+    if output_path:
+        from pathlib import Path as _P
+        _out = _P(output_path)
+        if not _out.is_dir():
+            raise HTTPException(400, f"output_path 不是存在的目录：{output_path}")
+    blob = await asyncio.to_thread(
+        build_diagnostic_bundle, output_path,
+        log_path=_path("LOG_PATH"),
+    )
+    filename = f"textforge-diagnostic-{time.strftime('%Y%m%d-%H%M%S')}.zip"
+    return Response(
+        content=blob, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/api/system/open")
@@ -246,7 +274,8 @@ async def system_open(payload: dict = Body(...)):
         else:
             subprocess.Popen(["xdg-open", str(p)])
     except Exception as e:
-        raise HTTPException(500, f"打开失败: {e}")
+        # #6：500 不回传内部细节。
+        raise raise_internal_error(e, "打开失败，请检查系统文件管理器", "system_open")
     logger.info(f"[system] 打开 {target}: {p}")
     return {"status": "opened", "path": str(p)}
 
@@ -374,7 +403,9 @@ async def system_llm_check(payload: dict = Body(...)):
     except httpx.HTTPError as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}", "elapsed_ms": round((time.time()-t0)*1000)}
     if resp.status_code != 200:
-        return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:300]}",
+        # #6：上游响应片段属内部细节，只截断记入日志，不回传客户端。
+        logger.warning("[system] 模型探测 HTTP %s: %s", resp.status_code, resp.text[:300])
+        return {"ok": False, "error": f"模型服务返回 HTTP {resp.status_code}",
                 "elapsed_ms": round((time.time() - t0) * 1000)}
     text = ""
     model_echo = model

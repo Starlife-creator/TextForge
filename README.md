@@ -57,7 +57,7 @@ Tauri + Vue 3 + FastAPI，后端以 sidecar 随应用分发。
 ## 目录结构
 
 ```
-backend/               FastAPI 后端（Python 3.12+）
+backend/               FastAPI 后端（Python 3.13+）
   core/                流水线各阶段：拆章、诊断、蓝图、重构、缝合、收尾
   routes/              HTTP 接口
   utils/               appdir（数据目录）、auth（调用方鉴权）、日志、token 估算
@@ -125,13 +125,15 @@ onefile 每次运行都要把载荷解压到 `%TEMP%\_MEIxxx`，既是启动慢�
 
 ## 本地开发
 
-```bash
-# 依赖
-cd backend && python -m venv venv && venv\Scripts\activate
-pip install -r requirements.txt
-pip install pyinstaller
-cd .. && npm install
+### 环境准备
 
+| 步骤 | Windows | Linux / macOS |
+|---|---|---|
+| 后端虚拟环境 | `cd backend && python -m venv venv && venv\Scripts\activate` | `cd backend && python3 -m venv venv && source venv/bin/activate` |
+| 后端依赖 | `pip install -r requirements-dev.txt` | 同左 |
+| 前端依赖 | `npm ci`（仓库根目录） | 同左 |
+
+```bash
 # 构建 sidecar（产出 src-tauri\binaries\）
 backend\build_sidecar.bat
 
@@ -140,21 +142,26 @@ python backend\main.py          # 终端 A
 npm run tauri dev               # 终端 B
 ```
 
-### 测试
+### 测试与质量门命令表
 
-```bash
-cd backend
-venv\Scripts\python regression_test.py    # 回归 / 单元
-venv\Scripts\python test_event_stream.py  # SSE 事件流
-venv\Scripts\python -m pytest tests -q    # pytest 单元
-venv\Scripts\python test_e2e_pipeline.py  # 端到端（含并发/连续性/自动重写）
+| 检查项 | 命令（仓库根目录） | 说明 |
+|---|---|---|
+| 后端 pytest 单测 | `cd backend && python -m pytest tests -q` | 纯逻辑优先，异步用 `asyncio.run()` 包裹 |
+| 后端回归脚本 | `cd backend && python regression_test.py` | 脚本形态，非 pytest 收集 |
+| SSE 事件流 | `cd backend && python test_event_stream.py` | 事件契约回归 |
+| 端到端 mock LLM | `cd backend && python test_e2e_pipeline.py` | phase0→phase4，自动确认闸门 |
+| 后端 Lint | `cd backend && ruff check .` | CI 阻断 |
+| 后端类型检查 | `cd backend && mypy --config-file mypy.ini .` | 新模块增量门槛（#10） |
+| 前端单测 | `npm run test`（vitest） | CI 阻断 |
+| 前端 Lint | `npm run lint` | ESLint，零警告阻断 |
+| 前端排版 | `npm run format:check` | Prettier 阻断 |
+| 前端构建 | `npm run build` | `vue-tsc --noEmit && vite build` |
+| Rust 单测 | `cd src-tauri && cargo test` | 需 Rust 工具链 |
 
-cd ..\src-tauri && cargo test             # Rust 单元
-cd .. && npm run test                     # 前端单元
-npm run lint                              # ESLint 代码质量
-npm run format:check                      # Prettier 排版检查
-npm run build                             # 类型检查 + 构建
-```
+> 离线环境：`requirements-dev.txt` 已手动锁定版本；`requirements.in` /
+> `requirements-dev.in` 是 `pip-compile --generate-hashes` 的输入，联网后生成带哈希的
+> 锁文件替换当前运行时清单（#14）。架构边界、状态机与持久化清单见
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 代码风格由 `eslint.config.js`（ESLint 10 扁平配置）+ `.prettierrc.json` 统一，
 两者的规则边界靠 `@vue/eslint-config-prettier` 划开，CI 里都会阻断。

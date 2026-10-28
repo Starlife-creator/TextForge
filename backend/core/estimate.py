@@ -28,7 +28,11 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import unicodedata
+from collections import OrderedDict
 from pathlib import Path
 
 from core import blueprint
@@ -167,7 +171,56 @@ def _blueprint_calls(context_window: int, summary_sizes: list[int]) -> tuple[int
     return calls, in_tokens, out_tokens
 
 
+# #15：预估结果内存 LRU 缓存。同一份输入（路径 + mtime/size + 影响算式的配置）
+# 重复请求不重扫原文；大对象高频状态拆分属架构级改动，本轮只落 estimate 缓存。
+# 用 OrderedDict：命中 move_to_end，淘汰 popitem(last=False)，真正 LRU。
+_ESTIMATE_CACHE: OrderedDict[str, dict] = OrderedDict()
+_ESTIMATE_CACHE_MAX = 16
+
+
+def _input_signature(req) -> tuple:
+    """组成预估结果的输入指纹：原文文件指纹 + 影响算式的配置项。"""
+    p = Path(req.input_path)
+    sig: list = [
+        str(p), req.input_mode, req.input_format, int(req.context_window),
+        getattr(req, "author_style", "") or "",
+        bool(getattr(req, "diagnose_json", None)),
+        bool((getattr(req, "refactor_gates", {}) or {}).get("skip_stitch_if_smooth")),
+    ]
+    try:
+        if req.input_mode == "single_file":
+            st = p.stat()
+            sig.extend([st.st_mtime_ns, st.st_size])
+        elif p.is_dir():
+            sig.append(sorted(
+                (f.name, f.stat().st_mtime_ns, f.stat().st_size)
+                for f in p.iterdir() if f.is_file()
+            ))
+        else:
+            sig.append(None)
+    except OSError:
+        sig.append(None)
+    return tuple(sig)
+
+
 def estimate_run(req) -> dict:
+    """带内存 LRU 缓存的规模预估入口；返回深拷贝，避免调用方改写污染缓存。"""
+    key = hashlib.sha1(
+        json.dumps(_input_signature(req), ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+    cached = _ESTIMATE_CACHE.get(key)
+    if cached is not None:
+        _ESTIMATE_CACHE.move_to_end(key)  # 命中即 touch，真 LRU
+        return copy.deepcopy(cached)
+    result = _estimate_run_uncached(req)
+    _ESTIMATE_CACHE[key] = result
+    _ESTIMATE_CACHE.move_to_end(key)
+    while len(_ESTIMATE_CACHE) > _ESTIMATE_CACHE_MAX:
+        _ESTIMATE_CACHE.popitem(last=False)  # 淘汰最久未用
+    return copy.deepcopy(result)
+
+
+def _estimate_run_uncached(req) -> dict:
     """返回一次运行的规模与 token 预估（下界）。"""
     sizes = chapter_token_sizes(req)
     if not sizes:

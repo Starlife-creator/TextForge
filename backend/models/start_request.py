@@ -51,6 +51,8 @@ class StartRequest(BaseModel):
     diagnose_json: Optional[str] = None
     # P1.6 左右对照：phase3 后按章生成「原文 | 重构后」Markdown 对照（默认关）
     compare_output: bool = False
+    # #20 可选 EPUB 导出：成品目录额外产出 .epub（导航目录 + 粗斜体映射），默认关。
+    export_epub: bool = False
     # P1.7 章快照：重构初稿(drafts)与缝合终稿(final)按逻辑章快照到
     # 02_workspace/snapshots/（原文在 split 目录，不再重复存）（默认关）
     chapter_snapshots: bool = False

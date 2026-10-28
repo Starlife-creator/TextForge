@@ -23,11 +23,15 @@ from core.api_client import call_with_retry, make_httpx_client, pick_endpoint
 
 logger = logging.getLogger("textforge")
 
-# 候选行判定参数
-CAND_MAX_LEN = 48          # 超过这个长度基本不是标题
-MAX_CANDIDATES = 3000      # 候选行总数硬上限
-CAND_PAYLOAD_CHARS = 2400  # 单次送模型的候选文本上限（按块切分，控制上下文占用）
-AI_MAX_TOKENS = 700        # 模型只需回一串行号
+# 候选行判定参数（#19：与 quality.py 一样集中维护，取值依据写在注释里）
+# 中文标题一般 ≤20 字；48 字以上更像正文段落，不再当候选标题。
+CAND_MAX_LEN = 48
+# 候选行总数硬上限：超长小说候选爆炸时兜底，防止把上下文撑爆；超出部分规则侧丢弃。
+MAX_CANDIDATES = 3000
+# 单次送模型的候选文本块预算（字符）；配合 AI_MAX_TOKENS 控制往返体量。
+CAND_PAYLOAD_CHARS = 2400
+# 模型只需回一串行号：3000 候选每行号约 3~4 token，700 token 留足余量。
+AI_MAX_TOKENS = 700
 
 # 候选行里「看起来像标题」的正则（与 splitter 的检测规则一致）
 from core.splitter import CHAPTER_PATTERN, _EN_PATTERN, _SPECIAL_PATTERN
@@ -153,7 +157,8 @@ def _parse_starts(text: str):
 
 def _chunks(cands, payload_chars=CAND_PAYLOAD_CHARS):
     """把候选行按体积切成若干块，避免单次提示词撑爆小窗口。"""
-    cur, size = [], 0
+    cur: list = []
+    size = 0
     for ln, s in cands:
         line_len = len(s) + len(str(ln)) + 2
         if cur and size + line_len > payload_chars:

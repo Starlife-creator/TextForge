@@ -20,7 +20,12 @@ async def lifespan(app: FastAPI):
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
     if state.log_listener:
-        state.log_listener.stop()
+        # 测试进程内多次 import app 时，listener._thread 可能已被上一次 stop()
+        # join 后置 None；只吞 AttributeError，不吞 join 其他真异常。
+        try:
+            state.log_listener.stop()
+        except AttributeError:
+            pass
 
 from routes.health import router as health_router
 from routes.start import router as start_router

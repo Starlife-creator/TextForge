@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # 仅列直接依赖并锁死版本；传递依赖（pydantic-core、lxml、httpcore、
 # certifi、idna、socksio、charset-normalizer 等）由 pip 依上层依赖自动解析。
 fastapi==0.141.1

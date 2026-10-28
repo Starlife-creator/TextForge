@@ -1,10 +1,10 @@
-import asyncio, logging
+import logging
 from pathlib import Path
 from core.budget import blueprint_chars
 from utils.atomic import atomic_write_text, atomic_write_json
 from routes import state
 from routes.events import sse_emit
-from core.prompt_version import PROMPT_VERSION
+from core.prompt_registry import PROMPT_VERSION, stage_versions
 
 logger = logging.getLogger("textforge")
 
@@ -29,18 +29,19 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
             state.blueprint_confirmed.clear()
             sse_emit("blueprint_ready", {"blueprint": existing_text, "resumed": True}, run_id)
             logger.info("[phase2] 检测到待确认蓝图，恢复等待用户确认")
-            while not state.blueprint_confirmed.is_set():
-                if state.stop_requested: raise asyncio.CancelledError()
-                await asyncio.sleep(1.0)
+            await state.wait_gate(
+                state.blueprint_confirmed, gate=state.GATE_BLUEPRINT,
+                progress=progress, progress_path=progress_path, tick=1.0)
             await state.absorb_gate_result(progress, progress_path, ['blueprint_confirmed', 'blueprint_user_edited'])
             progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
             return
 
-    # 提示词版本随 run 落盘：续跑时若与上次不同，_config_drift 会提示
+    # 提示词版本随 run 落盘：续跑时若与上次不同，_config_drift 会按阶段提示
     # 「前几批用旧提示词、后几批用新提示词」，而不是静默混用。
     progress['prompt_version'] = PROMPT_VERSION
+    progress['prompt_versions'] = stage_versions()
 
     # 蓝图上限与重构预留同源（core.budget.blueprint_chars）：
     # 两处各写一份时，「生成 5000 字」与「按另一套算式预留」会静默错配。
@@ -99,9 +100,9 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
     # 同步重置暂停标志：重试失败或用户已停止的场景下，若不清会立刻被 pause 打断
     sse_emit("blueprint_ready", {"blueprint": result, "max_chars": blueprint_max}, run_id)
     logger.info("[phase2] 蓝图已生成，等待用户确认")
-    while not state.blueprint_confirmed.is_set():
-        if state.stop_requested: raise asyncio.CancelledError()
-        await asyncio.sleep(1.0)
+    await state.wait_gate(
+        state.blueprint_confirmed, gate=state.GATE_BLUEPRINT,
+        progress=progress, progress_path=progress_path, tick=1.0)
     # 用户是否编辑过蓝图由控制端点写入，这里并回内存
     await state.absorb_gate_result(progress, progress_path, ['blueprint_confirmed', 'blueprint_user_edited'])
     blueprint_text = story_bible.read_text(encoding='utf-8')
