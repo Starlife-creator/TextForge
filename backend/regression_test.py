@@ -799,6 +799,10 @@ try:
 finally:
     if _real_appdata is not None:
         os.environ["APPDATA"] = _real_appdata
+    else:
+        # Linux/macOS 上本来就没有 APPDATA 键，必须删掉临时注入的值，
+        # 否则后面的「未注入时退回默认目录」用例读到的是测试目录。
+        os.environ.pop("APPDATA", None)
     shutil.rmtree(_hist_dir, ignore_errors=True)
 
 # ---------- 本地 API 调用方鉴权 ----------
@@ -1030,8 +1034,9 @@ try:
     check("端口文件随包迁移",
           S.PORT_FILE == _second / "port.json", str(S.PORT_FILE))
     del os.environ[_AD.ENV_KEY]
+    expected = (Path(_REAL_APPDATA) / "TextForge") if _REAL_APPDATA else (Path.home() / ".textforge")
     check("未注入时退回 %APPDATA%（安装版行为不变）",
-          _AD.data_dir() == Path(_REAL_APPDATA) / "TextForge", str(_AD.data_dir()))
+          _AD.data_dir() == expected, str(_AD.data_dir()))
 finally:
     if _real_data_dir is not None:
         os.environ[_AD.ENV_KEY] = _real_data_dir

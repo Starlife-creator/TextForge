@@ -16,8 +16,10 @@ for _s in (sys.stdout, sys.stderr):
 
 BREAK_MARK = "===CHAPTER_BREAK==="
 BACKEND = Path(__file__).parent
+# 默认用 venv/Scripts/python.exe（Windows 打包结构）；非 Windows 或 CI 上直接用
+# 当前解释器，避免 Linux runner 上硬编码的 Windows 路径 FileNotFoundError。
 PY = str(BACKEND / "venv" / "Scripts" / "python.exe")
-if sys.platform.startswith("win"):          # CI 上由 CI 环境提供解释器路径
+if not sys.platform.startswith("win") or not Path(PY).exists():
     PY = sys.executable
 # 端口可经环境变量覆盖：固定端口在 CI 并发/残留进程下会假失败
 LLM_PORT = int(os.environ.get("TF_E2E_LLM_PORT", "8299"))
