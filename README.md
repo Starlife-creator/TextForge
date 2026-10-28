@@ -121,6 +121,9 @@ onefile 每次运行都要把载荷解压到 `%TEMP%\_MEIxxx`，既是启动慢�
 为什么 sidecar 用 onedir 而不是 onefile、心跳为什么不落盘、
 闸门标志的 clear 为什么必须早于阶段落盘。
 
+候选缺陷的复核结论、批次方案与「本轮明确不做」记在唯一追踪表
+[docs/REVIEW-LOG.md](docs/REVIEW-LOG.md)——发现新问题请加行，不要另建清单。
+
 ---
 
 ## 本地开发
