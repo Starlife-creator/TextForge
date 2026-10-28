@@ -1,11 +1,15 @@
 """单章重生成后刷新质检结论（T7）的单元测试。"""
 
+import asyncio
+import json
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 from core.quality import has_blocking_issues
 from core.refactor import ACCEPT_ABSORB_KEYS, _refresh_qc_after_regen
+from routes import state
+from utils.atomic import atomic_write_json
 
 
 def _req(**kw):
@@ -92,3 +96,28 @@ def test_accept_gate_absorbs_refreshed_qc_keys():
     """验收门放行时要把刷新后的结论并回内存，否则流水线下一次写盘会覆盖掉。"""
     assert {"batch_qc", "pre_stitch_issues"} <= set(ACCEPT_ABSORB_KEYS)
     assert "accepted_batches" in ACCEPT_ABSORB_KEYS
+    # R3：单章重写的次数计数由 /api/regen_chapter 写在磁盘上，不在吸收清单里
+    # 就等于每过一次验收门把 REGEN_MAX_PER_CHAPTER 保险丝清零。
+    assert "regen_count" in ACCEPT_ABSORB_KEYS
+
+
+def test_accept_gate_does_not_reset_regen_fuse(tmp_path):
+    """复刻 R3：磁盘 regen_count → absorb → 整份写回，计数必须还在。
+
+    refactor.py 在验收门后紧接着 `atomic_write_json(progress_path, progress)`，
+    把内存里的 progress 整份落盘；内存从未拿到 regen_count，于是磁盘上的
+    {'5': 4} 被写成「没有这个键」，用户可以对同一章无限重写。
+    """
+    progress_path = tmp_path / "progress.json"
+    atomic_write_json(progress_path, {
+        "accepted_batches": [], "batch_qc": {}, "pre_stitch_issues": {},
+        "regen_count": {"5": 4}})
+    # 流水线内存里的那份：从未见过用户重写后的计数
+    mem = {"accepted_batches": [], "batch_qc": {}, "pre_stitch_issues": {},
+           "current_phase": "phase3_accept"}
+
+    asyncio.run(state.absorb_gate_result(mem, progress_path, list(ACCEPT_ABSORB_KEYS)))
+    atomic_write_json(progress_path, mem)          # 复刻 refactor.py:1118-1119
+
+    on_disk = json.loads(progress_path.read_text(encoding="utf-8"))
+    assert on_disk.get("regen_count") == {"5": 4}, f"验收门把重写计数清零了：{on_disk!r}"

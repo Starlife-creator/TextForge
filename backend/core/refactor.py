@@ -42,9 +42,11 @@ REGEN_MAX_PER_CHAPTER = 3
 
 # 逐章验收门放行时，必须从磁盘**并回内存**的键。
 # accepted_batches 是用户的选择；batch_qc / pre_stitch_issues 是「单章重生成」
-# （/api/regen_chapter）刷新后写盘的质检结论 —— 流水线随后会把内存 progress 整份写回，
-# 不并回来就等于把刷新结果丢掉（与当年 fix_list 静默失效同一个坑）。
-ACCEPT_ABSORB_KEYS = ('accepted_batches', 'batch_qc', 'pre_stitch_issues')
+# （/api/regen_chapter）刷新后写盘的质检结论；regen_count 是同端点累加的**重写次数计数**
+# —— 少了它，每次过验收门都会把 REGEN_MAX_PER_CHAPTER 保险丝清零，等于无限重写。
+# 流水线随后会把内存 progress 整份写回，不并回来就等于把刷新结果丢掉
+# （与当年 fix_list 静默失效同一个坑）。
+ACCEPT_ABSORB_KEYS = ('accepted_batches', 'batch_qc', 'pre_stitch_issues', 'regen_count')
 
 class ChapterBreakMissingError(RetryableBusinessError):
     """v8.8 修正：继承 RetryableBusinessError，才能进入 call_with_retry 的重试路径。"""
