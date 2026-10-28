@@ -19,12 +19,12 @@ def test_history_upsert_concurrent_two_paths(tmp_path, monkeypatch) -> None:
     (data_dir / "runs.json").write_text('{"entries": {}}', encoding="utf-8")
 
     def upsert_a() -> None:
-        for i in range(20):
+        for i in range(200):
             history.upsert(str(tmp_path / "book_a"),
                            {"novel_name": "甲", "current_phase": f"phase{i % 3}"})
 
     def upsert_b() -> None:
-        for i in range(20):
+        for i in range(200):
             history.upsert(str(tmp_path / "book_b"),
                            {"novel_name": "乙", "current_phase": f"phase{i % 3}"})
 

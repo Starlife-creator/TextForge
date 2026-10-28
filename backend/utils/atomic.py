@@ -2,7 +2,7 @@ import tempfile, os, json, time
 from pathlib import Path
 
 
-def _replace_with_retry(tmp: str, path: Path) -> None:
+def replace_with_retry(tmp: str, path: Path) -> None:
     """os.replace 的 Windows 容错版本。
 
     Windows 上杀软/资源管理器/另一个线程正打开目标文件时，os.replace 会抛
@@ -26,6 +26,10 @@ def _replace_with_retry(tmp: str, path: Path) -> None:
                 raise
     if last is not None:
         raise last
+
+
+# 内部别名（旧调用点保留 _replace_with_retry 名称）
+_replace_with_retry = replace_with_retry
 
 
 def atomic_write_json(path: Path, data: dict, *, pretty: bool = True):

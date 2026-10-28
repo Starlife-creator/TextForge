@@ -90,7 +90,8 @@ def _save_docx(doc: Any, output_path: str) -> None:
         # 且 Windows 上对已关闭句柄 unlink 会失败，留下孤儿临时文件
         with os.fdopen(fd, "wb") as f:
             doc.save(f)
-        os.replace(tmp, out)
+        from utils.atomic import replace_with_retry
+        replace_with_retry(tmp, out)
     except Exception:
         try:
             if os.path.exists(tmp):

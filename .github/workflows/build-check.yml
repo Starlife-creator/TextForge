@@ -71,8 +71,10 @@ jobs:
         run: npm run build
 
       # #24：前端依赖漏洞扫描，高危漏洞阻断合并（与后端 pip-audit、Rust cargo audit 对齐）。
+      # 口径：--omit=dev 只审计进 Tauri 产物的运行时依赖；vite/vue-tsc/vitest 等
+      # devDependencies 里的 source-map-js/launch-editor 不进最终 app，不该挡合并。
       - name: 前端依赖漏洞扫描 (npm audit)
-        run: npm audit --audit-level high
+        run: npm audit --omit=dev --audit-level high
 
       # tauri-build 的构建脚本会校验 externalBin 指向的文件**存在**（供打包配置解析），
       # 找不到就直接失败。此前这个 job 靠「先真构建一遍 sidecar」顺带满足它，
@@ -159,13 +161,23 @@ jobs:
           python test_event_stream.py
 
       # #24：后端依赖漏洞扫描，高危漏洞直接阻断合并。锁文件口径见 #14。
+      # 口径：只审 requirements.txt（进 PyInstaller 产物的运行时直依赖）；
+      # pytest 等 dev 工具链不进最终 app，单开一条 continue-on-error 的记录步，
+      # 避免把"测试框架本地提权"这种公告挡在合并上。
       - name: 后端依赖漏洞扫描 (pip-audit)
         shell: bash
         run: |
           cd backend
           if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
           python -m pip install pip-audit
-          pip-audit --desc on
+          pip-audit -r requirements.txt --desc on
+      - name: dev 工具链漏洞扫描（记录不阻断）
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd backend
+          if [ "$RUNNER_OS" = "Windows" ]; then source venv/Scripts/activate; else source venv/bin/activate; fi
+          pip-audit -r requirements-dev.txt --desc on
 
   # ------------------------------------------------------------------ 端到端
   e2e:
@@ -236,8 +248,11 @@ jobs:
       - name: Rust 编译检查
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
-      # #24：Rust 依赖漏洞扫描，高危漏洞阻断合并。cargo-audit 安装后在 src-tauri 执行。
+      # #24：Rust 依赖漏洞扫描，高危漏洞阻断合并。
+      # 注意：cargo-audit 没有 --manifest-path 选项（原命令 exit 2、从未真审计过）；
+      # 必须用 working-directory 切到 src-tauri，让它读当前目录的 Cargo.toml。
       - name: Rust 依赖漏洞扫描 (cargo audit)
+        working-directory: src-tauri
         run: |
-          cargo install cargo-audit
-          cargo audit --deny warnings --manifest-path src-tauri/Cargo.toml
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
