@@ -236,7 +236,6 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                 atomic_write_json(progress_path, progress)
             sse_emit("qc_failed", {"issues": issues}, run_id)
             await _wait_qc_confirm(progress, progress_path, run_id)
-            await state.absorb_gate_result(progress, progress_path, ['_qc_force'])
             progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
@@ -1108,14 +1107,14 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
     sse_emit("accept_ready", {"batch_id": batch['batch_id'], "chapters": chapters,
         "accepted": progress.get('accepted_batches', [])}, run_id)
     logger.info(f"[accept] 批次 {batch['batch_id']} 待验收（{len(chapters)} 章）")
-    await state.wait_gate(
-        state.accept_confirm, gate=state.GATE_ACCEPT,
-        progress=progress, progress_path=progress_path, tick=1.0)
     # ACCEPT_ABSORB_KEYS 里有 batch_qc / pre_stitch_issues 的原因：单章重生成
     # （/api/regen）会把刷新后的质检结论写进 progress.json，而流水线紧接着就把内存
     # progress 整份写回磁盘。不并回来，用户重写掉的旧硬伤会被内存里的旧结论覆盖 ——
     # 与 fix_list 当年的「静默失效」是同一个坑（见 routes/state.py::absorb_gate_result）。
-    await state.absorb_gate_result(progress, progress_path, list(ACCEPT_ABSORB_KEYS))
+    await state.wait_gate(
+        state.accept_confirm, gate=state.GATE_ACCEPT,
+        progress=progress, progress_path=progress_path, tick=1.0,
+        absorb_keys=ACCEPT_ABSORB_KEYS)
     progress['current_phase'] = 'phase3-1'
     async with state.progress_lock:
         atomic_write_json(progress_path, progress)
@@ -1157,11 +1156,17 @@ def _run_qc(output_path, progress):
 
 
 async def _wait_qc_confirm(progress, progress_path, run_id):
-    """质检决策等待：等待用户选择强制导出或停止。"""
+    """质检决策等待：等待用户选择强制导出或停止。
+
+    `_qc_force` 由控制端点写盘，交给 wait_gate 统一并回内存：用户在闸门处按停止时
+    也必须并（否则 run_pipeline 的 finally 会把整份内存写回，悄悄回退已确认的选择），
+    并且停止不再等于「强制导出」。
+    """
     state.qc_confirm.clear()
     await state.wait_gate(
         state.qc_confirm, gate=state.GATE_QC,
-        progress=progress, progress_path=progress_path, tick=1.0)
+        progress=progress, progress_path=progress_path, tick=1.0,
+        absorb_keys=('_qc_force',))
 
 
 async def _wait_pause():

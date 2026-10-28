@@ -416,11 +416,12 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     state.fix_review_confirm.clear()
     sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
     logger.info(f"[fix_review] 断层勾选等待确认（{len(gaps)} 项）run_id={run_id}")
+    # 用户勾选的断层清单由控制端点写入 progress.json，由 wait_gate 统一并回内存
+    # （含停止路径，否则会被本循环随后的写盘覆盖）
     await state.wait_gate(
         state.fix_review_confirm, gate=state.GATE_FIX,
-        progress=progress, progress_path=progress_path, tick=1.0)
-    # 用户勾选的断层清单由控制端点写入 progress.json，这里并回内存（否则会被本循环的写盘覆盖）
-    await state.absorb_gate_result(progress, progress_path, ['fix_list'])
+        progress=progress, progress_path=progress_path, tick=1.0,
+        absorb_keys=('fix_list',))
     logger.info(f"[fix_review] 已吸收用户勾选 fix_list={progress.get('fix_list')}")
     progress['current_phase'] = 'phase2'
     async with state.progress_lock:

@@ -31,8 +31,8 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
             logger.info("[phase2] 检测到待确认蓝图，恢复等待用户确认")
             await state.wait_gate(
                 state.blueprint_confirmed, gate=state.GATE_BLUEPRINT,
-                progress=progress, progress_path=progress_path, tick=1.0)
-            await state.absorb_gate_result(progress, progress_path, ['blueprint_confirmed', 'blueprint_user_edited'])
+                progress=progress, progress_path=progress_path, tick=1.0,
+                absorb_keys=('blueprint_confirmed', 'blueprint_user_edited'))
             progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
                 atomic_write_json(progress_path, progress)
@@ -100,11 +100,11 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
     # 同步重置暂停标志：重试失败或用户已停止的场景下，若不清会立刻被 pause 打断
     sse_emit("blueprint_ready", {"blueprint": result, "max_chars": blueprint_max}, run_id)
     logger.info("[phase2] 蓝图已生成，等待用户确认")
+    # 用户是否编辑过蓝图由控制端点写入，由 wait_gate 统一并回内存（含停止路径）
     await state.wait_gate(
         state.blueprint_confirmed, gate=state.GATE_BLUEPRINT,
-        progress=progress, progress_path=progress_path, tick=1.0)
-    # 用户是否编辑过蓝图由控制端点写入，这里并回内存
-    await state.absorb_gate_result(progress, progress_path, ['blueprint_confirmed', 'blueprint_user_edited'])
+        progress=progress, progress_path=progress_path, tick=1.0,
+        absorb_keys=('blueprint_confirmed', 'blueprint_user_edited'))
     blueprint_text = story_bible.read_text(encoding='utf-8')
     if len(blueprint_text) < 100:
         raise RuntimeError("蓝图过短，可能生成失败")

@@ -107,12 +107,20 @@ async def wait_gate(event: asyncio.Event, *, gate: str, progress: Optional[dict]
                     progress_path=None, tick: float = 1.0,
                     timeout: Optional[float] = None,
                     alternative: Optional[asyncio.Event] = None,
-                    release_events: tuple[asyncio.Event, ...] = ()) -> None:
+                    release_events: tuple[asyncio.Event, ...] = (),
+                    absorb_keys: tuple[str, ...] = ()) -> None:
     """等待一个人工闸门，替代各循环里无界的 `while not event`。
 
+    - `absorb_keys`：闸门结束时（无论正常确认还是被停止）都要从磁盘并回内存的键。
+      放在这里而不是让每个调用方各写一遍，是因为**停止路径也必须并**：调用方一旦
+      提前抛出，`run_pipeline` 的 finally 仍会把内存 progress 整份写回磁盘，把用户
+      刚拿到 200 的确认悄悄回退掉。
     - `alternative`：同闸门内的备选出路（如拆书预览门的「重新拆分」），它被
       置位时同样结束等待；调用方随后按两个 Event 的状态分支处理；
     - `stop_requested` 已置位 → 抛 asyncio.CancelledError（复用既有停止路径）；
+      **「停止优先于确认」**：/api/stop 会把所有闸门事件 set，若在此正常返回，
+      界面按了停止却会把本阶段当成已确认提交，并继续跑下一阶段（几十次模型调用）
+      才轮到下一个停止检查。
     - 等待超过 `timeout`（缺省 GATE_TIMEOUT_SECONDS）→ 置 stop_requested、把超时
       闸门与已等待时长记进内存 progress、释放本闸门与 `release_events`，
       抛 GateTimeoutError；
@@ -142,6 +150,14 @@ async def wait_gate(event: asyncio.Event, *, gate: str, progress: Optional[dict]
                     f"[gate] 闸门 {gate} 等待超时（{gate_wait_seconds(gate)}s），任务已安全暂停")
                 raise GateTimeoutError(f"人工闸门 {gate} 等待超时，任务已安全暂停")
             await asyncio.sleep(tick)
+        # 出口处两件事的顺序是硬要求：先并回磁盘上的用户选择，再判停止。
+        # 这个复查**不能**放进 finally：超时分支上面已经置了 stop_requested，
+        # 放在 finally 会把 GateTimeoutError 变成 CancelledError，
+        # 于是 gate_timeout 事件、progress 里的超时留痕和界面提示全部消失。
+        if absorb_keys and progress is not None and progress_path is not None:
+            await absorb_gate_result(progress, progress_path, list(absorb_keys))
+        if stop_requested:
+            raise asyncio.CancelledError()
     finally:
         gate_exit(gate)
 
