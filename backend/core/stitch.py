@@ -106,7 +106,16 @@ def apply_stitches(output_path: Path, stitches_by_file: dict) -> None:
 
         for s in sorted_patches:
             current_segment = text[s['start']:s['end']]
-            if sha256_of(current_segment) == s['before_hash']:
+            # 跨版本续跑：旧 progress 的 before_hash 可能是在 CRLF 文本上算的，
+            # 而 read_text(universal newlines) 已把 CRLF 折成 LF。双向归一：
+            # 原样、LF 版、CRLF 版各算一次哈希，任一匹配即应用；都不匹配才走
+            # 「已应用」兜底或抛错——避免一次行尾差异就整轮缝合失败。
+            seg_lf = current_segment.replace("\r\n", "\n").replace("\r", "\n")
+            seg_crlf = seg_lf.replace("\n", "\r\n")
+            seg_hash = sha256_of(current_segment)
+            if (seg_hash == s['before_hash']
+                    or sha256_of(seg_lf) == s['before_hash']
+                    or sha256_of(seg_crlf) == s['before_hash']):
                 text = text[:s['start']] + s['replacement'] + text[s['end']:]
                 s['applied'] = True
             elif _segment_already_applied(text, s):

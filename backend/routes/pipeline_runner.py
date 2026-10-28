@@ -1,4 +1,4 @@
-import asyncio, json, time, logging
+import asyncio, json, time, logging, hashlib
 from pathlib import Path
 from routes import state
 from routes.events import sse_emit
@@ -223,6 +223,27 @@ def _cfg_brief(value) -> str:
     return text if len(text) <= 120 else text[:117] + "..."
 
 
+def _fingerprint(value) -> str:
+    """结构指纹：敏感键（api_key/token 等）取 sha256(str(v))[:8]，非敏感键取原值。
+
+    与 _cfg_brief 的区别：brief 先 redact 成 *** 再比，于是「只换密钥不换模型」
+    两侧都是 ***、比较相等、漂移漏报。指纹保留敏感键的「不同」（哈希不同即可检出），
+    但哈希是单向的——明文既不落盘也不回传，满足 P0-1。
+    """
+    from utils.redact import _is_sensitive_key
+    def walk(v):
+        if isinstance(v, dict):
+            return {
+                k: (hashlib.sha256(str(val).encode("utf-8")).hexdigest()[:8]
+                    if _is_sensitive_key(k) else walk(val))
+                for k, val in v.items()
+            }
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        return v
+    return json.dumps(walk(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _config_drift(existing: dict, req) -> list[str]:
     """续跑时配置是否与上次不同。返回人类可读的差异描述（空列表=一致）。
 
@@ -275,7 +296,7 @@ def _config_drift(existing: dict, req) -> list[str]:
         if key not in existing:
             continue
         prev, cur = existing.get(key), getattr(req, key, None)
-        if _cfg_brief(prev) != _cfg_brief(cur):
+        if _fingerprint(prev) != _fingerprint(cur):
             diffs.append(f"{label}：{_cfg_brief(prev)} → {_cfg_brief(cur)}")
     return diffs
 

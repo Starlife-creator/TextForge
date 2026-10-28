@@ -25,6 +25,9 @@ def _is_sensitive_key(k) -> bool:
 # 关键收紧：分隔符必须是 = / : / ? / & 这类赋值或 URL 语境，不能只是空格——否则
 # 自由文本里的 "secret identity"、"每章 token 数量上限" 会被误改成 "secret ***"。
 # 值也要求像凭据（ASCII 6 字符以上），避免吃掉中文叙述。
+# 已知取舍（review E 节）：散文形态 "token <空格> sk-..." 不遮——v2 旧正则会遮，
+# v3 为避免误咬自由文本改成必须含赋值符后，这种形态不再命中。相对 main（字符串
+# 兜底根本没有）仍是净增强，字典/列表里的 api_key/token 键照常被 _is_sensitive_key 命中。
 _SECRET_PATTERN = re.compile(
     r'(api[_-]?key|token|authorization|password|secret)(\s*[=:?&]\s*["\']?)([A-Za-z0-9_\-.]{6,})',
     re.IGNORECASE,

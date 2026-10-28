@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -31,6 +32,9 @@ router = APIRouter()
 
 MAX_ENTRIES = 50
 _TRIM_CHARS = 200
+# 进程内串行化 runs.json 的读-改-写：record_progress（流水线线程）与
+# history_forget/clear（用户点按钮）可能并发，无锁时后写者整份覆盖前写者。
+_REGISTRY_LOCK = threading.Lock()
 
 
 def _registry_path() -> Path:
@@ -73,32 +77,33 @@ def upsert(output_path: str, meta: dict) -> None:
     if not output_path:
         return
     key = _norm(output_path)
-    reg = _load()
-    entries = reg["entries"]
-    prev = entries.get(key) or {}
-    e = dict(prev)
-    e["output_path"] = output_path
-    for k in ("novel_name", "input_path", "input_mode", "current_phase",
-              "total_chapters", "batches_done", "batches_total", "finished",
-              "finished_at", "chapter_detection", "regen_total", "config_drift"):
-        if k in meta and meta[k] is not None:
-            # P0-1：历史注册表不得留存明文密钥；config_drift 落 runs.json 前兜底脱敏。
-            e[k] = redact(meta[k]) if k == "config_drift" else meta[k]
-    errs = meta.get("last_error")
-    if errs:
-        e["last_error"] = str(errs)[:_TRIM_CHARS]
-    elif meta.get("clear_error"):
-        e.pop("last_error", None)
-    e["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    e.setdefault("created_at", e["updated_at"])
-    entries[key] = e
-    # 只保留最近 MAX_ENTRIES 条
-    ordered = sorted(entries.items(), key=lambda kv: kv[1].get("updated_at", ""), reverse=True)
-    reg["entries"] = dict(ordered[:MAX_ENTRIES])
-    try:
-        atomic_write_json(_registry_path(), reg)
-    except Exception as ex:
-        logger.warning(f"[history] 写入 runs.json 失败：{ex}")
+    with _REGISTRY_LOCK:
+        reg = _load()
+        entries = reg["entries"]
+        prev = entries.get(key) or {}
+        e = dict(prev)
+        e["output_path"] = output_path
+        for k in ("novel_name", "input_path", "input_mode", "current_phase",
+                  "total_chapters", "batches_done", "batches_total", "finished",
+                  "finished_at", "chapter_detection", "regen_total", "config_drift"):
+            if k in meta and meta[k] is not None:
+                # P0-1：历史注册表不得留存明文密钥；config_drift 落 runs.json 前兜底脱敏。
+                e[k] = redact(meta[k]) if k == "config_drift" else meta[k]
+        errs = meta.get("last_error")
+        if errs:
+            e["last_error"] = str(errs)[:_TRIM_CHARS]
+        elif meta.get("clear_error"):
+            e.pop("last_error", None)
+        e["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        e.setdefault("created_at", e["updated_at"])
+        entries[key] = e
+        # 只保留最近 MAX_ENTRIES 条
+        ordered = sorted(entries.items(), key=lambda kv: kv[1].get("updated_at", ""), reverse=True)
+        reg["entries"] = dict(ordered[:MAX_ENTRIES])
+        try:
+            atomic_write_json(_registry_path(), reg)
+        except Exception as ex:
+            logger.warning(f"[history] 写入 runs.json 失败：{ex}")
 
 
 def _meta_from_progress(progress: dict) -> dict:
@@ -157,16 +162,26 @@ async def history_list(limit: int = Query(30)):
     return {"items": out}
 
 
+def _forget_locked(key: str) -> None:
+    with _REGISTRY_LOCK:
+        reg = _load()
+        reg["entries"].pop(key, None)
+        atomic_write_json(_registry_path(), reg)
+
+
+def _clear_locked() -> None:
+    with _REGISTRY_LOCK:
+        atomic_write_json(_registry_path(), {"entries": {}})
+
+
 @router.post("/api/history/forget")
 async def history_forget(payload: dict = Body(...)):
     """把某条从历史里移除（只删注册表记录，不动磁盘文件）。"""
     output_path = (payload.get("output_path") or "").strip()
     if not output_path:
         raise HTTPException(422, "缺少 output_path")
-    reg = await asyncio.to_thread(_load)
-    reg["entries"].pop(_norm(output_path), None)
     try:
-        await asyncio.to_thread(_write_registry, reg)
+        await asyncio.to_thread(_forget_locked, _norm(output_path))
     except Exception as e:
         raise HTTPException(500, f"写入失败：{e}")
     return {"status": "forgotten"}
@@ -176,7 +191,7 @@ async def history_forget(payload: dict = Body(...)):
 async def history_clear():
     """清空整个历史注册表（只清注册表，不动任何磁盘文件）。"""
     try:
-        await asyncio.to_thread(_write_registry, {"entries": {}})
+        await asyncio.to_thread(_clear_locked)
     except Exception as e:
         raise HTTPException(500, f"清空失败：{e}")
     return {"status": "cleared"}

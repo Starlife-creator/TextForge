@@ -164,6 +164,7 @@ class GateControl:
         self.suppress = ()           # 本轮不自动确认的闸门名（场景七用）
         self.seen = set()            # 已处理过的闸门键
         self.run = None              # 当前轮次的 run_id
+        self.failed = []             # 确认重试 3 次仍失败的闸门（计入 FAIL）
 
 
 _GATE = GateControl()
@@ -181,6 +182,22 @@ def _cur_run(port):
         rid = _CUR_RUN["id"]
     _CUR_RUN.update({"id": rid, "t": t})
     return rid
+
+
+def _post_gate(port, path, body, ev):
+    """闸门确认 POST：慢响应/瞬时 5xx 重试 3 次，仍失败记入 _GATE.failed（计入 FAIL），
+    不再「吞掉异常然后伪装成流水线卡死」。409（已确认过）仍视为正常。"""
+    last = None
+    for attempt in range(3):
+        try:
+            return post(f"http://127.0.0.1:{port}{path}", body)
+        except Exception as e:
+            last = e
+            if "409" in str(e):
+                return
+            time.sleep(0.5 * (attempt + 1))
+    print(f"    [gate] {ev} 确认 3 次仍失败，计入 FAIL: {type(last).__name__} {last}")
+    _GATE.failed.append(ev)
 
 
 def gate_driver(port, enabled=True):
@@ -304,31 +321,31 @@ def _drive_gate(port, ev, d):
     """
     try:
         if ev == "split_ready":
-            post(f"http://127.0.0.1:{port}/api/split/confirm", {})
+            _post_gate(port, "/api/split/confirm", {}, ev)
             print("    [gate] 已确认拆书")
         elif ev == "blueprint_ready":
             bp = d.get("blueprint") or ""
             if len(bp) < 100:
                 bp = "（测试桩：蓝图正文过短时补齐，确认接口要求 >=100 字）" + bp
-            post(f"http://127.0.0.1:{port}/api/blueprint/confirm", {"blueprint": bp})
+            _post_gate(port, "/api/blueprint/confirm", {"blueprint": bp}, ev)
             print("    [gate] 已确认蓝图")
         elif ev == "fix_ready":
-            post(f"http://127.0.0.1:{port}/api/fix/confirm",
-                 {"action": "accept", "gaps": []})
+            _post_gate(port, "/api/fix/confirm",
+                       {"action": "accept", "gaps": []}, ev)
             print("    [gate] 已确认诊断")
         elif ev == "accept_ready":
             # 端点是 /api/accept（不是 /api/accept/confirm）；批次取自 progress.json
             # 的 accept_pending_batch，因此无需在此处传 batch_id。
-            post(f"http://127.0.0.1:{port}/api/accept", {})
+            _post_gate(port, "/api/accept", {}, ev)
             print(f"    [gate] 已验收批次 {d.get('batch_id')}")
         elif ev == "qc_failed":
-            post(f"http://127.0.0.1:{port}/api/export/force", {})
+            _post_gate(port, "/api/export/force", {}, ev)
             print("    [gate] 已强制导出")
     except Exception as e:
-        # 闸门已推进（409）说明已被确认过，属正常；其余仅记录不中断驱动线程
+        # 409（已被别处确认）仍视为正常；其余异常已由 _post_gate 记入 _GATE.failed。
         if "409" in str(e):
             return
-        print(f"    [gate] {ev} 确认异常（忽略）: {type(e).__name__} {e}")
+        print(f"    [gate] {ev} 确认异常: {type(e).__name__} {e}")
 
 
 def make_novel(path: Path, chapters: int, paras: int = 3):
@@ -417,7 +434,7 @@ llm = subprocess.Popen([PY, str(BACKEND / "mock_llm.py"), str(LLM_PORT)],
 api = subprocess.Popen([PY, "-m", "uvicorn", "app:app", "--host", "127.0.0.1",
                         "--port", str(API_PORT), "--log-level", "warning"],
                        cwd=str(BACKEND), env={**os.environ, "TEXTFORGE_DEV": "1"},
-                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 tmp = Path(tempfile.mkdtemp(prefix="tf_e2e_"))
 try:
     B = f"http://127.0.0.1:{API_PORT}"
@@ -434,8 +451,14 @@ try:
         except Exception:
             time.sleep(0.5)
     if not _up:
-        err = api.stderr.read().decode("utf-8", "replace") if api.stderr else ""
-        raise RuntimeError(f"后端/ mock 未就绪。api stderr:\n{err[-1500:]}")
+        # stderr 已 DEVNULL（避免 Windows 匿名管道缓冲写满堵死被检进程），
+        # 排查线索统一到 backend.log。
+        log_tail = ""
+        try:
+            log_tail = (BACKEND / "data" / "logs" / "backend.log").read_text(encoding="utf-8", errors="replace")[-1500:]
+        except OSError:
+            pass
+        raise RuntimeError(f"后端/mock 未就绪。backend.log 尾部:\n{log_tail}")
     # 所有场景共用一个事件队列（_EVENTS["q"]），全局驱动据此按闸门事件行动；
     # 队列在场景边界被 scene() 整体换掉，上一场景的残留不会灌进下一场景。
     print("mock / health:", get(f"{L}/v1/models")["data"][0]["id"], "|", get(f"{B}/api/health")["status"])
@@ -1241,9 +1264,16 @@ finally:
         p.terminate()
         try: p.wait(timeout=5)
         except Exception: p.kill()
-    err = api.stderr.read().decode("utf-8", "replace") if api.stderr else ""
+    # stderr 已 DEVNULL，Traceback 排查统一从 backend.log 取。
+    err = ""
+    try:
+        err = (BACKEND / "data" / "logs" / "backend.log").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
     if "Traceback" in err:
-        print("\n=== 后端 stderr 异常 ===\n", err[-2000:])
+        print("\n=== 后端日志异常 ===\n", err[-2000:])
+    for ev in _GATE.failed:
+        FAILS.append(f"gate_confirm_failed:{ev}")
     shutil.rmtree(tmp, ignore_errors=True)
 
 print()

@@ -24,6 +24,17 @@ def _check_run_id(run_id: str | None):
     if run_id and run_id != state.current_run_id:
         raise HTTPException(409, "run_id_mismatch")
 
+
+async def _save_progress_guarded(progress_path: Path, progress: dict) -> None:
+    """控制端点写 progress.json 的统一出口：Windows 上目标文件被杀软/资源管理器
+    占用时 os.replace 会抛 PermissionError [WinError 5]，退避重试仍失败就转成
+    503 让前端提示「文件正被占用，请重试」，而不是裸 500 + traceback 堵死 e2e。
+    """
+    try:
+        await asyncio.to_thread(save_progress_dict, progress_path, progress)
+    except PermissionError as e:
+        raise HTTPException(503, f"文件正被占用，请稍后重试：{progress_path.name}") from e
+
 @router.post("/api/pause")
 async def pause(run_id: str | None = Body(None, embed=True)):
     _check_run_id(run_id)
@@ -121,7 +132,7 @@ async def fix_confirm(payload: dict = Body(...)):
         if progress.get('current_phase') != 'phase1_fixreview':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许确认断层")
         progress['fix_list'] = fix_list
-        await asyncio.to_thread(save_progress_dict, progress_path, progress)
+        await _save_progress_guarded(progress_path, progress)
     state.fix_review_confirm.set()
     return {"status": "confirmed", "fix_list": fix_list}
 
@@ -163,7 +174,7 @@ async def export_force(payload: dict = Body(...)):
         if progress.get('current_phase') != 'phase3_qc':
             raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许强制导出")
         progress['_qc_force'] = True
-        await asyncio.to_thread(save_progress_dict, progress_path, progress)
+        await _save_progress_guarded(progress_path, progress)
     state.qc_confirm.set()
     return {"status": "exporting"}
 
@@ -220,7 +231,7 @@ async def regen_chapter(payload: dict = Body(...)):
         updated.setdefault('regen_count', {})
         cid = str(chapter_id)
         updated['regen_count'][cid] = int(updated['regen_count'].get(cid, 0)) + 1
-        await asyncio.to_thread(save_progress_dict, progress_path, updated)
+        await _save_progress_guarded(progress_path, updated)
     return {"status": "regenerated", "chapter_id": chapter_id, "preview": new_text[:80]}
 
 @router.post("/api/accept")
@@ -244,7 +255,7 @@ async def accept(payload: dict = Body(...)):
         pend = progress.get('accept_pending_batch')
         if pend is not None and pend not in progress['accepted_batches']:
             progress['accepted_batches'].append(pend)
-        await asyncio.to_thread(save_progress_dict, progress_path, progress)
+        await _save_progress_guarded(progress_path, progress)
     state.accept_confirm.set()
     return {"status": "accepted"}
 
@@ -277,10 +288,13 @@ async def blueprint_confirm(payload: dict = Body(...)):
             raise HTTPException(422, "blueprint 过短")
         story_bible = Path(output_path) / "Story_Bible.md"
         # #4：同步原子写（含 fsync）移出事件循环线程。
-        await asyncio.to_thread(atomic_write_text, story_bible, blueprint)
+        try:
+            await asyncio.to_thread(atomic_write_text, story_bible, blueprint)
+        except PermissionError as e:
+            raise HTTPException(503, "文件正被占用，请稍后重试：Story_Bible.md") from e
         progress["blueprint_confirmed"] = True
         progress["blueprint_user_edited"] = user_edited
-        await asyncio.to_thread(save_progress_dict, progress_path, progress)
+        await _save_progress_guarded(progress_path, progress)
     
     state.blueprint_confirmed.set()
     return {"status": "confirmed"}
