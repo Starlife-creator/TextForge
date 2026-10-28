@@ -21,10 +21,10 @@ async def lifespan(app: FastAPI):
             pass
     if state.log_listener:
         # 测试进程内多次 import app 时，listener._thread 可能已被上一次 stop()
-        # join 后置 None；直接 stop() 会 AttributeError，吞掉这个二次关闭。
+        # join 后置 None；只吞 AttributeError，不吞 join 其他真异常。
         try:
             state.log_listener.stop()
-        except (RuntimeError, AttributeError):
+        except AttributeError:
             pass
 
 from routes.health import router as health_router

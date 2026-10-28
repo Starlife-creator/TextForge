@@ -16,11 +16,10 @@ for _s in (sys.stdout, sys.stderr):
 
 BREAK_MARK = "===CHAPTER_BREAK==="
 BACKEND = Path(__file__).parent
-# 默认用 venv/Scripts/python.exe（Windows 打包结构）；非 Windows 或 CI 上直接用
-# 当前解释器，避免 Linux runner 上硬编码的 Windows 路径 FileNotFoundError。
-PY = str(BACKEND / "venv" / "Scripts" / "python.exe")
-if not sys.platform.startswith("win") or not Path(PY).exists():
-    PY = sys.executable
+# 父进程（本脚本）本身要 import docx/requests/uvicorn，必然由装好依赖的解释器
+# 启动；子进程没有理由换另一个解释器（venv 存在但陈旧时会悄悄用错）。
+# CI 激活 venv 后 sys.executable 就是 venv 里的 python。
+PY = sys.executable
 # 端口可经环境变量覆盖：固定端口在 CI 并发/残留进程下会假失败
 LLM_PORT = int(os.environ.get("TF_E2E_LLM_PORT", "8299"))
 API_PORT = int(os.environ.get("TF_E2E_API_PORT", "8298"))
