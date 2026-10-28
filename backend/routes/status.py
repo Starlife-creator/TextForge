@@ -128,7 +128,9 @@ async def status(output_path: str | None = None):
             "phase1_done": sum(1 for b in batches if b["status"] in ("phase1_done", "phase3_done")),
             "phase3_done": sum(1 for b in batches if b["status"] == "phase3_done"),
         },
-        "error_logs": progress.get("error_logs", [])[-5:],
+        # 错误正文常带请求上下文（"api_key=…"）；修复前写进 progress.json 的明文残留
+        # 无法回收，回传前按同一口径兜底脱敏。
+        "error_logs": redact(progress.get("error_logs", [])[-5:]),
         # #2：当前等待闸门、已等待时长、本轮是否发生过闸门超时。
         "active_gate": state.active_gate(),
         "waiting_seconds": state.gate_wait_seconds(),

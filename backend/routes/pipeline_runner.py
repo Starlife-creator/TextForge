@@ -518,7 +518,10 @@ async def log_error(progress_path: Path, error, progress: dict | None = None):
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "kind": getattr(error, "kind", "unknown"),
         "code": str(getattr(error, "code", "unknown")),
-        "message": str(error)[:500],
+        # 异常正文常带请求上下文（"… api_key=sk-live-…"），而这条 entry 会整份写进
+        # progress.json 并随诊断包外发 ⇒ 在源头就遮，别只靠各读侧兜底。
+        # 先脱敏后截断：截断点落在凭据中间时，剩下的碎片短于模式门槛反而躲过脱敏。
+        "message": redact(str(error))[:500],
     }
     if progress is not None:
         progress.setdefault("error_logs", []).append(entry)

@@ -48,10 +48,14 @@ def _load() -> dict:
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
         if isinstance(data, dict) and isinstance(data.get("entries"), dict):
-            # 历史一次性清洗：修复前落盘的 config_drift 可能含明文密钥，读侧兜底脱敏。
+            # 历史一次性清洗：修复前落盘的 config_drift / last_error 里可能已有明文
+            # 密钥，那些字节删不掉也没法回填，只能在读侧兜底，保证界面与响应不还原样输出。
             for e in data["entries"].values():
-                if isinstance(e, dict) and "config_drift" in e:
-                    e["config_drift"] = redact(e["config_drift"])
+                if not isinstance(e, dict):
+                    continue
+                for k in ("config_drift", "last_error"):
+                    if k in e:
+                        e[k] = redact(e[k])
             return data
     except Exception as e:
         # 与 progress.json 同一口径：读失败不静默清空，先把坏文件留 .bak，
@@ -91,7 +95,9 @@ def upsert(output_path: str, meta: dict) -> None:
                 e[k] = redact(meta[k]) if k == "config_drift" else meta[k]
         errs = meta.get("last_error")
         if errs:
-            e["last_error"] = str(errs)[:_TRIM_CHARS]
+            # 先脱敏、后截断：截断点可能正落在凭据中间，剩下的碎片短于模式要求的
+            # 6 个 ASCII，于是既躲过脱敏、又留在 runs.json 里。
+            e["last_error"] = str(redact(errs))[:_TRIM_CHARS]
         elif meta.get("clear_error"):
             e.pop("last_error", None)
         e["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

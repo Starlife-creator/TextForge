@@ -19,6 +19,7 @@ from fastapi import APIRouter, Body, HTTPException, Query
 
 from routes import state
 from utils.errors import raise_internal_error
+from utils.redact import redact
 
 logger = logging.getLogger("textforge")
 
@@ -64,7 +65,7 @@ def _summarize(output_path: str) -> dict:
             # 不能用 phase != 'phase4'：phase4 在 finalize 之前写入，渲染失败时
             # 仍应允许续跑，而不是让用户从头再跑一遍。
             "resumable": bool(phase) and not is_completed(prog),
-            "error_logs": (prog.get("error_logs") or [])[-5:],
+            "error_logs": redact((prog.get("error_logs") or [])[-5:]),
         })
     # 质量报告只取头部信息：inspect 会被界面频繁调用，没必要每次把整份
     # 逐章明细都读进来；完整报告由 /api/output/quality 按需拉取。
