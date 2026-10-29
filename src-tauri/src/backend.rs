@@ -60,23 +60,57 @@ pub struct BackendInfo {
 }
 
 pub fn data_dir() -> Option<PathBuf> {
-    // 单一数据源：外壳先解析出数据目录，再通过 TEXTFORGE_DATA_DIR 注入给 sidecar。
-    // 后端（utils/appdir.py）只认这个环境变量，认不到才退回 %APPDATA%\TextForge。
-    // 这样两边**不可能**算出不同路径 —— 原先两侧各自拼 %APPDATA%\TextForge，
-    // 一旦不一致，前端就永远读不到 port.json。
-    //
-    // 优先级：外部显式指定 > exe 旁的 data/（便携包，随包移动）> %APPDATA%（安装版）。
-    if let Ok(p) = std::env::var("TEXTFORGE_DATA_DIR") {
-        if !p.is_empty() {
-            return Some(PathBuf::from(p));
+    let exe_dir = std::env::current_exe().ok()?;
+    let exe_dir = exe_dir.parent()?;
+    resolve_data_dir(
+        std::env::var("TEXTFORGE_DATA_DIR").ok().as_deref(),
+        Some(exe_dir),
+        std::env::var("APPDATA").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        &|p: &std::path::Path| std::fs::create_dir_all(p).is_ok(),
+    )
+}
+
+/// 数据目录解析（纯函数：输入全靠参数，三端 `cargo test` 都跑得到）。
+///
+/// 单一数据源：外壳先解析出数据目录，再通过 TEXTFORGE_DATA_DIR 注入给 sidecar，
+/// 后端（utils/appdir.py）只认这个变量，认不到才退回 %APPDATA%\TextForge。
+///
+/// **「选中」的判据是能创建**（R9）：此前 `create_dir_all` 的失败被 `let _ =` 吞掉，
+/// 环境变量照样注入。于是装进 Program Files（只读）时——外壳读
+/// `exe旁/data/port.json`，后端因为创建失败回退到 `%APPDATA%\TextForge` 并写在那里，
+/// 两边各算一处，前端永远等不到端口文件（表现为「打开就是空白界面」）。
+/// 现在创建失败就换下一个候选，并且**只有真正落地的这个目录会被注入**，两侧必然一致。
+///
+/// 优先级：外部显式指定 > exe 旁的 data/（便携包，随包移动）> APPDATA（安装版）> 家目录。
+fn resolve_data_dir(
+    explicit: Option<&str>,
+    exe_dir: Option<&std::path::Path>,
+    appdata: Option<&str>,
+    home: Option<&str>,
+    ensure: &dyn Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit.filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(p);
+        if ensure(&path) {
+            return Some(path);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return Some(dir.join("data"));
+    if let Some(dir) = exe_dir {
+        let portable = dir.join("data");
+        if ensure(&portable) {
+            return Some(portable);
         }
     }
-    std::env::var("APPDATA").ok().map(|p| PathBuf::from(p).join("TextForge"))
+    if let Some(a) = appdata.filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(a).join("TextForge");
+        // 最后一个候选不再试探：与后端 appdir.py 的兜底保持同一答案，
+        // 全都创建不了时报错的是写入，而不是两侧各猜一个目录。
+        let _ = ensure(&path);
+        return Some(path);
+    }
+    home.filter(|s| !s.is_empty())
+        .map(|h| PathBuf::from(h).join(".textforge"))
 }
 
 pub fn port_file_path() -> Option<PathBuf> {
@@ -138,10 +172,20 @@ pub fn pid_alive(pid: u32) -> bool {
 /// 另一个正在使用的实例。
 pub fn reap_orphan_backend() {
     let pid = get_pid_from_json();
+    let port = get_port_from_json();
     if pid == 0 || !pid_alive(pid) {
+        // 记录里的进程已经不在了：这份 port.json 指的是死端口。
+        // 必须删掉，否则新后端启动前的任何一次读取都会把界面领到一个连不通的端口；
+        // 但若端口真的有人应答（另一个没写 pid 的实例），留着它，别把活的服务判死。
+        if port == 0 || !probe_port(port) {
+            if let Some(p) = port_file_path() {
+                if std::fs::remove_file(&p).is_ok() {
+                    eprintln!("[backend] 端口文件已过期（pid 不在了），删除 {}", p.display());
+                }
+            }
+        }
         return;
     }
-    let port = get_port_from_json();
     if port > 0 && probe_port(port) {
         return; // 还活着且服务可达 —— 是别人的实例，不碰
     }
@@ -184,9 +228,10 @@ pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
     let sidecar = app.shell().sidecar("backend")
         .map_err(|e| format!("sidecar 创建失败: {}", e))?;
     let mut cmd = sidecar;
-    // 把解析好的数据目录交给后端，避免两侧各算一套路径。
+    // data_dir() 已经把选中的目录创建好（创建不了就换下一个候选），所以这里注入的
+    // 一定是两侧真正都能用的那一个；过去是「创建失败也照样注入」，后端随后回退，
+    // 两边就分叉了（R9）。
     if let Some(dir) = data_dir() {
-        let _ = std::fs::create_dir_all(&dir);
         cmd = cmd.env("TEXTFORGE_DATA_DIR", dir);
     }
     // 注入调用方 token：后端所有接口（/api/health 除外）都会校验 X-TextForge-Token，
@@ -236,20 +281,41 @@ pub fn spawn_backend(app: &AppHandle) -> Result<CommandChild, String> {
     Ok(child)
 }
 
+/// 必须是 async：probe_port 最长阻塞 800ms，同步命令会卡住主线程（同 backend_info）。
+///
+/// 「port.json 存在」不等于「后端听得见」。孤儿进程被强杀、或端口文件来自上一轮，
+/// 都会留下一个连不通的端口；过去这里直接返回 Ready，前端拿着死端口发请求，
+/// 于是 waitForPort 第一次就成功返回、后续每个调用都失败（R9 的闩锁）。
+/// 现在探不通就继续 NotReady，让 waitForPort 的轮询等到服务真的起来。
 #[tauri::command]
-pub fn get_backend_port() -> PortResult {
+pub async fn get_backend_port() -> PortResult {
     if cfg!(debug_assertions) { return PortResult::DevMode(8000); }
     let Some(path) = port_file_path() else { return PortResult::Error("无法确定数据目录".into()); };
     if !path.exists() { return PortResult::NotReady; }
-    match std::fs::read_to_string(&path) {
+    let port = match std::fs::read_to_string(&path) {
         Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(json) => match json["port"].as_u64() {
-                Some(p) => PortResult::Ready(p as u16),
-                None => PortResult::Error("port 字段缺失".into()),
+                Some(p) => p as u16,
+                None => return PortResult::Error("port 字段缺失".into()),
             },
-            Err(e) => PortResult::Error(format!("解析失败: {}", e)),
+            Err(e) => return PortResult::Error(format!("解析失败: {}", e)),
         },
-        Err(e) => PortResult::Error(format!("读取失败: {}", e)),
+        Err(e) => return PortResult::Error(format!("读取失败: {}", e)),
+    };
+    if port == 0 { return PortResult::NotReady; }
+    let alive = tokio::task::spawn_blocking(move || probe_port(port))
+        .await
+        .unwrap_or(false);
+    classify_port(port, alive)
+}
+
+/// 端口文件里的端口 + TCP 探测结果 ⇒ 该不该把端口交给前端（纯函数，便于测试）。
+/// 判据只有一条：**听得见才算 Ready**（R9 的死端口闩锁）。
+fn classify_port(port: u16, reachable: bool) -> PortResult {
+    if port != 0 && reachable {
+        PortResult::Ready(port)
+    } else {
+        PortResult::NotReady
     }
 }
 
@@ -364,10 +430,96 @@ mod tests {
 
     #[test]
     fn port_file_lives_under_data_dir() {
-        let expected = std::env::current_exe().unwrap().parent().unwrap()
-            .join("data").join("port.json");
-        assert_eq!(port_file_path(), Some(expected),
-                   "port.json must sit next to the data dir so Rust and Python agree");
+        // port.json 必须住在 data_dir() 里 —— 这是 Rust 与 Python 唯一对得上的位置。
+        // 不再硬编码 current_exe()/data：现在数据目录取决于「哪一层先能创建」。
+        let pf = port_file_path().expect("测试环境总能解析出一个数据目录");
+        assert_eq!(pf.file_name().unwrap(), "port.json");
+        assert_eq!(pf.parent().unwrap(), data_dir().unwrap());
+    }
+
+    #[test]
+    fn data_dir_prefers_the_portable_side_when_it_is_writable() {
+        let got = resolve_data_dir(
+            None,
+            Some(std::path::Path::new("/opt/textforge")),
+            Some("C:/Users/me/AppData/Roaming"),
+            Some("/home/me"),
+            &|_| true,
+        );
+        assert_eq!(got, Some(PathBuf::from("/opt/textforge").join("data")));
+    }
+
+    #[test]
+    fn data_dir_falls_back_to_appdata_when_the_install_dir_is_readonly() {
+        // R9 的真实场景：装进 Program Files。旧实现把创建失败用 `let _ =` 吞掉，
+        // 照样注入 TEXTFORGE_DATA_DIR ⇒ 后端回退到 %APPDATA%、外壳却仍读 exe 旁，
+        // 两边各算一处 ⇒ 前端永远等不到 port.json（打开就是空白界面）。
+        let got = resolve_data_dir(
+            None,
+            Some(std::path::Path::new("C:/Program Files/TextForge")),
+            Some("C:/Users/me/AppData/Roaming"),
+            Some("C:/Users/me"),
+            &|p| !p.starts_with("C:/Program Files"),
+        );
+        assert_eq!(got, Some(PathBuf::from("C:/Users/me/AppData/Roaming").join("TextForge")));
+    }
+
+    #[test]
+    fn data_dir_ignores_an_override_it_cannot_create() {
+        // 显式指定也必须「创建得了才算数」：注入一个建不了的目录，后端会自己回退，
+        // 分叉就回来了。
+        let got = resolve_data_dir(
+            Some("E:/locked/TextForge"),
+            Some(std::path::Path::new("/app")),
+            None,
+            Some("/home/me"),
+            &|p| p == PathBuf::from("/app").join("data"),
+        );
+        assert_eq!(got, Some(PathBuf::from("/app").join("data")));
+    }
+
+    #[test]
+    fn data_dir_without_appdata_uses_the_home_dir() {
+        // 与后端 appdir.py 的最后一档（~/.textforge）保持一致，别让两侧又分叉。
+        let got = resolve_data_dir(None, None, None, Some("/home/me"), &|_| true);
+        assert_eq!(got, Some(PathBuf::from("/home/me").join(".textforge")));
+    }
+
+    #[test]
+    fn data_dir_rejects_an_empty_override_instead_of_treating_it_as_a_path() {
+        let got = resolve_data_dir(
+            Some(""),
+            Some(std::path::Path::new("/app")),
+            None,
+            None,
+            &|_| true,
+        );
+        assert_eq!(got, Some(PathBuf::from("/app").join("data")));
+    }
+
+    #[test]
+    fn probe_port_rejects_a_just_released_port() {
+        // 「port.json 存在」≠「听得见」：get_backend_port 靠这条把死端口挡在外面。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert!(!probe_port(port), "刚释放的端口不该被判成活着");
+    }
+
+    #[test]
+    fn probe_port_accepts_a_listening_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(probe_port(port), "真在听的端口必须判成活着，否则 waitForPort 永远等不完");
+    }
+
+    #[test]
+    fn a_dead_port_is_never_handed_to_the_frontend() {
+        // R9 闩锁：port.json 里的端口听不见时必须是 NotReady（让轮询继续等），
+        // 不能 Ready —— 前端拿到死端口后 waitForPort 就「成功」了，之后每个请求都失败。
+        assert!(matches!(classify_port(53117, false), PortResult::NotReady));
+        assert!(matches!(classify_port(0, true), PortResult::NotReady));
+        assert!(matches!(classify_port(53117, true), PortResult::Ready(53117)));
     }
 
     #[test]
