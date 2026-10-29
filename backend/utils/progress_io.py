@@ -99,6 +99,23 @@ def save_progress_dict(path: Path, data: dict) -> None:
         _progress_cache.pop(Path(path), None)
 
 
+def merge_progress_write(path: Path, mutate) -> dict:
+    """重读磁盘 → 把磁盘副本交给 mutate 就地改 → 写回，返回改后的副本。
+
+    存在的理由（R4/R12 的真实错法）：调用方手上的 progress 常常是**一次 LLM 调用之前**
+    读的快照，几十秒后拿它整份盖盘，会把期间别的写者（心跳、验收端点、另一章的重写、
+    log_error）写进去的键一并抹掉。这里把「读-改-写」收拢成一次，改的对象是刚读到的
+    内容，所以只有本次真正动过的键会被并入。
+
+    mutate 必须是纯磁盘语义（不要闭包旧快照的键值），且**不得包含网络/LLM 调用**：
+    调用方已持有 progress_lock，这段在锁里跑。
+    """
+    disk = read_progress(path)
+    mutate(disk)
+    save_progress_dict(path, disk)
+    return disk
+
+
 _CACHE_LOCK = threading.Lock()
 # 缓存值 = ((mtime_ns, size), 解析后的 dict)；按 mtime_ns + size 双条件失效。
 # 命中返回 deepcopy：经缓存的读方（routes/status.py）虽只读，但 deepcopy 让调用方

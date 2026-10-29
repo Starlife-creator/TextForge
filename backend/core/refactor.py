@@ -22,6 +22,7 @@ from core.quality import (
     MAX_PRE_STITCH_ISSUES,
 )
 from utils.tokens import estimate_tokens
+from utils.progress_io import ProgressUnreadable, merge_progress_write
 
 logger = logging.getLogger("textforge")
 
@@ -341,10 +342,23 @@ async def regen_single_chapter(req, output_path, chapter_id):
     atomic_write_text(recon_dir / f"chapter_{chapter_id}.txt", new_text)
     # 正文换了，质检结论也必须换：否则质量报告继续指控已经改好的章，
     # 而重写新引入的硬伤没人记录。写完文件再刷新，保证评的是新正文。
-    fresh = _refresh_qc_after_regen(req, output_path, progress, chapter_id, new_text)
-    if progress:
+    # R4：刷新与写盘必须对着**磁盘当前内容**做——`progress` 是这次 LLM 调用之前读的
+    # 快照，拿它整份盖回会抹掉期间心跳/验收/另一章重写写进去的键。
+    fresh: list[dict] = []
+    progress_path = output_path / "progress.json"
+    committed: dict = {}
+
+    def _commit_qc(disk: dict) -> None:
+        committed["fresh"] = _refresh_qc_after_regen(req, output_path, disk, chapter_id, new_text)
+
+    try:
         async with state.progress_lock:
-            atomic_write_json(output_path / "progress.json", progress)
+            await asyncio.to_thread(merge_progress_write, progress_path, _commit_qc)
+        fresh = committed.get("fresh") or []
+    except (ProgressUnreadable, OSError) as e:
+        # 读不了磁盘现状就什么都不写：宁可这批 QC 结论晚一拍刷新，也不能用旧快照盖掉
+        # 别人的进度（那正是 R4 的错法）。正文已经落盘，用户看到的是重写成功。
+        logger.warning(f"[regen] progress.json 读不了，跳过 QC 回写（正文已更新）：{e}")
     bad = [i for i in fresh if i.get("severity") == "bad"]
     if bad:
         sse_emit("qc_warning", {

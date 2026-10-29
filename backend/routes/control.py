@@ -5,7 +5,7 @@
 端点若也去写 current_phase，会与等待循环的写盘互相覆盖，且历史上曾错误地回退到
 'phase2'，导致断点恢复时蓝图被重新生成（见 routes/state.py:absorb_gate_result 注释）。
 """
-import asyncio, os, subprocess, sys
+import asyncio, logging, os, subprocess, sys
 from fastapi import APIRouter, HTTPException, Body
 from core.budget import blueprint_accept_max_chars
 from core.refactor import REGEN_MAX_PER_CHAPTER
@@ -14,9 +14,11 @@ from pathlib import Path
 from utils.atomic import atomic_write_text
 from utils.errors import raise_internal_error
 from utils.progress_io import (
-    load_progress_dict, save_progress_dict, ProgressUnreadable,
+    load_progress_dict, save_progress_dict, ProgressUnreadable, merge_progress_write,
 )
 import json
+
+logger = logging.getLogger("textforge")
 
 router = APIRouter()
 
@@ -223,16 +225,23 @@ async def regen_chapter(payload: dict = Body(...)):
         # #6：500 不回传内部异常细节，详情进日志。
         raise raise_internal_error(e, "单章重生成失败，详情请查看后端日志", "regen_chapter")
     # 成功后登记单章重写次数（与主路径整轮护栏口径一致）。
+    # R12：读不到磁盘现状时**绝不**退回「调用前那份快照」整份写回——一次重生成几十秒，
+    # 期间心跳/验收/另一章的写都在动同一个文件，旧快照盖盘会把它们的键抹掉。
+    # 次数只是保险丝，宁可少记一次并在响应里如实告知，也不能拿别人的进度换它。
+    def _bump(disk: dict) -> None:
+        rc = disk.setdefault('regen_count', {})
+        cid = str(chapter_id)
+        rc[cid] = int(rc.get(cid, 0) or 0) + 1
+
+    recorded = True
     async with state.progress_lock:
         try:
-            updated = await asyncio.to_thread(load_progress_dict, progress_path)
-        except (ProgressUnreadable, json.JSONDecodeError, OSError):
-            updated = progress
-        updated.setdefault('regen_count', {})
-        cid = str(chapter_id)
-        updated['regen_count'][cid] = int(updated['regen_count'].get(cid, 0)) + 1
-        await _save_progress_guarded(progress_path, updated)
-    return {"status": "regenerated", "chapter_id": chapter_id, "preview": new_text[:80]}
+            await asyncio.to_thread(merge_progress_write, progress_path, _bump)
+        except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
+            recorded = False
+            logger.warning(f"[control] 重写次数没登记上（正文已更新）：{e}")
+    return {"status": "regenerated", "chapter_id": chapter_id, "preview": new_text[:80],
+            "regen_count_recorded": recorded}
 
 @router.post("/api/accept")
 async def accept(payload: dict = Body(...)):
