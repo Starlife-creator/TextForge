@@ -91,20 +91,40 @@
 
 | # | 改动 | DoD | 反向断言 |
 |---|---|---|---|
-| B2.1 | 新增 `merge_progress_write(progress_path, changes)`：写盘前重读磁盘、只并入本次真正改动的键；`regen_single_chapter` 与 `control.py` 的 regen 计数改走它（R4/R12 一并收口） | 两个 regen 并发（stub 掉 LLM 调用）后两章的 QC 结论都在；写盘失败时不再回写旧快照 | 退回「读一次 + 整份写」⇒ 并发用例红 |
-| B2.2 | 脱敏判定拆成两层：**精确键名**（`apikey/token/password/authorization/secret/accesstoken/secretkey`）无条件遮；**泛词子串**（新增 `token`/`secret`/`credential`）只在「值是字符串、`strip()` 后长度 ≥16、无空白、匹配 `[A-Za-z0-9_:.\-]+` 或以 `sk-/ghp-/AIza/xox` 开头」时遮。`_is_sensitive_key(k)` **保持单参语义**（`_fingerprint` 就是单参调用，改签名会让它退化成不哈希 ⇒ 明文进指纹）；值形状判定放在 `redact()` 的键分支里 | 正向：`refresh_token`/`client_secret`/`?key=sk-live-…` 被遮；**带尾随换行的全局 api_key 仍被遮**（精确键无条件，App.vue:1113 未 trim 这条真实路径我查过）。反向不得误伤（用**本仓真实存在的键**）：`usage.prompt_tokens=1200`、`completion_tokens`、estimate 的 `tokens` dict、散文 `"每章 token 数量上限 1200"`、`"禁止出现 secret identity 设定"` 原样 | 只放宽键名不管值形状 ⇒ int/dict 反向用例红；把 `_is_sensitive_key` 改成双参 ⇒ `_fingerprint` 用例红（复刻 `test_config_drift_fingerprint.py`） |
-| B2.3 | **先解耦**：`atomic_write_json(path, data, *, pretty=True, sync=True)`，`pretty` 只管缩进、`sync` 只管 fsync（现状是 `pretty=False` 把 fsync 一起去掉）；随后 progress 写盘走 `pretty=False, sync=True` | 30 MB 上单次写耗时下降 ≥15%（实测 indent 本身只值 0.4 ms，收益来自更小字符串与写盘量），且 fsync 仍在 ⇒ 掉电语义不变。已确认 `progress.json` 无任何人类可读依赖（文档把它当机器状态，测试一律 `json.loads`，ADR-004 只断「心跳不落盘」） | 把 `sync` 默认改成 False ⇒ 新增的 fsync 断言红 |
+| B2.1 ✅ 07f5aa7 | 新增 `merge_progress_write(progress_path, changes)`：写盘前重读磁盘、只并入本次真正改动的键；`regen_single_chapter` 与 `control.py` 的 regen 计数改走它（R4/R12 一并收口） | 两个 regen 并发（stub 掉 LLM 调用）后两章的 QC 结论都在；写盘失败时不再回写旧快照 | 退回「读一次 + 整份写」⇒ 并发用例红 |
+| B2.2 ✅ 5c2fde9 | 脱敏判定拆成两层：**精确键名**（`apikey/token/password/authorization/secret/accesstoken/secretkey`）无条件遮；**泛词子串**（新增 `token`/`secret`/`credential`）只在「值是字符串、`strip()` 后长度 ≥16、无空白、匹配 `[A-Za-z0-9_:.\-]+` 或以 `sk-/ghp-/AIza/xox` 开头」时遮。`_is_sensitive_key(k)` **保持单参语义**（`_fingerprint` 就是单参调用，改签名会让它退化成不哈希 ⇒ 明文进指纹）；值形状判定放在 `redact()` 的键分支里 | 正向：`refresh_token`/`client_secret`/`?key=sk-live-…` 被遮；**带尾随换行的全局 api_key 仍被遮**（精确键无条件，App.vue:1113 未 trim 这条真实路径我查过）。反向不得误伤（用**本仓真实存在的键**）：`usage.prompt_tokens=1200`、`completion_tokens`、estimate 的 `tokens` dict、散文 `"每章 token 数量上限 1200"`、`"禁止出现 secret identity 设定"` 原样 | 只放宽键名不管值形状 ⇒ int/dict 反向用例红；把 `_is_sensitive_key` 改成双参 ⇒ `_fingerprint` 用例红（复刻 `test_config_drift_fingerprint.py`） |
+| B2.3 ✅ cd7ce2d | **先解耦**：`atomic_write_json(path, data, *, pretty=True, sync=True)`，`pretty` 只管缩进、`sync` 只管 fsync（现状是 `pretty=False` 把 fsync 一起去掉）；随后 progress 写盘走 `pretty=False, sync=True` | 30 MB 上单次写耗时下降 ≥15%（实测 indent 本身只值 0.4 ms，收益来自更小字符串与写盘量），且 fsync 仍在 ⇒ 掉电语义不变。已确认 `progress.json` 无任何人类可读依赖（文档把它当机器状态，测试一律 `json.loads`，ADR-004 只断「心跳不落盘」） | 把 `sync` 默认改成 False ⇒ 新增的 fsync 断言红 |
 
 ### 批 3 —— 前端可达性（必须先补最小 vitest，否则同类缺陷还会无声存活）
 
 | # | 改动 | DoD |
 |---|---|---|
-| B3.1 | 对照面板：选中项后带 `name` 再取正文（两次请求），列表项类型改 `{name,size}` | vitest：mock fetch 断言两次调用且 `text` 渲染出内容；删掉第二次调用 ⇒ 红 |
-| B3.2 | switch 补 `gate_timeout`/`split_ai_start` 分支 + `default`；`fetchStatus` 消费 `progress_error`；`checkRes` 对 503 给「文件被占用，稍后自动重试」并做一次退避重试 | vitest：闸门超时事件渲染出横幅；503 走重试路径；删 case ⇒ 红 |
+| B3.1 ✅ 478cff3 | 对照面板：选中项后带 `name` 再取正文（两次请求），列表项类型改 `{name,size}` | vitest：mock fetch 断言两次调用且 `text` 渲染出内容；删掉第二次调用 ⇒ 红 |
+| B3.2 ✅ 478cff3 + 562f6b1 | switch 补 `gate_timeout`/`split_ai_start` 分支 + `default`；`fetchStatus` 消费 `progress_error`；`checkRes` 对 503 给「文件被占用，稍后自动重试」并做一次退避重试 | vitest：闸门超时事件渲染出横幅；503 走重试路径；删 case ⇒ 红 |
 
 ### 批 4 —— 外壳（`R9`，含可测性重构）
 
-B4.1 Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE_DATA_DIR`，并把 exe-dir 分支改为「仅当可创建」；B4.2 `get_backend_port` 复用同文件已有的 `probe_port` 做存活探测，`reap_orphan_backend` 在 pid 已死时删除陈旧 `port.json`；B4.3 把路径解析抽成不依赖 `current_exe` 的纯函数以便 `cargo test`（三端腿都能跑）。
+B4.1 ✅ 0bde150 | Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE_DATA_DIR`，并把 exe-dir 分支改为「仅当可创建」；B4.2 `get_backend_port` 复用同文件已有的 `probe_port` 做存活探测，`reap_orphan_backend` 在 pid 已死时删除陈旧 `port.json`；B4.3 把路径解析抽成不依赖 `current_exe` 的纯函数以便 `cargo test`（三端腿都能跑）。
+
+> **批 2 / 批 3 / 批 4 收口（2026-10-29）**：
+> ① **B2.1** 的实现把 `merge_progress_write(path, mutate)` 做成「重读磁盘 → 把磁盘副本交给
+> mutate → 写回」，而不是方案里写的「传 changes 字典」——QC 结论必须对着**刚读到的** batch_qc
+> 逐章合并，传字典会把「只属于本章」的粒度丢掉。反向断言改为两条：确定性交错用例（负向对照钉住
+> 旧错法）+ 接线守卫（`inspect.getsource` 钉住两条路径确实走 merge，且 R12 的 `updated = progress`
+> 不许回来）。
+> ② **B2.3** 的收益**取决于键密度**，不是普适百分比：本机 4 万章 + 5000 批的键密集 payload
+> （11.7 MB）单次写 259.7 → 189.5 ms（**−27.0%**，字节 −32.7%）；而长锚点为主的 4 MB payload
+> 只降 6.2%。真实 progress.json 以章/批次记录为主，落在 27% 这一侧。fsync 与排版解耦后，
+> `sync=False` 必须显式传（把 sync 默认改 False / pretty=False 分支不 fsync / 入口退回 pretty,
+> 三条变异各自都红）。
+> ③ **批 3 没有组件测试环境**（devDependencies 里没有 @vue/test-utils、也没有 happy-dom/jsdom，
+> 加依赖要先过决策）。因此 R8/R10 的判据分两层：`fetchComparisonList` / `fetchComparisonText` /
+> `postWithBusyRetry` 用 mock fetch 做**行为**单测（33 条用例，其中 16 条本轮新增），
+> 「App.vue 是否真的接上」用 `?raw` 源码守卫钉住（删 case、去掉第二次请求、退回裸 apiFetch
+> 三种变异各自都红）。这是**已知弱化**，不是组件渲染断言。
+> ④ **批 4** 在 Windows 本机跑通 `cargo check`（2.6 s 增量）+ `cargo test`（18 passed，新增 8 条）,
+> 两条变异（便携目录建不了也照样选它 / 死端口照样 Ready）各自咬住。
+> **Linux/macOS 腿的 `cfg(not(windows))` 分支本机没编译过**，靠 CI 三条腿覆盖。
 
 ## 3. 本轮明确不做
 
@@ -120,3 +140,11 @@ B4.1 Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE_DATA_DIR`，�
 3. release.yml 只出 Windows：macOS `.dmg` 的 5 条手工验收长期无人代跑。
 4. 前端只有 4 个 vitest 文件（`src/*.test.ts`），界面态（弹窗、闸门、进度条）无任何自动断言——本轮 B3 是最小补齐，不是补齐完毕。
 5. e2e 走本地 HTTP mock LLM，**TLS 路径与真实模型错误文本**（正是 R5b 的来源）从未被真实覆盖。
+6. R5a 只做到「泛词键名 + 值形状」这一层：`https://user:pw@host` 这类 URL 内嵌口令**仍不遮**。
+   本轮砍掉的理由是它需要一组独立的反向用例（`key=value` 形态太宽，容易误咬正文里的 URL），
+   且本仓没有任何路径把带口令的 URL 写进日志/注册表。**重测条件**：一旦出现「把带凭据的 URL
+   存进 config/models 表」的真实入口，立刻补。
+7. 界面**渲染**层仍无断言（批 3 是行为单测 + 源码守卫）。要真钉住「闸门超时弹横幅」这种效果，
+   需要引入 `@vue/test-utils` + `happy-dom`——属新增 devDependency，需先拍板。
+8. 批 4 只在本机（Windows）编译过；`cfg(not(windows))` 分支的 libc::kill 等代码靠 CI 的
+   ubuntu/macos 腿首次真编译，本地无法验证。
