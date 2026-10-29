@@ -31,6 +31,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import threading
 import unicodedata
 from collections import OrderedDict
 from pathlib import Path
@@ -176,6 +177,9 @@ def _blueprint_calls(context_window: int, summary_sizes: list[int]) -> tuple[int
 # 用 OrderedDict：命中 move_to_end，淘汰 popitem(last=False)，真正 LRU。
 _ESTIMATE_CACHE: OrderedDict[str, dict] = OrderedDict()
 _ESTIMATE_CACHE_MAX = 16
+# 预估跑在 asyncio.to_thread 里，多个请求会并发碰同一份 OrderedDict。get→move_to_end
+# 之间被别的线程淘汰会抛 KeyError，写→淘汰之间交错则可能淘汰掉刚放的键。
+_ESTIMATE_CACHE_LOCK = threading.Lock()
 
 
 def _input_signature(req) -> tuple:
@@ -208,15 +212,17 @@ def estimate_run(req) -> dict:
     key = hashlib.sha1(
         json.dumps(_input_signature(req), ensure_ascii=False, default=str).encode("utf-8")
     ).hexdigest()
-    cached = _ESTIMATE_CACHE.get(key)
-    if cached is not None:
-        _ESTIMATE_CACHE.move_to_end(key)  # 命中即 touch，真 LRU
-        return copy.deepcopy(cached)
-    result = _estimate_run_uncached(req)
-    _ESTIMATE_CACHE[key] = result
-    _ESTIMATE_CACHE.move_to_end(key)
-    while len(_ESTIMATE_CACHE) > _ESTIMATE_CACHE_MAX:
-        _ESTIMATE_CACHE.popitem(last=False)  # 淘汰最久未用
+    with _ESTIMATE_CACHE_LOCK:
+        cached = _ESTIMATE_CACHE.get(key)
+        if cached is not None:
+            _ESTIMATE_CACHE.move_to_end(key)  # 命中即 touch，真 LRU
+            return copy.deepcopy(cached)
+    result = _estimate_run_uncached(req)  # 算在锁外：一次预估可达数百 ms，排队会拖慢并发预估
+    with _ESTIMATE_CACHE_LOCK:
+        _ESTIMATE_CACHE[key] = result
+        _ESTIMATE_CACHE.move_to_end(key)  # 同键可能已被别的线程写过，插入不会挪位置
+        while len(_ESTIMATE_CACHE) > _ESTIMATE_CACHE_MAX:
+            _ESTIMATE_CACHE.popitem(last=False)  # 淘汰最久未用
     return copy.deepcopy(result)
 
 
