@@ -1224,6 +1224,52 @@ try:
           q13_err or str(q13.get("summary")))
     put(f"{L}/", {"bad_content": {"times": 0}})
 
+    # ---------- 场景十四：停在验收门（B1.1 的端到端覆盖）----------
+    # 全局闸门驱动只按「确认」，从不在闸门处按停止 ⇒ 「停止优先于确认，但已确认的
+    # 选择必须先并回内存」这条改动过去没有任何端到端覆盖。用户可见的损失：
+    # 在闸门上按停止后界面只是「不再滚动」，恢复对话框再也回不来（阶段被推进了）。
+    # 这里钉三件事：stopped 事件 + 阶段仍是 phase3_accept + 刷新后 resume 仍指向该批。
+    from urllib.parse import quote as _quote14
+    scene("场景十四：停在验收门")
+    put(f"{L}/", {"reset": True, "log_clear": True,
+                  "fail": {"phase": None, "times": 0, "status": 500, "body": "",
+                           "skip": 0, "arm_after": 0, "extra_breaks": 0}})
+    e14in = tmp / "in14"; make_novel(e14in, chapters=6, paras=3)
+    o14 = tmp / "out14"
+    _GATE.suppress = {"accept_ready"}      # 验收门留给本场景按停止
+    ev14, th14 = sse_events(API_PORT, 300, stop_on="stopped")
+    start_run(dict(body, input_path=str(e14in), output_path=str(o14), context_window=8000,
+                   novel_name="停在验收门",
+                   refactor_gates={"require_chapter_accept": True,
+                                   "auto_rewrite_bad_batch": False},
+                   compare_output=False, chapter_snapshots=False, max_concurrency=1))
+    acc14 = None
+    t14 = time.time()
+    while time.time() - t14 < 180:
+        acc14 = next((json.loads(d) for _e, d in reversed(ev14) if _e == "accept_ready"), None)
+        if acc14:
+            break
+        time.sleep(0.25)
+    check("验收门已弹出（本场景在门处按停止）", bool(acc14), str(acc14)[:120])
+    _bid14 = str((acc14 or {}).get("batch_id"))
+    post(f"{B}/api/stop", {})
+    ok14 = wait_done(ev14, th14, api_port=API_PORT)[0]
+    names14 = [e for e, _ in ev14]
+    check("闸门处按停止能收到 stopped 事件", "stopped" in names14, str(names14[-6:]))
+    check("停止后本轮确实结束（不再空转）", ok14, str(names14[-4:]))
+    p14 = json.loads((o14 / "progress.json").read_text(encoding="utf-8"))
+    check("停在验收门时阶段仍是 phase3_accept",
+          p14.get("current_phase") == "phase3_accept", str(p14.get("current_phase")))
+    check("没确认的批次没有被记成已验收",
+          _bid14 not in [str(x) for x in (p14.get("accepted_batches") or [])],
+          str(p14.get("accepted_batches"))[:160])
+    st14 = get(f"{B}/api/status?output_path={_quote14(str(o14))}")
+    _res14 = st14.get("resume") or {}
+    check("刷新后仍能弹回验收门（key=accept 且批次对得上）",
+          _res14.get("key") == "accept" and str(_res14.get("batch_id")) == _bid14,
+          str(_res14)[:160])
+    _GATE.suppress = set()
+
     # 输出目录管理端点（GUI 用）：HTTP 层验证
     from urllib.parse import quote
     insp = get(f"{B}/api/output/inspect?output_path={quote(str(o8))}")
