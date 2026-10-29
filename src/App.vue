@@ -8,7 +8,7 @@ import SettingsModal from './components/SettingsModal.vue';
 import GateModal from './components/GateModal.vue';
 import RunStats from './components/RunStats.vue';
 import QualityModal from './components/QualityModal.vue';
-import { apiFetch, initAuth } from './api/client';
+import { apiFetch, initAuth, postWithBusyRetry } from './api/client';
 import {
   DEFAULT_CONTEXT_WINDOW,
   DEFAULT_PRESET_NAME,
@@ -21,12 +21,15 @@ import {
   fetchVersions,
   restoreVersion,
   fetchQualityReport,
+  fetchComparisonList,
+  fetchComparisonText,
   estimateRun,
   costOf,
   formatCost,
   type HistoryItem,
   type VersionInfo,
   type QualityReport,
+  type ComparisonEntry,
   type EstimateResult,
   type UnitPrice,
 } from './api/system';
@@ -177,8 +180,9 @@ function buildModels(): Record<
 const finalFiles = ref<{ name: string; path: string }[]>([]);
 // C1 左右对照预览
 const showComparisons = ref(false);
-const comparisonItems = ref<{ name: string; text: string }[]>([]);
+const comparisonItems = ref<ComparisonEntry[]>([]);
 const comparisonSel = ref('');
+const comparisonText = ref('');
 
 // ---------- 运行状态 ----------
 const runId = ref<string | null>(null);
@@ -742,6 +746,13 @@ async function fetchStatus(): Promise<boolean> {
     const res = await apiFetch(`http://127.0.0.1:${port.value}/api/status${q}`);
     if (!res.ok) return false;
     const s = await res.json();
+    // R10：这两个字段过去被前端整个忽略。progress.json 读坏了 / 闸门超时暂停时，
+    // 界面显示的是「一片空白，像什么都没跑」，而真相在响应的这两个字段里。
+    if (s.progress_error) topError.value = `进度文件读不了：${s.progress_error}`;
+    if (s.gate_timed_out)
+      topError.value =
+        `闸门超时，任务已安全暂停：${s.gate_timeout_gate || '未知闸门'}` +
+        `（已等待 ${Math.round((s.gate_wait_seconds || 0) / 60)} 分钟）`;
     isPaused.value = !!s.paused;
     if (Array.isArray(s.config_drift) && s.config_drift.length) {
       // 续跑时配置变了 → 前几批用旧配置、后几批用新配置，可能风格割裂
@@ -1021,6 +1032,28 @@ function handleSSEEvent(event: string, payload: any) {
     case 'comparison_done':
       addLog(`左右对照已生成：写入 ${payload.written} 章 / 跳过 ${payload.skipped} 章`, 'ok');
       break;
+    case 'gate_timeout':
+      // #2：某个闸门等太久，后端已安全暂停并留痕。不说清「卡在哪个门、等了多久」
+      // 的话，界面只是不再滚动，用户会以为程序死了。
+      topError.value = `闸门超时，任务已安全暂停：${payload.gate || '未知闸门'}`;
+      addLog(
+        `闸门超时（${payload.gate || '未知'}，已等待 ${Math.round(payload.waiting_seconds || 0)} 秒），` +
+          '请回到对应闸门确认后恢复',
+        'err',
+      );
+      break;
+    case 'split_ai_start':
+      addLog(
+        `识别不到章节边界，正在用 AI 辅助拆分（原因：${payload.reason || '未知'}，` +
+          `${payload.candidates || 0} 个候选）`,
+        'warn',
+      );
+      break;
+    default:
+      // 后端新增事件而前端没接上时，宁可在这里留一条日志：过去这类「前端漏处理」
+      // 全部表现为静默失效（对照面板空白、闸门超时不提示都属此类）。
+      addLog(`未处理的事件：${event}`, 'info');
+      break;
   }
 }
 
@@ -1208,11 +1241,11 @@ async function confirmSplit() {
   if (confirmingSplit.value) return; // 防重复点击：Enter 键和鼠标都会触发
   confirmingSplit.value = true;
   try {
-    const res = await apiFetch(`${apiBase()}/api/split/confirm`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ run_id: runId.value }),
-    });
+    const res = await postWithBusyRetry(
+      `${apiBase()}/api/split/confirm`,
+      { run_id: runId.value },
+      { onBusy: (n) => addLog(`文件正被占用，确认拆分自动重试第 ${n} 次…`, 'warn') },
+    );
     if (await checkRes(res, '确认拆分')) {
       markGateSettled('split');
       showSplit.value = false;
@@ -1284,11 +1317,11 @@ async function confirmFix() {
   confirmingFix.value = true;
   try {
     const descriptions = selectedGapDescriptions();
-    const res = await apiFetch(`${apiBase()}/api/fix/confirm`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ run_id: runId.value, fix_list: descriptions }),
-    });
+    const res = await postWithBusyRetry(
+      `${apiBase()}/api/fix/confirm`,
+      { run_id: runId.value, fix_list: descriptions },
+      { onBusy: (n) => addLog(`文件正被占用，确认断层自动重试第 ${n} 次…`, 'warn') },
+    );
     if (await checkRes(res, '确认断层')) {
       markGateSettled('fix');
       showFixReview.value = false;
@@ -1305,11 +1338,11 @@ async function confirmAccept() {
   if (confirmingAccept.value) return; // 防重复点击
   confirmingAccept.value = true;
   try {
-    const res = await apiFetch(`${apiBase()}/api/accept`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ run_id: runId.value }),
-    });
+    const res = await postWithBusyRetry(
+      `${apiBase()}/api/accept`,
+      { run_id: runId.value },
+      { onBusy: (n) => addLog(`文件正被占用，验收自动重试第 ${n} 次…`, 'warn') },
+    );
     if (await checkRes(res, '验收')) {
       markGateSettled('accept:' + acceptBatch.value);
       showAccept.value = false;
@@ -1326,15 +1359,19 @@ async function regenChapter(c: any) {
   if (regenerating.value.has(c.id)) return; // 防重复
   regenerating.value.add(c.id);
   try {
-    const res = await apiFetch(`${apiBase()}/api/regen_chapter`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ run_id: runId.value, chapter_id: c.id }),
-    });
+    const res = await postWithBusyRetry(
+      `${apiBase()}/api/regen_chapter`,
+      { run_id: runId.value, chapter_id: c.id },
+      { onBusy: (n) => addLog(`文件正被占用，重写自动重试第 ${n} 次…`, 'warn') },
+    );
     const d = await res.json().catch(() => null);
     if (res.ok) {
       c.preview = d?.preview || '';
       addLog(`章节 ${c.id} 已重写，请重新验收`, 'accent');
+      // 后端读 progress.json 失败时不写旧快照（R12），代价是这次没记上次数。
+      // 保险丝可能少算一次，必须如实说，不能让用户以为「随便重写不花钱」。
+      if (d && d.regen_count_recorded === false)
+        addLog(`章节 ${c.id} 的重写次数没能登记，重写上限可能比预期宽松一次`, 'warn');
     } else {
       await checkRes(res, '重写', d);
     }
@@ -1436,26 +1473,44 @@ async function exportLog() {
   addLog(`已导出日志（${eventLog.value.length} 条）`);
 }
 
-async function openComparisons() {
-  if (!outputPath.value) return;
+async function loadComparisonText() {
+  if (!port.value || !outputPath.value || !comparisonSel.value) {
+    comparisonText.value = '';
+    return;
+  }
   try {
-    const res = await apiFetch(
-      `${apiBase()}/api/comparisons?output_path=${encodeURIComponent(outputPath.value)}`,
+    comparisonText.value = await fetchComparisonText(
+      port.value,
+      outputPath.value,
+      comparisonSel.value,
     );
-    if (!res.ok) {
-      alert('获取对照失败');
-      return;
-    }
-    const d = await res.json();
-    comparisonItems.value = d.items || [];
+  } catch (e: any) {
+    comparisonText.value = '';
+    topError.value = `对照正文读取失败：${e.message}`;
+  }
+}
+
+async function openComparisons() {
+  if (!outputPath.value || !port.value) return;
+  try {
+    // R8：列表不含正文，必须再按选中项取一次；换章节时也要重取。
+    comparisonItems.value = await fetchComparisonList(port.value, outputPath.value);
     comparisonSel.value = comparisonItems.value[0]?.name ?? '';
     showComparisons.value = true;
-    if (!comparisonItems.value.length)
+    if (!comparisonItems.value.length) {
+      comparisonText.value = '';
       topError.value = '当前输出目录还没有左右对照文件（需开启「左右对照」并跑完 phase3）';
+      return;
+    }
+    await loadComparisonText();
   } catch (e: any) {
     topError.value = `请求失败：${e.message}`;
   }
 }
+
+watch(comparisonSel, () => {
+  void loadComparisonText();
+});
 
 async function confirmBlueprint() {
   if (confirmingBlueprint.value) return; // 防重复点击
@@ -1465,15 +1520,15 @@ async function confirmBlueprint() {
   }
   confirmingBlueprint.value = true;
   try {
-    const res = await apiFetch(`${apiBase()}/api/blueprint/confirm`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const res = await postWithBusyRetry(
+      `${apiBase()}/api/blueprint/confirm`,
+      {
         run_id: runId.value,
         blueprint: blueprintText.value,
         user_edited: true,
-      }),
-    });
+      },
+      { onBusy: (n) => addLog(`文件正被占用，确认蓝图自动重试第 ${n} 次…`, 'warn') },
+    );
     if (await checkRes(res, '确认蓝图')) {
       // 与 split/accept/fix/qc 一致：确认后落闩锁，防止轮询/重放再次弹窗。
       markGateSettled('blueprint');
@@ -1505,8 +1560,15 @@ async function checkRes(res: Response, action: string, parsed?: any): Promise<bo
     detail = detail.map((e: any) => `${(e.loc || []).slice(1).join('.')}: ${e.msg}`).join('; ');
   }
   const msg = detail || `HTTP ${res.status}`;
-  topError.value = `${action}失败：${msg}`;
-  addLog(`${action}失败：${msg}`, 'err');
+  // 503 是「progress.json 正被别的程序占用」（后端已退避重试一轮，前端又自动重发
+  // 过一次）。这时说「失败：文件正被占用」用户还得自己点，直接给下一步动作。
+  const text =
+    res.status === 503
+      ? `${action}：成品文件正被占用，自动重试仍未成功。请关闭正在打开输出目录的程序` +
+        '（资源管理器预览、Word/Excel、杀毒扫描）后再点一次'
+      : `${action}失败：${msg}`;
+  topError.value = text;
+  addLog(text, 'err');
   return false;
 }
 
@@ -1522,11 +1584,11 @@ async function control(action: 'pause' | 'resume' | 'stop') {
   controlling.value = true;
   try {
     const label = { pause: '暂停', resume: '恢复', stop: '停止' }[action];
-    const res = await apiFetch(`${apiBase()}/api/${action}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ run_id: runId.value }),
-    });
+    const res = await postWithBusyRetry(
+      `${apiBase()}/api/${action}`,
+      { run_id: runId.value },
+      { onBusy: (n) => addLog(`文件正被占用，${label}自动重试第 ${n} 次…`, 'warn') },
+    );
     await checkRes(res, label);
   } catch (e: any) {
     topError.value = `请求失败：${e.message}`;
@@ -2244,13 +2306,11 @@ const canStart = computed(
           <label>章节</label>
           <select v-model="comparisonSel">
             <option v-for="it in comparisonItems" :key="it.name" :value="it.name">
-              {{ it.name }}
+              {{ it.name }}（{{ Math.round(it.size / 1024) }} KB）
             </option>
           </select>
         </div>
-        <pre class="comp-preview">{{
-          (comparisonItems.find((i) => i.name === comparisonSel) || {}).text
-        }}</pre>
+        <pre class="comp-preview">{{ comparisonText }}</pre>
         <div class="modal-actions">
           <span></span>
           <button @click="showComparisons = false">关闭</button>

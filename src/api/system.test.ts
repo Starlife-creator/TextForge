@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { costOf, estimateRun, fetchQualityReport, formatCost } from './system';
+import {
+  costOf,
+  estimateRun,
+  fetchComparisonList,
+  fetchComparisonText,
+  fetchQualityReport,
+  formatCost,
+} from './system';
+import appSource from '../App.vue?raw';
 
 describe('api/system 质量报告', () => {
   afterEach(() => {
@@ -103,5 +111,61 @@ describe('api/system 开跑前预估', () => {
       ),
     );
     await expect(estimateRun(1234, {})).rejects.toThrow('不一致');
+  });
+});
+
+describe('对照面板按需加载（R8 / B3.1）', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('列表只要名字与大小，正文必须由第二次带 name 的请求取回', async () => {
+    const urls: string[] = [];
+    const spy = vi.fn(async (input: RequestInfo | URL) => {
+      const u = new URL(String(input));
+      urls.push(u.pathname + u.search);
+      const name = u.searchParams.get('name');
+      const body = name
+        ? { items: [{ name, text: '左：原文段落\n右：重构段落' }] }
+        : { items: [{ name: 'chapter_3.comparison.md', size: 20480 }] };
+      return new Response(JSON.stringify(body), { status: 200 });
+    });
+    vi.stubGlobal('fetch', spy);
+
+    const items = await fetchComparisonList(1234, 'E:\\书 名\\out');
+    expect(items).toEqual([{ name: 'chapter_3.comparison.md', size: 20480 }]);
+    expect(items[0]).not.toHaveProperty('text');
+
+    const text = await fetchComparisonText(1234, 'E:\\书 名\\out', 'chapter_3.comparison.md');
+    expect(text).toContain('右：重构段落');
+
+    expect(urls).toHaveLength(2);
+    const second = new URL(urls[1], 'http://127.0.0.1:1234');
+    expect(second.pathname).toBe('/api/comparisons');
+    expect(second.searchParams.get('name')).toBe('chapter_3.comparison.md');
+    expect(second.searchParams.get('output_path')).toBe('E:\\书 名\\out');
+  });
+
+  it('没有对照文件时得到空列表；正文缺失时得到空串而不是 undefined', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const u = new URL(String(input));
+        return new Response(
+          JSON.stringify(u.searchParams.has('name') ? { items: [] } : { items: [] }),
+          { status: 200 },
+        );
+      }),
+    );
+    expect(await fetchComparisonList(1234, 'out')).toEqual([]);
+    expect(await fetchComparisonText(1234, 'out', 'chapter_1.comparison.md')).toBe('');
+  });
+
+  it('App.vue 确实接了两次请求（不再把列表当带正文的列表用）', () => {
+    const src = appSource;
+    expect(src).toContain('fetchComparisonList(');
+    expect(src).toContain('fetchComparisonText(');
+    expect(src).toContain('watch(comparisonSel');
+    expect(src).not.toContain('comparisonItems.find((i) => i.name === comparisonSel) || {}).text');
   });
 });

@@ -322,6 +322,36 @@ export function inspectOutput(port: number, outputPath: string) {
   return req<any>(port, `/api/output/inspect?${q}`);
 }
 
+export interface ComparisonEntry {
+  name: string;
+  size: number;
+}
+
+/** R8：对照面板要发**两次**请求。
+ *
+ * `/api/comparisons` 不带 `name` 时只返回文件名与大小（整目录正文一次返回会让弹窗
+ * 卡住，按需加载是既有设计）；正文必须带 `name` 再取。此前前端把列表返回值当成
+ * 带正文的列表直接用，`it.text` 永远是 undefined ⇒ 面板永远空白。
+ */
+export async function fetchComparisonList(
+  port: number,
+  outputPath: string,
+): Promise<ComparisonEntry[]> {
+  const q = new URLSearchParams({ output_path: outputPath });
+  const d = await req<{ items: ComparisonEntry[] }>(port, `/api/comparisons?${q}`);
+  return d.items ?? [];
+}
+
+export async function fetchComparisonText(
+  port: number,
+  outputPath: string,
+  name: string,
+): Promise<string> {
+  const q = new URLSearchParams({ output_path: outputPath, name });
+  const d = await req<{ items: { name: string; text: string }[] }>(port, `/api/comparisons?${q}`);
+  return d.items?.[0]?.text ?? '';
+}
+
 /** 探测服务端真实上下文窗口，并与用户配置值对比（仅自检，不影响能否启动）。 */
 export async function probeContext(
   port: number,

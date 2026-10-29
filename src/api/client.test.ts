@@ -7,7 +7,14 @@
  * vue-tsc 只能证明「能编译」，证明不了「行为对」。
  */
 import { describe, expect, it, beforeEach, vi } from 'vitest';
-import { TOKEN_HEADER, apiFetch, authHeaders, getAuthToken, setAuthToken } from './client';
+import {
+  TOKEN_HEADER,
+  apiFetch,
+  authHeaders,
+  getAuthToken,
+  postWithBusyRetry,
+  setAuthToken,
+} from './client';
 
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(async () => 'tok-from-shell'),
@@ -90,5 +97,71 @@ describe('api/client token 注入', () => {
     const [, init] = spy.mock.calls[0] as unknown as [string, RequestInit];
     expect(init.method).toBe('POST');
     expect(init.body).toBe('{}');
+  });
+});
+
+describe('api/client 503「文件被占用」自动重试', () => {
+  function responder(...statuses: number[]) {
+    let i = 0;
+    return vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => {
+      const status = statuses[Math.min(i, statuses.length - 1)];
+      i += 1;
+      return new Response(JSON.stringify({ detail: '文件正被占用，请稍后重试' }), { status });
+    });
+  }
+
+  it('第一次 503、第二次 200 ⇒ 共发两次，返回成功，并把重试告诉调用方', async () => {
+    const spy = responder(503, 200);
+    vi.stubGlobal('fetch', spy);
+    const seen: number[] = [];
+
+    const res = await postWithBusyRetry(
+      'http://127.0.0.1:1234/api/accept',
+      {},
+      { delayMs: 0, onBusy: (n) => seen.push(n) },
+    );
+
+    expect(res.status).toBe(200);
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(seen).toEqual([2]);
+  });
+
+  it('一直 503 ⇒ 只发 tries 次就停（不能变成无限重发）', async () => {
+    const spy = responder(503);
+    vi.stubGlobal('fetch', spy);
+
+    const res = await postWithBusyRetry(
+      'http://127.0.0.1:1234/api/accept',
+      {},
+      { tries: 3, delayMs: 0 },
+    );
+
+    expect(res.status).toBe(503);
+    expect(spy).toHaveBeenCalledTimes(3);
+  });
+
+  it('4xx 不重试：占用之外的错误必须立刻交给界面显示', async () => {
+    const spy = responder(422);
+    vi.stubGlobal('fetch', spy);
+
+    const res = await postWithBusyRetry('http://127.0.0.1:1234/api/accept', {}, { delayMs: 0 });
+
+    expect(res.status).toBe(422);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it('重发仍带 token（重试不能绕过鉴权）', async () => {
+    setAuthToken('tok-abc');
+    const spy = responder(503, 200);
+    vi.stubGlobal('fetch', spy);
+
+    await postWithBusyRetry('http://127.0.0.1:1234/api/accept', {}, { delayMs: 0 });
+
+    const headers = (spy.mock.calls[1] as [string, RequestInit])[1].headers as Record<
+      string,
+      string
+    >;
+    expect(headers[TOKEN_HEADER]).toBe('tok-abc');
+    setAuthToken(null);
   });
 });

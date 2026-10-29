@@ -50,3 +50,42 @@ export function apiFetch(input: string, init: RequestInit = {}): Promise<Respons
   };
   return fetch(input, { ...init, headers });
 }
+
+export interface BusyRetryOptions {
+  /** 总共允许几次尝试（含第一次），默认 2。 */
+  tries?: number;
+  /** 两次尝试之间的等待毫秒数，默认 800。 */
+  delayMs?: number;
+  /** 每次因 503 重发前回调，界面用它把「正在自动重试」说给用户。 */
+  onBusy?: (attempt: number) => void;
+}
+
+/**
+ * POST 一个控制端点，并替用户吃掉 503「文件正被占用」。
+ *
+ * 后端写 progress.json 时，Windows 上文件可能正被杀软/Word 占着，退避重试仍失败
+ * 就返回 503（backend/routes/control.py 的 _save_progress_guarded）。过去界面只说
+ * 「验收失败：文件正被占用，请稍后重试」，用户必须自己再点一次——而占用通常几百
+ * 毫秒就过去。这里把那一次点击补上：默认再多试一次、间隔 800ms。
+ * 其他状态码原样返回，仍由调用方的 checkRes 处理（不能把 4xx 当占用无限重发）。
+ */
+export async function postWithBusyRetry(
+  url: string,
+  body: unknown,
+  opts: BusyRetryOptions = {},
+): Promise<Response> {
+  const tries = opts.tries ?? 2;
+  const delayMs = opts.delayMs ?? 800;
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  };
+  let res = await apiFetch(url, init);
+  for (let attempt = 1; res.status === 503 && attempt < tries; attempt++) {
+    opts.onBusy?.(attempt + 1);
+    await new Promise((r) => setTimeout(r, delayMs));
+    res = await apiFetch(url, init);
+  }
+  return res;
+}
