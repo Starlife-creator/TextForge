@@ -13,13 +13,37 @@ def _normalize_key(k) -> str:
     return re.sub(r"[\s_\-]+", "", str(k).lower())
 
 
+# 泛词子串：`openai_api_key` / `github_secret` / `refresh_token` 这类复合键名归一化后
+# 不在精确集合里，但含有这些词根。**命中泛词不再等于必须遮**——`prompt_tokens`、
+# `completion_tokens`、estimate 的 `tokens` 都是正常业务字段（R5a 的另一半）。
+_GENERIC_KEY_HINTS = ("apikey", "accesstoken", "authorization", "password", "secretkey",
+                      "token", "secret", "credential")
+
+# 值形状：像凭据才遮。要么是已知服务商前缀（sk-/ghp-/AIza/xox…/ya29.），
+# 要么是 ≥16 个「密码字符」（不含空白，中文散文天然不命中）。
+_CREDENTIAL_VALUE = (r"sk-[A-Za-z0-9_\-]{4,}|ghp-[A-Za-z0-9]{4,}|AIza[A-Za-z0-9_\-]{4,}"
+                     r"|xox[abprs]?-[A-Za-z0-9_\-]{4,}|ya29\.[A-Za-z0-9_\-]{4,}"
+                     r"|[A-Za-z0-9_:.\-+/=]{16,}")
+_CREDENTIAL_VALUE_RE = re.compile(r"(?:%s)\Z" % _CREDENTIAL_VALUE)
+
+
 def _is_sensitive_key(k) -> bool:
+    """键名**是否可能**指向凭据（精确集 ∪ 泛词子串）。
+
+    单参语义必须保留：`_fingerprint` 就是单参调用，改成双参会让它退化成「不哈希」，
+    于是明文进指纹。要不要真遮一个值，由 redact() 结合值形状判断。
+    """
     n = _normalize_key(k)
     if n in _SENSITIVE_KEYS_NORMALIZED:
         return True
-    # 子串兜底：`openai_api_key` / `github_secret` 这类复合键名
-    # 归一化后是 `openaiapikey`，精确集合不命中，但子串命中。
-    return any(s in n for s in ("apikey", "accesstoken", "authorization", "password", "secretkey"))
+    return any(s in n for s in _GENERIC_KEY_HINTS)
+
+
+def _looks_like_secret(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    s = value.strip()
+    return bool(s) and bool(_CREDENTIAL_VALUE_RE.match(s))
 
 # 字符串内嵌密钥（如 "api_key=xxx"、"token: xxx"、"?api_key=xxx&token=yyy"）的脱敏模式。
 # 关键收紧：分隔符必须是 = / : / ? / & 这类赋值或 URL 语境，不能只是空格——否则
@@ -34,16 +58,39 @@ _SECRET_PATTERN = re.compile(
 )
 # Bearer 形态：Authorization: Bearer <token>，整段凭据在 Bearer 之后。
 _BEARER_PATTERN = re.compile(r'(Bearer\s+)([^\s",}&]+)', re.IGNORECASE)
+# 裸 `key=`/`?key=`：只有值像凭据才遮（R5a：`?key=sk-live-…` 此前完全不命中）。
+# 前面用负向后视排除 `monkey=`、`publickey=` 这类撞词。
+_BARE_KEY_PATTERN = re.compile(
+    r'(?<![A-Za-z0-9_])(key)(\s*[=:?&]\s*["\']?)(?:%s)' % _CREDENTIAL_VALUE,
+    re.IGNORECASE)
+# 单独出现的凭据串（没有 `xxx=` 前缀），例如异常正文里直接拼了 sk-live-…。
+_STANDALONE_TOKEN_PATTERN = re.compile(
+    r'(?<![A-Za-z0-9_])((?:sk|ghp|xox[abprs]?|AIza|ya29)[._\-][A-Za-z0-9._\-]{4,})')
 
 
 def _mask_text(text: str) -> str:
     text = _BEARER_PATTERN.sub(r"\1***", text)
-    return _SECRET_PATTERN.sub(r"\1\2***", text)
+    text = _SECRET_PATTERN.sub(r"\1\2***", text)
+    text = _BARE_KEY_PATTERN.sub(r"\1\2***", text)
+    return _STANDALONE_TOKEN_PATTERN.sub("***", text)
 
 
 def redact(data):
     if isinstance(data, dict):
-        return {k: ('***' if _is_sensitive_key(k) else redact(v)) for k, v in data.items()}
+        out = {}
+        for k, v in data.items():
+            n = _normalize_key(k)
+            if n in _SENSITIVE_KEYS_NORMALIZED:
+                # 精确键名：无条件遮。值带尾随换行也要遮（前端提交的全局 api_key
+                # 没有 trim，这是真实路径）。
+                out[k] = '***'
+            elif any(s in n for s in _GENERIC_KEY_HINTS) and _looks_like_secret(v):
+                # 泛词键名 + 值像凭据 ⇒ 遮；值不是凭据形状（int、dict、中文散文、
+                # `prompt_tokens`）⇒ 继续递归，不误伤业务字段。
+                out[k] = '***'
+            else:
+                out[k] = redact(v)
+        return out
     if isinstance(data, list):
         return [redact(x) for x in data]
     # 字符串元素（如 config_drift 里 "模型 … api_key=xxx" 的人类可读差异串）也要兜底，
