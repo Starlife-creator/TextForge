@@ -69,12 +69,23 @@
 
 | # | 改动 | DoD | 反向断言 |
 |---|---|---|---|
-| B1.1 | `wait_gate` 增加 `absorb_keys: tuple = ()`：**在 `while` 之后**（不在 `finally`）复查 `stop_requested`；若已置位则先 `await absorb_gate_result(progress, progress_path, list(absorb_keys))` 再抛 `CancelledError`。6 个调用点各自把原来写在下一行的 keys 传进参数（split 门无 absorb，传空）。`finally` 仍只做 `gate_exit` | ①「事件已 set + stop」⇒ 抛 CancelledError 且**磁盘上刚做的选择仍在**；②超时路径仍抛 `GateTimeoutError`（`test_gate_timeout.py:73/:130` 不得变红）；③外部停止路径 `:97` 仍绿 | 三面包围：把出口复查删掉 ⇒ 断言①红；把复查挪进 `finally` ⇒ 断言②红；把 absorb 挪到抛错之后 ⇒ 断言①的"磁盘仍保留"红 |
-| B1.2 | `ACCEPT_ABSORB_KEYS` 增加 `regen_count` | 磁盘 `regen_count` 在验收门之后仍在；原 3 键行为不变 | 去掉该键 ⇒ 用例红（复刻 R3 实测：`{'5': 4}` → `None`） |
-| B1.3 | `versions.restore` 三层改：①成功判据 = `shutil.move` 返回值且 `03_final` 内容等于 tmp（**不能用 exists 当证据**）；②只有替换成功才删 `backup_dir`，`cur_name is None`（快照失败）时**永不删**、把它停下并在返回值/异常里报出绝对路径；③回滚本身 try/except，失败时抛「成品停在 <path>」；临时名改 `._restore_tmp_<ts>` / `._restore_old_<ts>`，预清理带 `ignore_errors`；救急副本**不停进 `_versions/`**（`_prune` 会把它当旧版本删掉），而是把 `._restore_old*` 前缀加进 `routes/output.py` 的 `ARTIFACTS`，让「清空输出目录」能收口 | 注入「第二次 move 抛 PermissionError」⇒ `03_final` 内容 == 改动前；注入「`03_final` 被别的写者重建」⇒ 断言内容是新版而不是嵌套目录；快照失败路径 ⇒ 救急副本仍在且路径被报出 | 还原现有 `finally` ⇒ 第一条红；把判据改回 `exists()` ⇒ 嵌套那条红 |
-| B1.4 | `history.upsert` 写 `last_error` 前 `_mask_text`；`/api/status` 的 `error_logs` 走 `redact()`（读侧兜底覆盖历史残留） | 明文 `api_key=sk-live-…` 进 runs.json / status 响应后为 `***`；既有断言（`test_pipeline_recovery.py:165`「最后一条错」、`regression_test.py:792`「炸了」、`:618`「boom-injected」）全部**不受影响**——我已实测这些文本不含凭据形状 | 去掉任一处 redact ⇒ 用例红（写侧 + 读侧两面都钉）；顺带写明：读侧遮罩后若再 upsert 会把遮好的值写回，属可接受自愈 |
-| B1.5 | 把 `SensitiveFilter` 挂到**handler** 上：挂点从 `setup_logging()` 移到 FastAPI **lifespan 启动段**（`main.py:60-63` 是「先 import app、后 `Config/Server` 触发 dictConfig」，导入期挂不到 uvicorn 的 handler），对 `uvicorn.error`/`uvicorn.access`/`httpx` 的每个 handler 各挂一份；root logger 那份保留 | `logging.getLogger("uvicorn.error").warning("api_key=sk-live…")` 经捕获 handler 后为 `***`；`textforge` 自身日志不双份 | 只在 import 期挂 ⇒ 新用例红（正是现状） |
-| B1.6 | `_ESTIMATE_CACHE` 加 `threading.Lock`（取/放/淘汰同锁），并把 `move_to_end` 对「已被别的线程淘汰的键」做成 try/except KeyError | 并发预估不再可能抛 KeyError（真实失败模式：缓存满 16 时两线程互踩 `move_to_end`）。**无「回退即红」断言**：GIL 下缺锁只是概率性失败，概率断言我不写进门禁 | 不适用（治理项，实现自证 + 锁存在性断言） |
+| B1.1 ✅ de3d07e | `wait_gate` 增加 `absorb_keys: tuple = ()`：**在 `while` 之后**（不在 `finally`）复查 `stop_requested`；若已置位则先 `await absorb_gate_result(progress, progress_path, list(absorb_keys))` 再抛 `CancelledError`。6 个调用点各自把原来写在下一行的 keys 传进参数（split 门无 absorb，传空）。`finally` 仍只做 `gate_exit` | ①「事件已 set + stop」⇒ 抛 CancelledError 且**磁盘上刚做的选择仍在**；②超时路径仍抛 `GateTimeoutError`（`test_gate_timeout.py:73/:130` 不得变红）；③外部停止路径 `:97` 仍绿 | 三面包围：把出口复查删掉 ⇒ 断言①红；把复查挪进 `finally` ⇒ 断言②红；把 absorb 挪到抛错之后 ⇒ 断言①的"磁盘仍保留"红 |
+| B1.2 ✅ 77aafd6 | `ACCEPT_ABSORB_KEYS` 增加 `regen_count` | 磁盘 `regen_count` 在验收门之后仍在；原 3 键行为不变 | 去掉该键 ⇒ 用例红（复刻 R3 实测：`{'5': 4}` → `None`） |
+| B1.3 ✅ 6766ec0 + c3346e6 | `versions.restore` 三层改：①成功判据 = `shutil.move` 返回值且 `03_final` 内容等于 tmp（**不能用 exists 当证据**）；②只有替换成功才删 `backup_dir`，`cur_name is None`（快照失败）时**永不删**、把它停下并在返回值/异常里报出绝对路径；③回滚本身 try/except，失败时抛「成品停在 <path>」；临时名改 `._restore_tmp_<ts>` / `._restore_old_<ts>`，预清理带 `ignore_errors`；救急副本**不停进 `_versions/`**（`_prune` 会把它当旧版本删掉），而是把 `._restore_old*` 前缀加进 `routes/output.py` 的 `ARTIFACTS`，让「清空输出目录」能收口 | 注入「第二次 move 抛 PermissionError」⇒ `03_final` 内容 == 改动前；注入「`03_final` 被别的写者重建」⇒ 断言内容是新版而不是嵌套目录；快照失败路径 ⇒ 救急副本仍在且路径被报出 | 还原现有 `finally` ⇒ 第一条红；把判据改回 `exists()` ⇒ 嵌套那条红 |
+| B1.4 ✅ 8479996 | `history.upsert` 写 `last_error` 前 `_mask_text`；`/api/status` 的 `error_logs` 走 `redact()`（读侧兜底覆盖历史残留） | 明文 `api_key=sk-live-…` 进 runs.json / status 响应后为 `***`；既有断言（`test_pipeline_recovery.py:165`「最后一条错」、`regression_test.py:792`「炸了」、`:618`「boom-injected」）全部**不受影响**——我已实测这些文本不含凭据形状 | 去掉任一处 redact ⇒ 用例红（写侧 + 读侧两面都钉）；顺带写明：读侧遮罩后若再 upsert 会把遮好的值写回，属可接受自愈 |
+| B1.5 ✅ aac41a8 | 把 `SensitiveFilter` 挂到**handler** 上：挂点从 `setup_logging()` 移到 FastAPI **lifespan 启动段**（`main.py:60-63` 是「先 import app、后 `Config/Server` 触发 dictConfig」，导入期挂不到 uvicorn 的 handler），对 `uvicorn.error`/`uvicorn.access`/`httpx` 的每个 handler 各挂一份；root logger 那份保留 | `logging.getLogger("uvicorn.error").warning("api_key=sk-live…")` 经捕获 handler 后为 `***`；`textforge` 自身日志不双份 | 只在 import 期挂 ⇒ 新用例红（正是现状） |
+| B1.6 ✅ 33614ab | `_ESTIMATE_CACHE` 加 `threading.Lock`（取/放/淘汰同锁），并把 `move_to_end` 对「已被别的线程淘汰的键」做成 try/except KeyError | 并发预估不再可能抛 KeyError（真实失败模式：缓存满 16 时两线程互踩 `move_to_end`）。**实施修正**：读写整段进锁后 KeyError 分支不可能发生，不加 try/except（加了反而是给不存在的场景兜底）；并且**找到了确定性反向断言**——命中路径那次 `deepcopy` 必须观察到锁被持有，把锁换成 no-op 替身 ⇒ 用例红 | 同上：不再依赖概率压测（原计划「无回退即红」作废，压测降级为辅助用例并如实标注） |
+| B1.7 ✅ 5f5fb9f | （实施中发现的新行）`test_atomic_winerror5.py` 原判据「读写各 50 次、双方零异常」在本机 20 跑红 3 ⇒ 拆成注入式确定判据 + 真实节拍并发用例 | 写侧退避语义用注入 `PermissionError` 验证（非 `PermissionError` 必须原样上抛）；并发只钉「写侧零异常 + 永不读到半截 + 终态是最后一次写」。改后 25 跑 0 红 | 把 `_replace_with_retry` 退回裸 `os.replace` ⇒ 2 条注入用例红（已实测，还原字节一致） |
+
+> **批 1 收口（2026-10-29）**：B1.1–B1.7 全部落地。实施中的三处偏离原方案，都已回写进行：
+> ① B1.3 的救急副本回收没有做成 `ARTIFACTS` 里的固定名（恢复目录名带时间戳，固定名匹配不上），
+> 改为 `ARTIFACT_PREFIXES` + **只认目录**，并在 `/api/output/inspect` 的 `artifacts` 里列出，
+> 让界面看得见；② B1.4 除 `history.upsert` 与 `/api/status` 外，还补了**源头** `log_error`
+> （`str(error)` 进 progress.json 前脱敏）与 `/api/output/inspect` 两条读面，
+> `utils/diagnostics.py` 实测已有整份 `redact(summary)` 兜底，只补了钉住它的用例；
+> ③ B1.6 不加 try/except KeyError（读写整段进锁后该分支不可能发生），并找到确定性反向断言。
+> 六条闸门 + e2e 全绿：`252 passed, 1 skipped`、ruff/mypy 干净、regression 与 event-stream
+> `=== 全部通过 ===`、e2e `=== 全部通过 ===`（exit 0）。回退变异 10 条全部咬住（M1–M8 + 原子门 2 条）。
 
 ### 批 2 —— 合并写与脱敏判定（需要两面断言，设计先行）
 
