@@ -89,12 +89,16 @@ def load_progress_dict(path: Path) -> dict:
 
 
 def save_progress_dict(path: Path, data: dict) -> None:
-    """同步原子写 progress.json 的薄封装（供 asyncio.to_thread 调用）。
+    """progress.json 的唯一写入口：紧凑排版 + 仍然 fsync（B2.3）。
+
+    这份文件是机器状态（缝合锚点内嵌全文时可达数十 MB），indent=2 让字节数与写盘量
+    翻倍以上，而没有任何人类依赖它的可读性（文档把它当状态、测试一律 json.loads）。
+    fsync 保留：掉电语义不能因为「想写小一点」被悄悄换掉。
 
     写后剔除该路径的缓存条目：write 由 progress_lock 串行化，但读侧缓存若按旧
     mtime/size 命中，会在同一秒快速连写时返回上一版内容。
     """
-    atomic_write_json(Path(path), data)
+    atomic_write_json(Path(path), data, pretty=False, sync=True)
     with _CACHE_LOCK:
         _progress_cache.pop(Path(path), None)
 

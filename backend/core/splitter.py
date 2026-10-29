@@ -3,6 +3,7 @@ from collections import deque
 from pathlib import Path
 from docx import Document
 from utils.atomic import atomic_write_text, atomic_write_json
+from utils.progress_io import save_progress_dict
 from utils.sort import natural_sort_key
 from utils.tokens import estimate_tokens
 from core.batching import pack_groups
@@ -400,7 +401,7 @@ async def phase0_split(req, progress, progress_path, run_id):
     progress['current_phase'] = 'phase1'
 
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
     sse_emit("phase_done", {"phase": "phase0", "total_chapters": len(chapters)}, run_id)
 
 
@@ -463,7 +464,7 @@ async def resplit_single_file(req, progress, progress_path, run_id):
     progress['chapter_detection'] = detection
     progress['total_chapters'] = len(chapters)
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
     logger.info(f"[phase0] 按自定义标记重新拆分：{len(chapters)} 章")
 
 async def phase1_diagnose(req, progress, progress_path, run_id):
@@ -506,7 +507,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
         progress['chapters'], progress['batches'], progress['virtual_chapter_map'])
     # 批次构建结果立即持久化：首批失败/崩溃后 status 查询与恢复都能看到批次划分
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
     
     from core.api_client import call_with_retry, make_httpx_client, pick_endpoint, ContextOverflowError
     from core.batching import split_batch_in_progress
@@ -548,7 +549,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
                     detail=(f"模型上限 {e.available} token" if e.available else "超出模型上下文窗口"),
                     run_id=run_id)
                 async with state.progress_lock:
-                    atomic_write_json(progress_path, progress)
+                    save_progress_dict(progress_path, progress)
                 if not parts:
                     raise RuntimeError(
                         f"单章仍超出模型上下文：批次 {batch['batch_id']} 章节={batch['chapter_ids']}，"
@@ -581,7 +582,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
             if batch['batch_id'] not in progress.setdefault('processed_batches', []):
                 progress['processed_batches'].append(batch['batch_id'])
             async with state.progress_lock:
-                atomic_write_json(progress_path, progress)
+                save_progress_dict(progress_path, progress)
             logger.info(f"[phase1] batch {batch['batch_id']} 完成 -> {summary_file}")
             sse_emit("batch_done", {"batch_id": batch['batch_id'], "output_file": summary_file}, run_id)
             # 铁律8：批次间保持串行间隔，避免连续请求触发云端限流（间隔可配置，缺省 2s）
@@ -590,7 +591,7 @@ async def phase1_diagnose(req, progress, progress_path, run_id):
     
     progress['current_phase'] = 'phase2'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
 
 def _record_diag_json_miss(progress, batch_id, run_id=None):
     """结构化诊断解析不出来：记进进度并推给用户，而不是只留一行日志。

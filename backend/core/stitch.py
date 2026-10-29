@@ -1,6 +1,7 @@
 import asyncio, json, re, hashlib, unicodedata, logging
 from pathlib import Path
-from utils.atomic import atomic_write_text, atomic_write_json
+from utils.atomic import atomic_write_text
+from utils.progress_io import save_progress_dict
 from core.budget import stitch_window_chars
 from core.quality import change_rate
 
@@ -417,7 +418,7 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
         merge_virtual_chapters(virtuals_sorted, output_path, progress)
         virtual_done.append(original_id)
         async with state.progress_lock:
-            atomic_write_json(output_path / "progress.json", progress)
+            save_progress_dict(output_path / "progress.json", progress)
     sse_emit_fn("stitch_done", {"stage": 1}, run_id)
     
     # v8.8 修正：阶段 2 批次间缝合，不再跳过任何边界
@@ -446,7 +447,7 @@ async def stitch_pipeline(output_path, progress, client, payload_base, sse_emit_
         # 失败边界也记为已完成：续跑时不应反复为一个「已降级跳过」的交界烧调用。
         batch_done.append(pair_key)
         async with state.progress_lock:
-            atomic_write_json(output_path / "progress.json", progress)
+            save_progress_dict(output_path / "progress.json", progress)
     if total_pairs > 0:
         sse_emit_fn("stitch_done", {"stage": 2}, run_id)
     skipped = len(progress.get("stitch_failures") or [])

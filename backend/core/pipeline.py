@@ -1,7 +1,8 @@
 import logging
 from pathlib import Path
 from core.budget import blueprint_chars
-from utils.atomic import atomic_write_text, atomic_write_json
+from utils.atomic import atomic_write_text
+from utils.progress_io import save_progress_dict
 from routes import state
 from routes.events import sse_emit
 from core.prompt_registry import PROMPT_VERSION, stage_versions
@@ -35,7 +36,7 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
                 absorb_keys=('blueprint_confirmed', 'blueprint_user_edited'))
             progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
-                atomic_write_json(progress_path, progress)
+                save_progress_dict(progress_path, progress)
             return
 
     # 提示词版本随 run 落盘：续跑时若与上次不同，_config_drift 会按阶段提示
@@ -96,7 +97,7 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
     state.blueprint_confirmed.clear()
     progress['current_phase'] = 'phase2_waiting'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
     # 同步重置暂停标志：重试失败或用户已停止的场景下，若不清会立刻被 pause 打断
     sse_emit("blueprint_ready", {"blueprint": result, "max_chars": blueprint_max}, run_id)
     logger.info("[phase2] 蓝图已生成，等待用户确认")
@@ -110,7 +111,7 @@ async def phase2_blueprint(req, progress, progress_path, run_id):
         raise RuntimeError("蓝图过短，可能生成失败")
     progress['current_phase'] = 'phase3-1'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
 
 
 def _add_usage(progress: dict, usage: dict | None) -> None:

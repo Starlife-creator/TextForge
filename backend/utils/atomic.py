@@ -32,13 +32,15 @@ def replace_with_retry(tmp: str, path: Path) -> None:
 _replace_with_retry = replace_with_retry
 
 
-def atomic_write_json(path: Path, data: dict, *, pretty: bool = True):
+def atomic_write_json(path: Path, data: dict, *, pretty: bool = True, sync: bool = True):
     """原子写 JSON（临时文件 + os.replace）。
 
-    pretty=False 时不缩进、不 fsync —— 供高频写入使用（如心跳）。
-    progress.json 可能因缝合锚点内嵌全文而达到数十 MB，此时 indent=2 + fsync
-    会在事件循环里造成数十毫秒的停顿，10s 一次足以让 SSE 心跳抖动、
-    pause/stop 等控制端点排队。
+    `pretty` 只管排版、`sync` 只管是否 fsync——原先两者是绑在一起的（pretty=False
+    顺带去掉 fsync），于是「想要小一点的文件」必须悄悄牺牲掉电语义，这个取舍没人
+    在评审里看见过。分成两个参数后各自可独立选择。
+
+    progress.json 可能因缝合锚点内嵌全文而达到数十 MB，此时 indent=2 会让字节数
+    与写盘量都翻倍以上；这类机器状态文件走 pretty=False, sync=True。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.stem + "_", suffix=".tmp")
@@ -48,11 +50,11 @@ def atomic_write_json(path: Path, data: dict, *, pretty: bool = True):
             # 只省 5% 体积；要真正紧凑必须显式传 separators。
             if pretty:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
             else:
                 json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-                f.flush()
+            f.flush()
+            if sync:
+                os.fsync(f.fileno())
         _replace_with_retry(tmp, path)
     except Exception:
         try:

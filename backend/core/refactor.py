@@ -1,7 +1,7 @@
 import asyncio, re, logging, html, hashlib, json
 from collections import deque
 from pathlib import Path
-from utils.atomic import atomic_write_text, atomic_write_json
+from utils.atomic import atomic_write_text
 from routes import state
 from routes.events import sse_emit
 from core.stitch import stitch_pipeline
@@ -22,7 +22,7 @@ from core.quality import (
     MAX_PRE_STITCH_ISSUES,
 )
 from utils.tokens import estimate_tokens
-from utils.progress_io import ProgressUnreadable, merge_progress_write
+from utils.progress_io import ProgressUnreadable, merge_progress_write, save_progress_dict
 
 logger = logging.getLogger("textforge")
 
@@ -234,16 +234,16 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
             progress['qc_issues'] = issues
             progress['current_phase'] = 'phase3_qc'
             async with state.progress_lock:
-                atomic_write_json(progress_path, progress)
+                save_progress_dict(progress_path, progress)
             sse_emit("qc_failed", {"issues": issues}, run_id)
             await _wait_qc_confirm(progress, progress_path, run_id)
             progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
-                atomic_write_json(progress_path, progress)
+                save_progress_dict(progress_path, progress)
 
     progress['current_phase'] = 'phase4'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
 
 def _refresh_qc_after_regen(req, output_path, progress, chapter_id, new_text) -> list[dict]:
     """单章重生成后刷新**这一章**的结构性质检结论，返回该章的新问题清单。
@@ -372,7 +372,7 @@ async def regen_single_chapter(req, output_path, chapter_id):
 
 async def _save_progress(progress, progress_path):
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
 
 
 def _effective_concurrency(req, gates) -> int:
@@ -1117,7 +1117,7 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
     progress['current_phase'] = 'phase3_accept'
     progress['accept_pending_batch'] = batch['batch_id']
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
     sse_emit("accept_ready", {"batch_id": batch['batch_id'], "chapters": chapters,
         "accepted": progress.get('accepted_batches', [])}, run_id)
     logger.info(f"[accept] 批次 {batch['batch_id']} 待验收（{len(chapters)} 章）")
@@ -1131,7 +1131,7 @@ async def _wait_batch_accept(progress, progress_path, batch, output_path, run_id
         absorb_keys=ACCEPT_ABSORB_KEYS)
     progress['current_phase'] = 'phase3-1'
     async with state.progress_lock:
-        atomic_write_json(progress_path, progress)
+        save_progress_dict(progress_path, progress)
 
 def _run_qc(output_path, progress):
     """质检拦截导出门：对最终逻辑章做轻量规则质检，返回问题清单（空表 = 通过）。
