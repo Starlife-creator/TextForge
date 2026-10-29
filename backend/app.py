@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes import state
 from utils.auth import TokenAuthMiddleware
-from utils.logging_setup import setup_logging
+from utils.logging_setup import attach_redaction_to_handlers, setup_logging
 from utils.version import VERSION
 import asyncio
 
@@ -12,6 +12,9 @@ state.log_listener = listener
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # uvicorn 的 handler 是 dictConfig 在「import app 之后」才建的，所以脱敏过滤器
+    # 只能挂在这里；挂到 setup_logging() 里会对第三方日志完全失效。
+    attach_redaction_to_handlers()
     yield
     if state.pipeline_task and not state.pipeline_task.done():
         state.pipeline_task.cancel()
