@@ -28,6 +28,10 @@ router = APIRouter()
 # TextForge 写出的产物（白名单）。清空时只删这些。
 ARTIFACTS = ("01_summaries", "02_workspace", "03_final", "_diagnostics",
              "_versions", "_backup", "Story_Bible.md", "progress.json")
+# 带时间戳的临时/救急副本（versions.restore 产出，名字形如 `._restore_old_20261029_…`）：
+# 恢复失败时救急副本是用户旧成品的唯一副本，不能停进 `_versions/`（会被 _prune 当旧版本删），
+# 但也不能永远留在输出目录根上——「清空输出目录」负责收口。只按前缀匹配，不碰别的名字。
+ARTIFACT_PREFIXES = ("._restore_tmp_", "._restore_old_")
 
 
 def _summarize(output_path: str) -> dict:
@@ -38,7 +42,10 @@ def _summarize(output_path: str) -> dict:
                 "batches_done": 0, "batches_total": 0, "error_logs": []}
     info = {
         "exists": True,
-        "artifacts": [n for n in ARTIFACTS if (p / n).exists()],
+        # 恢复失败留下的救急副本也要列出来：它是用户旧成品的唯一副本，界面必须看得见
+        "artifacts": [n for n in ARTIFACTS if (p / n).exists()] + sorted(
+            q.name for q in p.iterdir()
+            if q.name.startswith(ARTIFACT_PREFIXES) and q.is_dir()),
         "resumable": False, "finished": False, "current_phase": None,
         "total_chapters": 0, "batches_done": 0, "batches_total": 0,
         "novel_name": None, "error_logs": [],
@@ -211,7 +218,9 @@ def _clear_artifacts(p: Path) -> tuple[list[str], list[str]]:
     """白名单逐个删除产物；目录 rmtree / 文件 unlink 属阻塞磁盘 I/O，由线程池执行。"""
     removed: list[str] = []
     failed: list[str] = []
-    for name in ARTIFACTS:
+    names = list(ARTIFACTS) + [q.name for q in p.iterdir()
+                               if q.name.startswith(ARTIFACT_PREFIXES) and q.is_dir()]
+    for name in names:
         target = p / name
         if not target.exists():
             continue

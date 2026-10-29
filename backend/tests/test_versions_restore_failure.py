@@ -96,3 +96,30 @@ def test_snapshot_failure_parks_backup_instead_of_deleting_it(tmp_path, monkeypa
     parked = list(out.glob("._restore_old*"))
     assert parked, "快照失败时 ._restore_old 是唯一副本，成功也不能删"
     assert (parked[0] / "重构终稿.txt").read_text(encoding="utf-8") == "UNIQUE-CURRENT"
+
+
+def test_clear_sweep_removes_restore_residue_only_for_our_dirs(tmp_path):
+    """B1.3 ③收口：救急副本不进 `_versions/`（会被 _prune 当旧版本删），停在输出目录根上，
+    由「清空输出目录」按**前缀 + 只认目录**回收——用户自己的同名前缀文件不能碰。"""
+    from routes.output import _clear_artifacts, _summarize
+
+    out = tmp_path / "book"
+    out.mkdir()
+    (out / "progress.json").write_text("{}", encoding="utf-8")
+    parked = out / "._restore_old_20261029_010101"
+    parked.mkdir()
+    (parked / "重构终稿.txt").write_text("UNIQUE-CURRENT", encoding="utf-8")
+    (out / "._restore_tmp_20261029_010102").mkdir()
+    (out / "我的笔记.txt").write_text("用户的文件", encoding="utf-8")
+    (out / "._restore_old_readme.txt").write_text("同名前缀的用户文件", encoding="utf-8")
+
+    listed = _summarize(str(out))["artifacts"]
+    assert parked.name in listed, "救急副本必须在输出检查里看得见"
+
+    removed, failed = _clear_artifacts(out)
+
+    assert failed == []
+    assert parked.name in removed and "._restore_tmp_20261029_010102" in removed
+    assert not parked.exists()
+    assert (out / "我的笔记.txt").read_text(encoding="utf-8") == "用户的文件"
+    assert (out / "._restore_old_readme.txt").exists(), "前缀匹配必须只认目录，不能吃掉用户的文件"
