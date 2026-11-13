@@ -42,6 +42,9 @@ src-tauri/binaries/*
 # 便携包组装暂存目录
 .portable-stage/
 
+# 本地诊断/临时目录（受限沙箱里把 TEMP/TMP 指到这里；随时可删，不入库）
+.tmp/
+
 backend/*.spec
 
 # 不纳入版本控制的便携包产物（可重建）
