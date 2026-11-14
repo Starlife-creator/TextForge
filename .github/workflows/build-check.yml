@@ -109,6 +109,12 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v7
+        with:
+          # 全量检出：backend 测试里的 test_review_log_commit_refs.py 要用
+          # `git cat-file -e <短号>^{commit}` 核对 REVIEW-LOG 记的提交号。
+          # 默认 fetch-depth: 1 时旧提交不可达，那条门禁会整体 skip（不是红，
+          # 但等于在 CI 里躺着不执行）。仓库 36.6 MB / ~121 commits，代价可忽略。
+          fetch-depth: 0
 
       - name: 安装 Python
         uses: actions/setup-python@v7
