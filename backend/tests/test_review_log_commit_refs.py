@@ -13,11 +13,15 @@ REVIEW-LOG 的每个批次行都手抄了一个 commit 短号（`B1.1 ✅ de3d07
 3. 只验证存在性，不验证「这条改动是否还在」——后者要靠 `git log -S`，判据太脆，
    而且历史批的部分回退是合法的。存在性已经能挡住「抄错 / 历史重写」。
 
-浅克隆下必须**跳过而不是红**：`git cat-file -e` 在 `--depth 1` 的仓库里对旧提交
-返回 128（已实测），那不是证据失效，是这个环境根本没带那段历史。
+浅克隆下按环境分流：`git cat-file -e` 在 `--depth 1` 的仓库里对旧提交返回 128
+（已实测），那不是证据失效，是环境没带那段历史——**本地 skip 是对的**。
+但 CI 里出现浅克隆只能是我们自己的 checkout 配置掉了 `fetch-depth: 0`，
+那是配置回归，必须红（见 `test_ci_checkout_must_be_full`）：否则整条门禁会
+「每轮都绿、一次都没真跑」，比没有门禁更糟。
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -61,6 +65,29 @@ def is_shallow() -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
+def in_ci() -> bool:
+    """是否跑在 CI 里（GitHub Actions 会注入 `GITHUB_ACTIONS=true`）。
+
+    这里**只用来加严**、不用来放宽：CI 里浅克隆必须红，本地浅克隆才允许 skip。
+    """
+    return os.environ.get("GITHUB_ACTIONS", "").strip().lower() == "true"
+
+
+def coverage_gap() -> str | None:
+    """返回「本应取证却取不了」的原因；None 表示取证能力完好。
+
+    这是本文件存在意义的看门人：`test_review_log_shas_all_resolve` 在浅克隆里
+    会 skip，而 skip 是绿的。如果 CI 的 checkout 掉了 `fetch-depth: 0`，整条门禁
+    会变成「每次都绿、一次都没真跑」——那比没有门禁更糟，因为它给了假的安心。
+    所以：**CI 里浅克隆 = 红**（配置坏了，要人修）；本地浅克隆 = skip（环境限制）。
+    """
+    if not git_available():
+        return "不是 git 工作区"
+    if is_shallow():
+        return "浅克隆（--depth N），无完整提交历史"
+    return None
+
+
 def resolves(sha: str) -> bool:
     """短号能否解析成一个 commit。"""
     return _git("cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
@@ -80,17 +107,55 @@ def log_text() -> str:
     return LOG.read_text(encoding="utf-8")
 
 
+def require_evidence() -> None:
+    """取证能力不足时的统一出口：CI 里红、本地 skip。
+
+    为什么分两种反应：浅克隆让 `git cat-file` 对旧提交必然失败（实测 exit 128），
+    证据本身没失效，是环境没带那段历史 —— 本地允许 skip。但 CI 里出现浅克隆，
+    只能是我们自己的 checkout 配置掉了 `fetch-depth: 0`（build-check.yml:117 /
+    release.yml:62 都已显式设 0），那是**配置回归**，必须红。
+    """
+    gap = coverage_gap()
+    if gap is None:
+        return
+    if in_ci():
+        pytest.fail(
+            f"CI 里取不了证（{gap}）：本门禁在 CI 中会 silent-skip，等于从未执行。"
+            "检查 .github/workflows 里跑 pytest 的 job 是否带 with: fetch-depth: 0"
+            "（build-check.yml backend-check / release.yml backend-test）。"
+        )
+    pytest.skip(f"环境无法取证（{gap}），本地浅克隆属正常情况")
+
+
+def test_ci_checkout_must_be_full() -> None:
+    """CI 环境必须完整检出——本文件是「门禁会不会被静默跳过」的看门人。
+
+    浅克隆下上面几条取证测试只能 skip，而 **skip 是绿的**。若 checkout 退回
+    `fetch-depth: 1`，整条 commit-ref 门禁就变成「每轮都绿、一次都没真跑」，
+    比没有门禁更糟：它给假的安心。所以这条断言在 CI 里恒开、且不 skip。
+    """
+    if not git_available():
+        pytest.skip("不是 git 工作区，无法判断检出方式")
+    if not in_ci():
+        pytest.skip("非 CI 环境，检出方式由本地决定")
+    assert not is_shallow(), (
+        "CI 里检出是浅克隆（--depth N），commit-ref 门禁将 silent-skip。"
+        "给该 job 的 actions/checkout 加 with: fetch-depth: 0。"
+    )
+
+
 def test_repo_is_usable_or_skip() -> None:
     if not git_available():
         pytest.skip("不是 git 工作区，短号取证无意义")
-    if is_shallow():
+    if is_shallow() and not in_ci():
         pytest.skip("浅克隆（无完整历史），`git cat-file` 对旧 commit 必然失败，属环境限制")
+    if is_shallow() and in_ci():
+        pytest.fail("CI 里检出不完整，见 test_ci_checkout_must_be_full 的说明")
 
 
 def test_review_log_shas_all_resolve(log_text: str) -> None:
     """真实的 REVIEW-LOG：每一个 `✅ 短号` 都必须能解析。"""
-    if not git_available() or is_shallow():
-        pytest.skip("环境无法取证")
+    require_evidence()
     hits = shas_in(log_text)
     assert hits, "一个短号都没抽到——正文里明明有 `B1.1 ✅ de3d07e`，说明抽取正则失效了"
     assert validate(log_text) == []
