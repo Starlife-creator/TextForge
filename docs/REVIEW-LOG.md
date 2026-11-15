@@ -129,7 +129,7 @@ B4.1 ✅ 0bde150 | Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE
 > 验证范围（批 3）：全量未记（历史批；收口块只记了 33 条用例，未记全量项数与耗时）
 > 验证范围（批 4）：全量未记（历史批；收口块只记了 cargo test 18 项，未记全量项数与耗时）
 > **Linux/macOS 腿的 `cfg(not(windows))` 分支本机没编译过**，靠 CI 三条腿覆盖。
-> 验证范围（§4 八条复评，2026-11-15）：全量已跑（314 passed + 2 skipped / 耗时 12.05s）；regression_test.py、test_event_stream.py、test_e2e_pipeline.py 均 `=== 全部通过 ===`（exit 0）
+> 验证范围（§4 八条复评，2026-11-15）：`cd backend && python -m pytest tests -q`、`ruff check .`、`mypy --config-file mypy.ini .`，加 `regression_test.py` / `test_event_stream.py` / `test_e2e_pipeline.py` 三条脚本，实跑全绿（exit 0）；**项数与耗时以当场输出为准，此处不抄数字**——某次运行的通过数写进历史文档必然漂，且 REVIEW-LOG 不进门禁扫描，漂了没人发现。
 >
 > **§4「还有什么没查」八条复评（2026-11-15，来源：R2 任务卡 reczz28ZvK6brgKB）**：§4-6 的重测条件**已真实出现**，本轮已补（见下）；§4-3 与 §4-8 的表述与当前事实不符，**原文按 R1 不覆写**，判定留痕于此；其余 §4-1/2/4/5/7 仍成立但不紧急，回来条件见各条原文与本轮周报。
 >
