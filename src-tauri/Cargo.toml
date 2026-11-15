@@ -1,6 +1,6 @@
 [package]
 name = "textforge"
-version = "0.13.1"
+version = "0.13.2"
 description = "文炼工坊 TextForge"
 authors = ["Starlife-creator"]
 license = "Apache-2.0"
