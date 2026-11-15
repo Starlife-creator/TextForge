@@ -8,7 +8,7 @@ from core.pipeline import phase2_blueprint
 from core.refactor import phase3_refactor_stitch
 from core.finalize import phase4_finalize
 from utils.progress_io import save_progress_dict
-from utils.redact import redact
+from utils.redact import redact, _mask_text, _strip_url_credentials
 from utils.version import VERSION
 from core.prompt_registry import PROMPT_VERSION, stage_versions, load_registry
 
@@ -261,8 +261,17 @@ def _config_drift(existing: dict, req) -> list[str]:
         ("context_window", req.context_window, "上下文窗口"),
     ):
         prev = old.get(key)
-        if prev is not None and str(prev) != str(cur):
-            diffs.append(f"{label}：{prev} → {cur}")
+        # §4-6：api_url 落盘时被遮成 `https://***:***@host/v1`，而这里的 cur 是原始
+        # `https://u:pw@host/v1`。两边都先剥掉凭据段再比，否则每次续跑都误报
+        # 「API 地址已变更」—— 那是掩码引入的假漂移，比漏报更伤（用户会以为配置被改）。
+        if key == "api_url":
+            same = _strip_url_credentials(str(prev)) == _strip_url_credentials(str(cur))
+        else:
+            same = str(prev) == str(cur)
+        if prev is not None and not same:
+            # 文案同样要过 _mask_text：cur 是 req 里的原始值，可能带内嵌口令，
+            # 而这段差异会进 progress.json 的 config_drift 并随 /api/status 回传。
+            diffs.append(f"{label}：{_mask_text(str(prev))} → {_mask_text(str(cur))}")
     if existing.get("input_path") and req.input_path and \
             str(existing["input_path"]) != str(req.input_path):
         diffs.append(f"输入路径已变更（{existing['input_path']} → {req.input_path}）")
@@ -471,7 +480,10 @@ def init_progress(req, run_id):
         "prompt_versions": stage_versions(), "run_id": run_id,
         "input_mode": req.input_mode,
         "input_format": req.input_format, "input_path": req.input_path, "output_path": req.output_path,
-        "api_config": {"api_url": req.api_url, "model": req.model, "context_window": req.context_window},
+        # §4-6：api_url 可能带内嵌口令（https://user:pw@host），落盘前遮掉，
+        # 否则会随 progress.json / 诊断包 / 任务历史外发。比较侧见 _config_drift。
+        "api_config": {"api_url": _mask_text(req.api_url), "model": req.model,
+                       "context_window": req.context_window},
         "novel_name": novel_name, "rich_text": req.rich_text,
         # 优化方案增量：重构档位与门开关（缺省 full_rewrite，旧 run 无字段即按此恢复）
         "refactor_mode": getattr(req, "refactor_mode", "full_rewrite"),

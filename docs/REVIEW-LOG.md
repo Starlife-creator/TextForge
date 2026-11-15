@@ -129,6 +129,15 @@ B4.1 ✅ 0bde150 | Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE
 > 验证范围（批 3）：全量未记（历史批；收口块只记了 33 条用例，未记全量项数与耗时）
 > 验证范围（批 4）：全量未记（历史批；收口块只记了 cargo test 18 项，未记全量项数与耗时）
 > **Linux/macOS 腿的 `cfg(not(windows))` 分支本机没编译过**，靠 CI 三条腿覆盖。
+> 验证范围（§4 八条复评，2026-11-15）：全量已跑（314 passed + 2 skipped / 耗时 12.05s）；regression_test.py、test_event_stream.py、test_e2e_pipeline.py 均 `=== 全部通过 ===`（exit 0）
+>
+> **§4「还有什么没查」八条复评（2026-11-15，来源：R2 任务卡 reczz28ZvK6brgKB）**：§4-6 的重测条件**已真实出现**，本轮已补（见下）；§4-3 与 §4-8 的表述与当前事实不符，**原文按 R1 不覆写**，判定留痕于此；其余 §4-1/2/4/5/7 仍成立但不紧急，回来条件见各条原文与本轮周报。
+>
+> §4-3 判定：**「macOS `.dmg` 的 5 条手工验收」是不存在的前提**。`build-check.yml` 4 个 job（static/e2e 在 windows、backend-check 是 pytest 矩阵含 macos 但不编译 Rust、rust-nonwindows 在 ubuntu）、`release.yml` 3 个 job 全 windows；`src-tauri/tauri.portable.json` 为 `{"bundle":{"active":false}}`，ADR-006 已定「bundle.active=false，发布手工组装的便携 zip」；全仓 grep「手工验收」仅 REVIEW-LOG 该行自身，无那 5 条清单。故不是「没人跑」而是「没有东西可跑」。
+>
+> §4-8 判定：**macos 半句不实**。`cfg(not(windows))` 的 `libc::kill`（`src-tauri/src/backend.rs` 的 `:161-162`、`:212-214`，依赖 `Cargo.toml` 的 `[target.'cfg(not(windows))'.dependencies] libc = "0.2"`）**已被 ubuntu 腿的 `cargo check` 真编译过**；但 `backend-check` 的 macos 腿只跑 pytest/ruff/mypy，**macOS 从未编译过 Rust**。风险不在「从未编译」，而在 `rust-nonwindows` 是唯一非 Windows 编译腿且没有任何测试盯着它（正是 a52dcd9 治的 silent-skip 形状）。按上轮裁决**不加读 workflow 的静态断言**；回来条件 = `rust-nonwindows` 被删 / 改 runner / 加 `if`，或要做 macOS 分发。
+>
+> §4-6 已补：`utils/redact.py` 新增 `_URL_CREDENTIAL_PATTERN`——`scheme://user:pw@` → `scheme://***:***@`，要求带 scheme 前缀且同时含 `:` 与 `@`，user/pass 段不含 `/`、空白、`@`，故邮箱、裸 `@`、端口不误咬；`init_progress` 的 `api_config.api_url` 落盘前过 `_mask_text`；`_config_drift` 改用 `_strip_url_credentials` 两侧归一后比较、差异文案也过 `_mask_text`（否则掩码会把「同一地址」误报成「API 地址已变更」）。用例 `backend/tests/test_redact_url_credentials.py` 16 条；变异验证：删掉 `_URL_CREDENTIAL_PATTERN.sub` 那行 ⇒ 7 failed / exit 1，装回 ⇒ 16 passed / exit 0。
 
 ## 3. 本轮明确不做
 

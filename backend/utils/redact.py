@@ -66,12 +66,35 @@ _BARE_KEY_PATTERN = re.compile(
 # 单独出现的凭据串（没有 `xxx=` 前缀），例如异常正文里直接拼了 sk-live-…。
 _STANDALONE_TOKEN_PATTERN = re.compile(
     r'(?<![A-Za-z0-9_])((?:sk|ghp|xox[abprs]?|AIza|ya29)[._\-][A-Za-z0-9._\-]{4,})')
+# URL 内嵌口令（R5a 的剩余缺口，§4-6）：`scheme://user:pass@host` → `scheme://***:***@host`。
+#
+# 三条收紧，避免误咬正文（§4-6 当初砍掉它的理由正是「key=value 形态太宽」）：
+#   1. 必须带 `scheme://` 前缀 —— 邮箱 `a@b.com`、裸 `@` 天然不命中；
+#   2. user/pass 段不含 `/`、空白、`@` —— 端口 `host:8080/v1` 因为没有 `@` 不命中；
+#   3. 必须同时有 `:` 和 `@` —— 只有 `@` 没有 `:`（如 `//host@x`）不算凭据。
+# 用户段允许为空（`redis://:pw@host` 是真实写法）。
+_URL_CREDENTIAL_PATTERN = re.compile(
+    r'(?P<scheme>\b[A-Za-z][A-Za-z0-9+.\-]*://)(?P<user>[^/\s:@]*):(?P<pw>[^/\s@]+)@')
+
+
+def _strip_url_credentials(text: str) -> str:
+    """把 URL 里的 `user:pw@` **整段删掉**（不是遮），用于「配置是否漂移」的比较。
+
+    为什么要单开一个函数：落盘值是被遮过的 `https://***:***@host/v1`，而续跑时
+    拿到的 `req.api_url` 是原始 `https://u:pw@host/v1`，直接 `str` 比较必然不等 ⇒
+    每次续跑都误报「API 地址已变更」。两边都先剥掉凭据段再比，才比的是真正有意义的
+    那部分（scheme + host + path）。
+    """
+    return _URL_CREDENTIAL_PATTERN.sub(r"\g<scheme>", text)
 
 
 def _mask_text(text: str) -> str:
     text = _BEARER_PATTERN.sub(r"\1***", text)
     text = _SECRET_PATTERN.sub(r"\1\2***", text)
     text = _BARE_KEY_PATTERN.sub(r"\1\2***", text)
+    # 先遮 URL 内嵌口令，再跑裸凭据兜底：否则 `https://u:sk-live-xxx@h` 会被
+    # _STANDALONE_TOKEN_PATTERN 只遮掉 sk-live-xxx，留下 `u:` 半截形状更难读。
+    text = _URL_CREDENTIAL_PATTERN.sub(r"\g<scheme>***:***@", text)
     return _STANDALONE_TOKEN_PATTERN.sub("***", text)
 
 
