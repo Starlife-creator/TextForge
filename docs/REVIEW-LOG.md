@@ -139,6 +139,17 @@ B4.1 ✅ 0bde150 | Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE
 >
 > §4-6 已补：`utils/redact.py` 新增 `_URL_CREDENTIAL_PATTERN`——`scheme://user:pw@` → `scheme://***:***@`，要求带 scheme 前缀且同时含 `:` 与 `@`，user/pass 段不含 `/`、空白、`@`，故邮箱、裸 `@`、端口不误咬；`init_progress` 的 `api_config.api_url` 落盘前过 `_mask_text`；`_config_drift` 改用 `_strip_url_credentials` 两侧归一后比较、差异文案也过 `_mask_text`（否则掩码会把「同一地址」误报成「API 地址已变更」）。用例 `backend/tests/test_redact_url_credentials.py` 16 条；变异验证：删掉 `_URL_CREDENTIAL_PATTERN.sub` 那行 ⇒ 7 failed / exit 1，装回 ⇒ 16 passed / exit 0。
 
+### 批 5 —— 零牺牲双引擎状态库（`.tfproj.db`）+ 边跑边审三栏工作台 + AST 架构契约
+
+| # | 改动 | DoD | 反向断言 |
+|---|---|---|---|
+| B5.1 ✅ 9026a3a | 新增 `backend/core/project_db.py`（`ProjectDB` SQLite WAL 行级引擎，含 `project_meta` / `chapters` / `batches` / `gate_events` / `error_logs` 五表），透明挂载进 `utils/progress_io.py`、`routes/output.py`（登记 `.tfproj.db` / `-wal` / `-shm`）、`core/versions.py` 与 `routes/pipeline_runner.py`（收尾/回滚/清理前执行 `PRAGMA wal_checkpoint(TRUNCATE)` 并释放句柄） | ① `save_progress_dict` / `merge_progress_write` 双写同步，旧目录仅含 `progress.json` 时首次打开自动回灌；② `list_chapters_summary` / `get_chapter_record` / `update_chapter_review` / `record_batch_ready` 单次调用亚毫秒级（零 30 MB deepcopy）；③ `output_clear` 零 `WinError 32` 清理 `.tfproj.db*` 且保留用户文件 | 移除 `checkpoint_project_db` 调用 ⇒ `test_arch_contracts.py` 生命周期 AST 断言与 Windows 句柄清理断言变红 |
+| B5.2 ✅ 9026a3a | 新增 `backend/core/text_diff.py`（分句/分段 `compute_chapter_diff`）、`backend/routes/chapters.py`（`GET /api/chapters`、`GET /api/chapters/{chapter_num}/diff`、`POST /api/chapters/{chapter_num}/review`）及 `pipeline_runner.py` 实时 `batch_stream_ready` SSE 推送；`progress_io.absorb_concurrent_review_fields` 在 Phase 3 并发写盘前并回审阅态与单章质检覆盖；同时补齐 `wait_split_confirm`（含 R11）、`wait_fix_review`、`phase3_qc` 三处 ADR-005 顺序 | ① Phase 3 单批完成即推送 `batch_stream_ready` 并标 `ready_for_review`；② 后台跑后续批次期间人工精修前序章节，重跑 `quality.py` 单章质检且不被后续 `_save_progress` 覆盖；③ 路径穿越与无 Token 请求拦截生效 | 去掉 `absorb_concurrent_review_fields` ⇒ 并发精修用例红；把任意闸门 `clear()` 移到 `current_phase` 赋值之后 ⇒ `test_arch_contracts.py` 红 |
+| B5.3 ✅ 9026a3a | 新增 `src/api/chapters.ts`、`src/components/ChapterReviewWorkbench.vue`（左栏四维筛选章节树 + 中栏句级对照 Diff / 双栏并排 / 内联精修编辑 + 右栏质检诊断卡片/通过/重写联动）并接入 `src/App.vue`；新增 `backend/tests/test_arch_contracts.py`、`backend/tests/test_project_db_and_streaming_review.py`、`src/chapters.test.ts` | 前端 `vue-tsc` / `eslint` / `prettier` / `vitest`（40 项）与后端六条基线闸门全绿 | 路由内直接同步调用阻塞 I/O 或删掉 `batch_stream_ready` 接线 ⇒ AST 守卫与 `src/chapters.test.ts` 变红 |
+
+> **批 5 收口（2026-11-18）**：双引擎架构保留了 `progress.json` 的纯文本可检视性与 100% 旧测试/旧目录兼容，同时消除章节级查询与边跑边审对大 JSON 的重复解析与深拷贝开销；全部 5 个人工闸门现均由 AST 契约强制保证 `clear()` 早于阶段落盘。
+> 验证范围（批 5）：全量已跑（326 项 / 耗时 8.10s）
+
 ## 3. 本轮明确不做
 
 - **状态拆分 / 单写者队列**（R6+R7 的正解）：需要改 `progress_lock` 的所有权模型，属架构项，需拍板后单开一轮；本轮只落 B2.3 这种不动模型的半步。**重测条件**：若 `progress.json` 实际尺寸分布中位数 > 30 MB，或 `/api/status` p99 > 200 ms，必须启动。
