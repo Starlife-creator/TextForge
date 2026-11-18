@@ -2,6 +2,7 @@ from fastapi import APIRouter
 from pathlib import Path
 from collections import OrderedDict
 import asyncio, json, logging, os, re, threading
+from core.project_db import DB_FILENAME, get_project_db
 from routes import state
 from utils.progress_io import is_completed, read_progress_cached, ProgressUnreadable
 from utils.redact import redact
@@ -69,6 +70,20 @@ def _scan_final_files(target: Path) -> list[dict]:
             if f.is_file() and f.suffix.lower() in (".txt", ".md", ".docx"):
                 files.append({"name": f.name, "path": str(f)})
     return files
+
+
+def _read_review_summary_fast(target: Path) -> dict[str, int] | None:
+    """当 `.tfproj.db` 已落盘时，经 SQLite 单条 SQL 毫秒级读取章节审校汇总（不新建空库）。"""
+    db_file = target / DB_FILENAME
+    if not db_file.is_file():
+        return None
+    try:
+        db = get_project_db(target)
+        db.ensure_hydrated()
+        return db.get_review_summary()
+    except Exception as e:
+        logger.debug(f"[status] review_summary 读取忽略异常: {e}")
+        return None
 
 
 @router.get("/api/status")
@@ -154,6 +169,10 @@ async def status(output_path: str | None = None):
     data["resume"] = await asyncio.to_thread(_build_resume, progress, Path(target), recon_files)
     # A3：章节概览（逻辑章折叠到父章，去重）
     data["chapters_summary"] = _chapter_summary(progress, recon_files)
+    # B6：当 .tfproj.db 存在时，O(1) 附带审校汇总供顶部状态栏零额外往返展示
+    review_summary = await asyncio.to_thread(_read_review_summary_fast, Path(target))
+    if review_summary is not None:
+        data["review_summary"] = review_summary
     return data
 
 

@@ -263,13 +263,19 @@ const showChapterTree = ref(false);
 // 边跑边审三栏工作台状态：在 phase3 / phase3_accept / phase4 及已完成目录自动激活
 const rawPhase = ref('');
 const reviewRefreshTick = ref(0);
+const reviewSummary = ref<{
+  total_chapters: number;
+  ready_chapters: number;
+  approved_chapters: number;
+  edited_chapters: number;
+} | null>(null);
 const showReviewWorkbench = computed(
   () =>
     Boolean(port.value && outputPath.value) &&
     isReviewWorkbenchPhase(
       rawPhase.value || String(outInfo.value?.current_phase || ''),
       Boolean(outInfo.value?.finished || currentPhase.value === '完成'),
-      chapterProgress.value.done,
+      chapterProgress.value.done || (reviewSummary.value?.ready_chapters ?? 0),
     ),
 );
 const topError = ref<string | null>(null);
@@ -817,6 +823,8 @@ async function fetchStatus(): Promise<boolean> {
         done: s.reconstructed_chapters || 0,
       };
     if (Array.isArray(s.chapters_summary)) chapterRows.value = s.chapters_summary;
+    reviewSummary.value =
+      s.review_summary && typeof s.review_summary === 'object' ? s.review_summary : null;
     if (typeof s.current_phase === 'string') rawPhase.value = s.current_phase;
     if (pipelineRunning.value && s.current_phase)
       currentPhase.value = phaseLabel[s.current_phase] || s.current_phase;
@@ -2092,6 +2100,16 @@ const canStart = computed(
           <span v-if="currentPhase" class="phase">{{ currentPhase }}</span>
           <span v-if="isPaused" class="badge paused">已暂停</span>
           <span v-if="pipelineRunning" class="badge running">运行中</span>
+          <span
+            v-if="reviewSummary && reviewSummary.ready_chapters > 0"
+            class="badge running"
+            title="来自 .tfproj.db 的实时章节审校汇总"
+          >
+            已审校 {{ reviewSummary.approved_chapters + reviewSummary.edited_chapters }}/{{
+              reviewSummary.ready_chapters
+            }}
+            章
+          </span>
           <button v-if="outputPath && port" class="open-btn" @click="openOutput">
             打开输出目录
           </button>
@@ -2226,6 +2244,7 @@ const canStart = computed(
         :refresh-tick="reviewRefreshTick"
         :regenerating-ids="regenerating"
         @regen="regenChapter"
+        @review-updated="fetchStatus"
         @log="(msg, lvl) => addLog(msg, lvl)"
         @error="(msg) => (topError = msg)"
       />

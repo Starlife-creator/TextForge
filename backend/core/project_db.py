@@ -559,6 +559,42 @@ class ProjectDB:
                 ).fetchall()
             return [self._row_to_dict(r) for r in rows]
 
+    def get_review_summary(self) -> dict[str, int]:
+        """单条 SQL 聚合查询章节审阅进度汇总（<1ms，零 JSON 反序列化开销）。"""
+        with self._lock:
+            if self._conn is None and not self.db_path.is_file():
+                return {
+                    "total_chapters": 0,
+                    "ready_chapters": 0,
+                    "approved_chapters": 0,
+                    "edited_chapters": 0,
+                }
+            conn = self._get_conn()
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_chapters,
+                    COALESCE(SUM(CASE WHEN status = 'ready_for_review' THEN 1 ELSE 0 END), 0) AS ready_chapters,
+                    COALESCE(SUM(CASE WHEN review_status = 'approved' THEN 1 ELSE 0 END), 0) AS approved_chapters,
+                    COALESCE(SUM(CASE WHEN review_status = 'edited' THEN 1 ELSE 0 END), 0) AS edited_chapters
+                FROM chapters
+                WHERE is_empty = 0
+                """
+            ).fetchone()
+            if row is None:
+                return {
+                    "total_chapters": 0,
+                    "ready_chapters": 0,
+                    "approved_chapters": 0,
+                    "edited_chapters": 0,
+                }
+            return {
+                "total_chapters": int(row["total_chapters"] or 0),
+                "ready_chapters": int(row["ready_chapters"] or 0),
+                "approved_chapters": int(row["approved_chapters"] or 0),
+                "edited_chapters": int(row["edited_chapters"] or 0),
+            }
+
     def get_chapter_record(self, chapter_num: int | str) -> dict[str, Any] | None:
         """按主键 / chapter_id 单行精确查询（<1ms）。"""
         with self._lock:

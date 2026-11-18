@@ -7,8 +7,10 @@ import {
   computeInlineDiffSummary,
   fetchChapterDiff,
   fetchChapterList,
+  fetchChaptersAudit,
   filterChaptersForWorkbench,
   isReviewWorkbenchPhase,
+  resolveWorkbenchShortcut,
   submitChapterReview,
   type ChapterSummaryItem,
 } from './api/chapters';
@@ -191,7 +193,7 @@ describe('工作台纯函数逻辑：内联 Diff 统计、章节筛选与激活�
     expect(edited.changeRatio).toBe(0.5);
   });
 
-  it('filterChaptersForWorkbench 覆盖四个筛选标签', () => {
+  it('filterChaptersForWorkbench 覆盖五个筛选标签与检索交集过滤', () => {
     expect(filterChaptersForWorkbench(SAMPLE_CHAPTERS, 'all')).toHaveLength(3);
     expect(
       filterChaptersForWorkbench(SAMPLE_CHAPTERS, 'pending').map((c) => c.chapter_num),
@@ -200,8 +202,108 @@ describe('工作台纯函数逻辑：内联 Diff 统计、章节筛选与激活�
       2,
     ]);
     expect(
+      filterChaptersForWorkbench(SAMPLE_CHAPTERS, 'audit', {
+        auditFlaggedNums: new Set([1, 3]),
+      }).map((c) => c.chapter_num),
+    ).toEqual([1, 3]);
+    expect(
+      filterChaptersForWorkbench(SAMPLE_CHAPTERS, 'all', {
+        searchMatchedNums: new Set([2]),
+      }).map((c) => c.chapter_num),
+    ).toEqual([2]);
+    expect(
       filterChaptersForWorkbench(SAMPLE_CHAPTERS, 'approved').map((c) => c.chapter_num),
     ).toEqual([1]);
+  });
+
+  it('fetchChaptersAudit 自动携带鉴权头并编码检索词 q', async () => {
+    setAuthToken('tok-audit-9');
+    let capturedUrl = '';
+    let capturedToken = '';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: string, init?: RequestInit) => {
+        capturedUrl = String(input);
+        capturedToken = ((init?.headers as Record<string, string>) || {})[TOKEN_HEADER] || '';
+        return new Response(
+          JSON.stringify({
+            output_path: 'E:/out/book',
+            query: '林渊',
+            summary: {
+              audited_chapters: 3,
+              flagged_chapters: 1,
+              forbidden_hits: 0,
+              old_name_hits: 1,
+              length_anomalies: 0,
+              stitch_warnings: 0,
+              search_matched_chapters: 1,
+              search_total_matches: 2,
+            },
+            items: [],
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    const res = await fetchChaptersAudit(8123, 'E:\\out\\book', '  林渊  ');
+    expect(res.query).toBe('林渊');
+    expect(capturedToken).toBe('tok-audit-9');
+    expect(capturedUrl).toContain('/api/chapters/audit?');
+    expect(capturedUrl).toContain('q=%E6%9E%97%E6%B8%8A');
+  });
+
+  it('resolveWorkbenchShortcut 支持键盘流操作并在输入框聚焦时严格屏蔽单键误触', () => {
+    // 非输入焦点下响应 j/k/Alt+方向键/a/1/2/3
+    expect(resolveWorkbenchShortcut({ key: 'j', targetTagName: 'DIV' })).toBe('next_chapter');
+    expect(resolveWorkbenchShortcut({ key: 'ArrowDown', altKey: true, targetTagName: 'DIV' })).toBe(
+      'next_chapter',
+    );
+    expect(resolveWorkbenchShortcut({ key: 'k', targetTagName: 'BUTTON' })).toBe('prev_chapter');
+    expect(resolveWorkbenchShortcut({ key: 'ArrowUp', altKey: true, targetTagName: 'DIV' })).toBe(
+      'prev_chapter',
+    );
+    expect(resolveWorkbenchShortcut({ key: 'a', targetTagName: 'DIV' })).toBe('toggle_approve');
+    expect(resolveWorkbenchShortcut({ key: '1', targetTagName: 'DIV' })).toBe('mode_diff');
+    expect(resolveWorkbenchShortcut({ key: '2', targetTagName: 'DIV' })).toBe('mode_side_by_side');
+    expect(resolveWorkbenchShortcut({ key: '3', targetTagName: 'DIV' })).toBe('mode_edit');
+
+    // 反向安全守卫：在 INPUT / TEXTAREA 中敲击 j/k/a/1/2/3 绝不能劫持输入
+    for (const k of ['j', 'k', 'a', '1', '2', '3']) {
+      expect(
+        resolveWorkbenchShortcut({ key: k, targetTagName: 'TEXTAREA', inEditMode: true }),
+      ).toBe(null);
+      expect(resolveWorkbenchShortcut({ key: k, targetTagName: 'INPUT' })).toBe(null);
+    }
+
+    // 内联精修模式下 Ctrl+S / Cmd+S 允许在 TEXTAREA 内保存，非精修模式不响应
+    expect(
+      resolveWorkbenchShortcut({
+        key: 's',
+        ctrlKey: true,
+        targetTagName: 'TEXTAREA',
+        inEditMode: true,
+      }),
+    ).toBe('save_edit');
+    expect(
+      resolveWorkbenchShortcut({
+        key: 'S',
+        metaKey: true,
+        targetTagName: 'TEXTAREA',
+        inEditMode: true,
+      }),
+    ).toBe('save_edit');
+    expect(
+      resolveWorkbenchShortcut({
+        key: 's',
+        ctrlKey: true,
+        targetTagName: 'DIV',
+        inEditMode: false,
+      }),
+    ).toBe(null);
+    expect(resolveWorkbenchShortcut({ key: 'j', targetTagName: 'DIV', collapsed: true })).toBe(
+      null,
+    );
   });
 
   it('isReviewWorkbenchPhase 在 phase3 / phase3_accept / phase4 或已完成时激活', () => {
@@ -214,14 +316,20 @@ describe('工作台纯函数逻辑：内联 Diff 统计、章节筛选与激活�
 });
 
 describe('三栏审阅工作台与 App.vue 结构接线守卫', () => {
-  it('App.vue 接入 batch_stream_ready 事件与 ChapterReviewWorkbench 组件', () => {
+  it('App.vue 接入 batch_stream_ready 事件、review_summary 状态汇总与 ChapterReviewWorkbench 组件', () => {
     expect(appRaw).toContain("case 'batch_stream_ready'");
     expect(appRaw).toContain('<ChapterReviewWorkbench');
     expect(appRaw).toContain('showReviewWorkbench');
+    expect(appRaw).toContain('review_summary');
+    expect(appRaw).toContain('@review-updated="fetchStatus"');
   });
 
-  it('ChapterReviewWorkbench 包含三栏结构、三种检视模式与通过/重写操作入口', () => {
+  it('ChapterReviewWorkbench 包含三栏结构、设定与篇幅巡检检索、键盘流快捷键与通过/重写入口', () => {
     expect(workbenchRaw).toContain('边跑边审：已完成');
+    expect(workbenchRaw).toContain('🔍 设定与篇幅巡检');
+    expect(workbenchRaw).toContain('快捷键：J/K 上下章');
+    expect(workbenchRaw).toContain('fetchChaptersAudit');
+    expect(workbenchRaw).toContain('resolveWorkbenchShortcut');
     expect(workbenchRaw).toContain('句级对照 Diff');
     expect(workbenchRaw).toContain('双栏并排');
     expect(workbenchRaw).toContain('内联精修编辑');

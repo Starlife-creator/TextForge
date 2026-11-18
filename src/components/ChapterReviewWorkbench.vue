@@ -7,13 +7,17 @@
  * - 中栏：三种检视/精修模式切换（「句级对照 Diff」 / 「双栏并排」 / 「内联精修编辑」直接改写并重跑质检）
  * - 右栏：单章结构性质检诊断卡片、字数增减与改动率、重写次数徽章、「✓ 通过本章」与「↻ 重写本章」联动
  */
-import { computed, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import {
   computeInlineDiffSummary,
   fetchChapterDiff,
   fetchChapterList,
+  fetchChaptersAudit,
   filterChaptersForWorkbench,
+  resolveWorkbenchShortcut,
   submitChapterReview,
+  type ChapterAuditItem,
+  type ChapterAuditSummary,
   type ChapterDiffResponse,
   type ChapterFilterTab,
   type ChapterSummaryItem,
@@ -32,6 +36,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'regen', chapter: { id: string; chapter_num: number; title: string }): void;
+  (e: 'review-updated'): void;
   (e: 'log', message: string, level?: 'info' | 'ok' | 'warn' | 'err' | 'accent'): void;
   (e: 'error', message: string): void;
 }>();
@@ -43,6 +48,7 @@ const centerMode = ref<WorkbenchCenterMode>('diff');
 const loadingList = ref(false);
 const loadingDiff = ref(false);
 const savingReview = ref(false);
+const auditing = ref(false);
 
 const chapters = ref<ChapterSummaryItem[]>([]);
 const totalChapters = ref(0);
@@ -50,6 +56,12 @@ const readyCount = ref(0);
 const approvedCount = ref(0);
 const editedCount = ref(0);
 const flaggedCount = ref(0);
+
+const searchQuery = ref('');
+const activeSearchQuery = ref('');
+const auditSummary = ref<ChapterAuditSummary | null>(null);
+const auditItemsByNum = ref<Map<number, ChapterAuditItem>>(new Map());
+const searchMatchedNums = ref<Set<number> | null>(null);
 
 const selectedChapterNum = ref<number | null>(null);
 const currentDiff = ref<ChapterDiffResponse | null>(null);
@@ -59,7 +71,8 @@ const localNotice = ref('');
 const FILTER_TABS: { key: ChapterFilterTab; label: string }[] = [
   { key: 'all', label: '全部' },
   { key: 'pending', label: '待审阅' },
-  { key: 'qc', label: '有质检提示' },
+  { key: 'qc', label: '质检提示' },
+  { key: 'audit', label: '巡检异常' },
   { key: 'approved', label: '已通过' },
 ];
 
@@ -69,8 +82,27 @@ const CENTER_MODES: { key: WorkbenchCenterMode; label: string }[] = [
   { key: 'edit', label: '内联精修编辑' },
 ];
 
+const auditFlaggedNums = computed(() => {
+  const nums = new Set<number>();
+  for (const item of auditItemsByNum.value.values()) {
+    if (item.findings.length > 0) {
+      nums.add(item.chapter_num);
+    }
+  }
+  return nums;
+});
+
 const filteredChapters = computed(() =>
-  filterChaptersForWorkbench(chapters.value, filterTab.value),
+  filterChaptersForWorkbench(chapters.value, filterTab.value, {
+    auditFlaggedNums: auditFlaggedNums.value,
+    searchMatchedNums: searchMatchedNums.value,
+  }),
+);
+
+const selectedAuditItem = computed(() =>
+  selectedChapterNum.value != null
+    ? (auditItemsByNum.value.get(selectedChapterNum.value) ?? null)
+    : null,
 );
 
 const selectedSummary = computed(
@@ -208,6 +240,7 @@ async function markApproval(nextStatus: 'approved' | 'pending') {
       `第 ${cnum} 章审阅状态已更新为：${nextStatus === 'approved' ? '已通过' : '待审阅'}`,
       'ok',
     );
+    emit('review-updated');
     await reloadList(false);
   } catch (e: any) {
     emit('error', `更新审阅状态失败：${e?.message || e}`);
@@ -245,12 +278,130 @@ async function saveInlineEdit() {
       `第 ${cnum} 章人工精修已落盘并刷新质检（遗留问题 ${res.qc_issues.length} 项）`,
       'ok',
     );
+    emit('review-updated');
     await loadChapterDiff(cnum);
     await reloadList(false);
   } catch (e: any) {
     emit('error', `保存精修失败：${e?.message || e}`);
   } finally {
     savingReview.value = false;
+  }
+}
+
+async function runAuditOrSearch(opts: { switchToAuditTab?: boolean; queryOverride?: string } = {}) {
+  if (!props.port || !props.outputPath || auditing.value) return;
+  const q = opts.queryOverride !== undefined ? opts.queryOverride.trim() : searchQuery.value.trim();
+  auditing.value = true;
+  try {
+    const res = await fetchChaptersAudit(props.port, props.outputPath, q || undefined);
+    auditSummary.value = res.summary;
+    const map = new Map<number, ChapterAuditItem>();
+    for (const item of res.items) {
+      map.set(item.chapter_num, item);
+    }
+    auditItemsByNum.value = map;
+
+    if (q) {
+      activeSearchQuery.value = q;
+      searchMatchedNums.value = new Set(res.items.map((it) => it.chapter_num));
+      localNotice.value = `全书检索「${q}」命中 ${res.summary.search_matched_chapters} 章（共 ${res.summary.search_total_matches} 处）`;
+    } else {
+      activeSearchQuery.value = '';
+      searchMatchedNums.value = null;
+      localNotice.value = `全书巡检完成：共核查 ${res.summary.audited_chapters} 章，需关注 ${res.summary.flagged_chapters} 章`;
+    }
+
+    if (opts.switchToAuditTab) {
+      filterTab.value = 'audit';
+    }
+
+    const visible = filteredChapters.value;
+    if (
+      visible.length > 0 &&
+      !isEditDirty.value &&
+      !visible.some((c) => c.chapter_num === selectedChapterNum.value)
+    ) {
+      selectedChapterNum.value = visible[0].chapter_num;
+      await loadChapterDiff(visible[0].chapter_num);
+    }
+  } catch (e: any) {
+    emit('error', `全书检索/设定巡检失败：${e?.message || e}`);
+  } finally {
+    auditing.value = false;
+  }
+}
+
+function clearSearchAndAuditFilter() {
+  searchQuery.value = '';
+  activeSearchQuery.value = '';
+  searchMatchedNums.value = null;
+  if (filterTab.value === 'audit') {
+    filterTab.value = 'all';
+  }
+}
+
+async function stepChapter(delta: 1 | -1) {
+  const list = filteredChapters.value;
+  if (!list.length) return;
+  const curIdx = list.findIndex((c) => c.chapter_num === selectedChapterNum.value);
+  const nextIdx = curIdx < 0 ? 0 : Math.max(0, Math.min(list.length - 1, curIdx + delta));
+  const target = list[nextIdx];
+  if (target && target.chapter_num !== selectedChapterNum.value) {
+    await selectChapter(target);
+  }
+}
+
+function onWorkbenchKeydown(e: KeyboardEvent) {
+  const t = e.target as HTMLElement | null;
+  const action = resolveWorkbenchShortcut({
+    key: e.key,
+    ctrlKey: e.ctrlKey,
+    metaKey: e.metaKey,
+    altKey: e.altKey,
+    shiftKey: e.shiftKey,
+    repeat: e.repeat,
+    targetTagName: t?.tagName ?? null,
+    isContentEditable: Boolean(t?.isContentEditable),
+    inEditMode: centerMode.value === 'edit',
+    collapsed: collapsed.value,
+  });
+  if (!action) return;
+
+  switch (action) {
+    case 'save_edit':
+      e.preventDefault();
+      void saveInlineEdit();
+      break;
+    case 'next_chapter':
+      e.preventDefault();
+      void stepChapter(1);
+      break;
+    case 'prev_chapter':
+      e.preventDefault();
+      void stepChapter(-1);
+      break;
+    case 'toggle_approve':
+      if (
+        currentDiff.value &&
+        currentDiff.value.status === 'ready_for_review' &&
+        !savingReview.value
+      ) {
+        e.preventDefault();
+        void markApproval(currentDiff.value.review_status === 'approved' ? 'pending' : 'approved');
+      }
+      break;
+    case 'mode_diff':
+      e.preventDefault();
+      centerMode.value = 'diff';
+      break;
+    case 'mode_side_by_side':
+      e.preventDefault();
+      centerMode.value = 'side_by_side';
+      break;
+    case 'mode_edit':
+      e.preventDefault();
+      centerMode.value = 'edit';
+      break;
   }
 }
 
@@ -264,12 +415,25 @@ function triggerRegen() {
   });
 }
 
+onMounted(() => {
+  window.addEventListener('keydown', onWorkbenchKeydown);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onWorkbenchKeydown);
+});
+
 watch(
   () => [props.port, props.outputPath],
   ([p, out]) => {
     if (p && out) {
       selectedChapterNum.value = null;
       currentDiff.value = null;
+      searchQuery.value = '';
+      activeSearchQuery.value = '';
+      searchMatchedNums.value = null;
+      auditSummary.value = null;
+      auditItemsByNum.value = new Map();
       void reloadList(true);
     }
   },
@@ -303,6 +467,21 @@ watch(
         </span>
       </div>
       <div class="wb-header-actions">
+        <span
+          class="wb-shortcut-legend"
+          title="仅在未聚焦输入框时响应单键；精修编辑框内支持 Ctrl+S"
+        >
+          快捷键：J/K 上下章 · 1/2/3 视图 · A 通过 · Ctrl+S 保存精修
+        </span>
+        <button
+          type="button"
+          class="wb-btn ghost"
+          :disabled="auditing || !readyCount"
+          title="全书扫描禁用设定泄露、未替换旧人名、极端压缩/膨胀与缝合边界告警"
+          @click="runAuditOrSearch({ switchToAuditTab: true, queryOverride: '' })"
+        >
+          {{ auditing ? '巡检中…' : '🔍 设定与篇幅巡检' }}
+        </button>
         <button
           type="button"
           class="wb-btn ghost"
@@ -318,8 +497,48 @@ watch(
     </div>
 
     <div v-if="!collapsed" class="wb-grid">
-      <!-- 左栏：可筛选章节树 -->
+      <!-- 左栏：全书检索/设定一致性巡检 + 可筛选章节树 -->
       <aside class="wb-col wb-left">
+        <div class="wb-search-bar" aria-label="全书正文检索 / 设定一致性巡检">
+          <input
+            v-model="searchQuery"
+            type="search"
+            class="wb-search-input"
+            placeholder="全书检索人名/词条（回车）…"
+            @keydown.enter.prevent="runAuditOrSearch()"
+          />
+          <button
+            type="button"
+            class="wb-search-btn"
+            :disabled="auditing"
+            @click="runAuditOrSearch()"
+          >
+            检索
+          </button>
+          <button
+            v-if="activeSearchQuery || filterTab === 'audit'"
+            type="button"
+            class="wb-search-btn clear"
+            title="清除检索与巡检筛选"
+            @click="clearSearchAndAuditFilter"
+          >
+            ×
+          </button>
+        </div>
+
+        <div v-if="auditSummary" class="wb-audit-strip">
+          <template v-if="activeSearchQuery">
+            检索「{{ activeSearchQuery }}」：命中 {{ auditSummary.search_matched_chapters }} 章 ·
+            {{ auditSummary.search_total_matches }} 处
+          </template>
+          <template v-else>
+            巡检 {{ auditSummary.audited_chapters }} 章：异常
+            <b>{{ auditSummary.flagged_chapters }}</b> 章（禁设 {{ auditSummary.forbidden_hits }} ·
+            旧名 {{ auditSummary.old_name_hits }} · 篇幅 {{ auditSummary.length_anomalies }} · 缝合
+            {{ auditSummary.stitch_warnings }}）
+          </template>
+        </div>
+
         <div class="wb-tabs" role="tablist" aria-label="章节筛选">
           <button
             v-for="tab in FILTER_TABS"
@@ -349,12 +568,31 @@ watch(
               <span class="wb-ch-num">#{{ ch.chapter_num }}</span>
               <span class="wb-ch-title">{{ ch.title }}</span>
               <span v-if="ch.qc_issues.length" class="wb-qc-dot" title="有结构性质检提示">!</span>
+              <span
+                v-if="auditFlaggedNums.has(ch.chapter_num)"
+                class="wb-audit-dot"
+                title="设定/篇幅/缝合巡检提示"
+              >
+                巡
+              </span>
             </div>
             <div class="wb-ch-meta">
               <span :class="reviewBadgeClass(ch)">{{ reviewBadgeText(ch) }}</span>
               <span v-if="ch.char_refactored > 0" class="wb-chars">
                 {{ ch.char_raw }} → {{ ch.char_refactored }} 字
               </span>
+            </div>
+            <div
+              v-if="auditItemsByNum.get(ch.chapter_num)?.search_matches.snippets[0]"
+              class="wb-ch-snip"
+            >
+              {{ auditItemsByNum.get(ch.chapter_num)?.search_matches.snippets[0] }}
+            </div>
+            <div
+              v-else-if="auditItemsByNum.get(ch.chapter_num)?.findings[0]"
+              class="wb-ch-snip warn"
+            >
+              {{ auditItemsByNum.get(ch.chapter_num)?.findings[0]?.message }}
             </div>
           </button>
         </div>
@@ -517,6 +755,40 @@ watch(
             </div>
           </div>
 
+          <div
+            v-if="
+              selectedAuditItem &&
+              (selectedAuditItem.findings.length > 0 ||
+                selectedAuditItem.search_matches.snippets.length > 0)
+            "
+            class="wb-card"
+          >
+            <div class="wb-card-title">设定巡检与检索命中</div>
+            <div v-if="selectedAuditItem.findings.length" class="wb-qc-list">
+              <div
+                v-for="(fd, fIdx) in selectedAuditItem.findings"
+                :key="fIdx"
+                class="wb-qc-item"
+                :class="fd.severity === 'bad' ? 'bad' : 'warn'"
+              >
+                <div class="wb-qc-head">
+                  <span class="wb-qc-sev">{{ fd.severity === 'bad' ? '违规' : '提示' }}</span>
+                  <span>{{ fd.message }}</span>
+                </div>
+                <div v-if="fd.snippet" class="wb-qc-ev">{{ fd.snippet }}</div>
+              </div>
+            </div>
+            <div v-if="selectedAuditItem.search_matches.snippets.length" class="wb-qc-list">
+              <div
+                v-for="(sn, sIdx) in selectedAuditItem.search_matches.snippets"
+                :key="sIdx"
+                class="wb-search-hit"
+              >
+                命中 {{ sIdx + 1 }}：{{ sn }}
+              </div>
+            </div>
+          </div>
+
           <div class="wb-actions-stack">
             <button
               v-if="currentDiff.review_status !== 'approved'"
@@ -613,11 +885,57 @@ watch(
 }
 .wb-header-actions {
   display: flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+}
+.wb-shortcut-legend {
+  font-size: 11px;
+  color: #718096;
+  background: #edf2f7;
+  border: 1px solid #e2e8f0;
+  border-radius: 4px;
+  padding: 3px 8px;
+}
+.wb-search-bar {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #fff;
+}
+.wb-search-input {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 8px;
+  font-size: 12px;
+  border: 1px solid #cbd5e0;
+  border-radius: 4px;
+}
+.wb-search-btn {
+  padding: 4px 8px;
+  font-size: 12px;
+  border: 1px solid #cbd5e0;
+  border-radius: 4px;
+  background: #edf2f7;
+  color: #2d3748;
+  cursor: pointer;
+}
+.wb-search-btn.clear {
+  padding: 4px 7px;
+  font-weight: 700;
+}
+.wb-audit-strip {
+  padding: 5px 8px;
+  font-size: 11px;
+  color: #744210;
+  background: #fffff0;
+  border-bottom: 1px solid #fefcbf;
+  line-height: 1.45;
 }
 .wb-grid {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 290px;
+  grid-template-columns: 270px minmax(0, 1fr) 290px;
   gap: 12px;
   min-height: 430px;
   max-height: 560px;
@@ -633,7 +951,7 @@ watch(
 }
 .wb-tabs {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   border-bottom: 1px solid #e2e8f0;
   background: #edf2f7;
 }
@@ -961,6 +1279,41 @@ watch(
   opacity: 0.85;
   word-break: break-all;
 }
+.wb-audit-dot {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #dd6b20;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.wb-ch-snip {
+  font-size: 11px;
+  color: #2b6cb0;
+  background: #ebf8ff;
+  border-radius: 3px;
+  padding: 2px 5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-ch-snip.warn {
+  color: #975a16;
+  background: #fffff0;
+}
+.wb-search-hit {
+  font-size: 11px;
+  color: #2b6cb0;
+  background: #ebf8ff;
+  border: 1px solid #bee3f8;
+  border-radius: 4px;
+  padding: 5px 7px;
+  word-break: break-all;
+}
 .wb-actions-stack {
   display: flex;
   flex-direction: column;
@@ -1081,5 +1434,29 @@ html.dark .wb-seg-del {
 html.dark .wb-seg-ins {
   background: rgba(72, 187, 120, 0.25);
   color: #9ae6b4;
+}
+html.dark .wb-shortcut-legend,
+html.dark .wb-search-bar,
+html.dark .wb-search-btn {
+  background: #232b39;
+  border-color: #4a5568;
+  color: #cbd5e0;
+}
+html.dark .wb-search-input {
+  background: #1a202c;
+  border-color: #4a5568;
+  color: #e2e8f0;
+}
+html.dark .wb-audit-strip,
+html.dark .wb-ch-snip.warn {
+  background: rgba(236, 201, 75, 0.14);
+  border-color: #975a16;
+  color: #fbd38d;
+}
+html.dark .wb-ch-snip,
+html.dark .wb-search-hit {
+  background: rgba(49, 130, 206, 0.2);
+  border-color: #2b6cb0;
+  color: #90cdf4;
 }
 </style>

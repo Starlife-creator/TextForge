@@ -372,3 +372,131 @@ def test_emit_batch_stream_ready_syncs_db_and_pushes_sse(tmp_path: Path) -> None
         assert pushed["data"]["chapters"][0]["chapter_num"] == 3
     finally:
         events_mod._subscribers.pop(run_id, None)
+
+
+def test_chapters_audit_detects_forbidden_old_name_length_and_stitch_anomalies(
+    tmp_path: Path,
+) -> None:
+    """B6.1：验证 GET /api/chapters/audit 同时覆盖禁设词、未替换旧名、极端压缩/膨胀与缝合告警，并支持关键词全文检索。"""
+    out_dir = _create_sample_project(tmp_path / "audit_book", write_via_save=False)
+    pf = out_dir / "progress.json"
+    prog = json.loads(pf.read_text(encoding="utf-8"))
+    prog["forbidden_canon"] = ["赛博飞船"]
+    prog["name_map"] = {"旧主角甲": "林渊"}
+    prog["batches"][1]["status"] = "phase3_done"
+    prog["stitch_anchors"] = [
+        {
+            "file": "02_workspace/reconstructed/chapter_1.txt",
+            "applied": True,
+            "change_rate": 0.32,
+            "chars": 240,
+        }
+    ]
+    prog["stitch_failures"] = [
+        {"stage": 2, "boundary": "0-1", "error": "ValueError: 缝合契约分隔符不匹配"}
+    ]
+    save_progress_dict(pf, prog)
+
+    # 第 1 章：正常长度，但含未替换旧名「旧主角甲」+ 高改动率缝合锚点
+    raw_ch1 = (out_dir / "02_workspace/split/1.txt").read_text(encoding="utf-8")
+    (out_dir / "02_workspace/reconstructed/chapter_1.txt").write_text(
+        raw_ch1 + "旧主角甲提剑望向远方山门，剑气纵横。",
+        encoding="utf-8",
+    )
+    # 第 2 章：明显压缩（ratio < 0.60）+ 命中禁设「赛博飞船」+ 批次边界 0-1 缝合跳过
+    (out_dir / "02_workspace/reconstructed/chapter_2.txt").write_text(
+        "天幕裂开，一艘赛博飞船缓缓降落，众人哗然。",
+        encoding="utf-8",
+    )
+    # 第 3 章：明显膨胀（ratio > 1.45）+ 包含特定检索词「玄铁重剑」两次
+    raw_ch3 = (out_dir / "02_workspace/split/3.txt").read_text(encoding="utf-8")
+    (out_dir / "02_workspace/reconstructed/chapter_3.txt").write_text(
+        (raw_ch3 * 2) + "林渊拔出玄铁重剑，玄铁重剑在雪夜铮鸣。",
+        encoding="utf-8",
+    )
+    # 重新触发同步
+    save_progress_dict(pf, json.loads(pf.read_text(encoding="utf-8")))
+
+    client = TestClient(app_module.app)
+    r_audit = client.get("/api/chapters/audit", params={"output_path": str(out_dir)})
+    assert r_audit.status_code == 200
+    body = r_audit.json()
+    summary = body["summary"]
+    assert summary["audited_chapters"] == 3
+    assert summary["flagged_chapters"] == 3
+    assert summary["forbidden_hits"] == 1
+    assert summary["old_name_hits"] == 1
+    assert summary["length_anomalies"] == 2
+    assert summary["stitch_warnings"] >= 2
+
+    by_num = {it["chapter_num"]: it for it in body["items"]}
+    ch1_cats = {f["category"] for f in by_num[1]["findings"]}
+    assert "old_name" in ch1_cats
+    assert "stitch_boundary" in ch1_cats
+
+    ch2_cats = {f["category"] for f in by_num[2]["findings"]}
+    assert "forbidden_canon" in ch2_cats
+    assert "length_compression" in ch2_cats
+    assert "stitch_boundary" in ch2_cats
+
+    ch3_cats = {f["category"] for f in by_num[3]["findings"]}
+    assert "length_bloat" in ch3_cats
+
+    # 关键词全文检索 ?q=玄铁重剑
+    r_search = client.get(
+        "/api/chapters/audit",
+        params={"output_path": str(out_dir), "q": "玄铁重剑"},
+    )
+    assert r_search.status_code == 200
+    s_body = r_search.json()
+    assert s_body["summary"]["search_matched_chapters"] == 1
+    assert s_body["summary"]["search_total_matches"] == 2
+    assert len(s_body["items"]) == 1
+    assert s_body["items"][0]["chapter_num"] == 3
+    assert s_body["items"][0]["search_matches"]["count"] == 2
+    assert any("玄铁重剑" in sn for sn in s_body["items"][0]["search_matches"]["snippets"])
+
+
+def test_status_enriches_review_summary_live_from_project_db(
+    tmp_path: Path,
+) -> None:
+    """B6.3：无进度的空目录不新建 `.tfproj.db`；仅含 `progress.json` 的旧目录经 `/api/status` 自动回灌并毫秒级附带实时 `review_summary`。"""
+    empty_dir = tmp_path / "empty_out"
+    empty_dir.mkdir(parents=True, exist_ok=True)
+    client = TestClient(app_module.app)
+
+    r_empty = client.get("/api/status", params={"output_path": str(empty_dir)})
+    assert r_empty.status_code == 200
+    assert r_empty.json()["has_progress"] is False
+    assert "review_summary" not in r_empty.json()
+    assert not (empty_dir / ".tfproj.db").exists()
+
+    legacy_dir = _create_sample_project(tmp_path / "status_legacy", write_via_save=False)
+    assert not (legacy_dir / ".tfproj.db").exists()
+
+    r_initial = client.get("/api/status", params={"output_path": str(legacy_dir)})
+    assert r_initial.status_code == 200
+    assert r_initial.json().get("review_summary") == {
+        "total_chapters": 3,
+        "ready_chapters": 2,
+        "approved_chapters": 0,
+        "edited_chapters": 0,
+    }
+
+    assert client.post(
+        "/api/chapters/1/review",
+        json={"output_path": str(legacy_dir), "review_status": "approved"},
+    ).status_code == 200
+    assert client.post(
+        "/api/chapters/2/review",
+        json={"output_path": str(legacy_dir), "edited_text": "精修定稿正文。" * 90},
+    ).status_code == 200
+
+    r_enriched = client.get("/api/status", params={"output_path": str(legacy_dir)})
+    assert r_enriched.status_code == 200
+    assert r_enriched.json().get("review_summary") == {
+        "total_chapters": 3,
+        "ready_chapters": 2,
+        "approved_chapters": 1,
+        "edited_chapters": 1,
+    }

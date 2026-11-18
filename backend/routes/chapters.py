@@ -22,13 +22,21 @@ from typing import Any
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from core.project_db import VALID_REVIEW_STATUSES, get_project_db
-from core.quality import assess_batch_texts
+from core.quality import (
+    COLLAPSE_MIN_ORIG_CHARS,
+    COLLAPSE_RATIO,
+    EXPANSION_RATIO,
+    STITCH_WARN_MEAN_RATE,
+    _snippet,
+    assess_batch_texts,
+    find_hits,
+)
 from core.refactor import _refresh_qc_after_regen
 from core.text_diff import compute_chapter_diff
 from routes import state
 from utils.atomic import atomic_write_text
 from utils.errors import raise_internal_error
-from utils.progress_io import ProgressUnreadable, merge_progress_write
+from utils.progress_io import ProgressUnreadable, merge_progress_write, read_progress_cached
 
 logger = logging.getLogger("textforge")
 router = APIRouter()
@@ -304,6 +312,318 @@ def _apply_review_sync(
     }
 
 
+AUDIT_COMPRESSION_RATIO = 0.60
+AUDIT_BLOAT_RATIO = 1.45
+AUDIT_MIN_RAW_CHARS = 20
+AUDIT_MAX_SNIPPETS = 3
+_CHAPTER_FILE_CID_RE = re.compile(r"chapter_([A-Za-z0-9_]+)\.txt$", re.IGNORECASE)
+
+
+def _normalize_forbidden_list(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        parts = re.split(r"[\r\n,，;；]+", raw)
+        return [p.strip() for p in parts if len(p.strip()) >= 2]
+    if isinstance(raw, (list, tuple, set)):
+        return [str(x).strip() for x in raw if len(str(x).strip()) >= 2]
+    return []
+
+
+def _normalize_name_map(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        old_n = str(k).strip()
+        new_n = str(v).strip()
+        if len(old_n) >= 2 and old_n.casefold() != new_n.casefold():
+            out[old_n] = new_n
+    return out
+
+
+def _collect_stitch_signals(
+    progress: dict[str, Any],
+) -> tuple[dict[str, float], dict[str, str]]:
+    """从 `progress` 提取每章的缝合高改动率与缝合跳过记录。"""
+    high_rates: dict[str, float] = {}
+    for anchor in progress.get("stitch_anchors") or []:
+        if not isinstance(anchor, dict) or not anchor.get("applied"):
+            continue
+        rate = anchor.get("change_rate")
+        if not isinstance(rate, (int, float)) or float(rate) < STITCH_WARN_MEAN_RATE:
+            continue
+        f_rel = str(anchor.get("file") or "").replace("\\", "/")
+        m = _CHAPTER_FILE_CID_RE.search(f_rel)
+        if m:
+            logic_cid = m.group(1).split("_", 1)[0]
+            high_rates[logic_cid] = max(high_rates.get(logic_cid, 0.0), float(rate))
+
+    batches_by_id: dict[str, dict[str, Any]] = {}
+    for b in progress.get("batches") or []:
+        if isinstance(b, dict) and b.get("batch_id") is not None:
+            batches_by_id[str(b["batch_id"])] = b
+
+    failures_by_cid: dict[str, str] = {}
+    for fail in progress.get("stitch_failures") or []:
+        if not isinstance(fail, dict):
+            continue
+        boundary = str(fail.get("boundary") or "").strip()
+        err_short = str(fail.get("error") or "缝合跳过")[:90]
+        target_cids: list[str] = []
+        if boundary.startswith("virtual:"):
+            head = boundary[len("virtual:") :].split("->", 1)[0].strip()
+            if head:
+                target_cids.append(head.split("_", 1)[0])
+        elif "-" in boundary:
+            left, right = boundary.split("-", 1)
+            if left in batches_by_id:
+                cids_l = batches_by_id[left].get("chapter_ids") or []
+                if cids_l:
+                    target_cids.append(str(cids_l[-1]).split("_", 1)[0])
+            if right in batches_by_id:
+                cids_r = batches_by_id[right].get("chapter_ids") or []
+                if cids_r:
+                    target_cids.append(str(cids_r[0]).split("_", 1)[0])
+        if not target_cids:
+            for cm in re.finditer(r"chapter_([A-Za-z0-9_]+)", boundary):
+                target_cids.append(cm.group(1).split("_", 1)[0])
+        for cid in target_cids:
+            failures_by_cid.setdefault(cid, f"{boundary}: {err_short}")
+
+    return high_rates, failures_by_cid
+
+
+def _search_keyword_in_chapter(
+    text: str, title: str, q_clean: str
+) -> dict[str, Any]:
+    """在单章正文与标题中大小写无关检索关键词，返回命中次数与上下文摘要。"""
+    q_fold = q_clean.casefold()
+    text_fold = text.casefold()
+    q_len = len(q_fold)
+    count = 0
+    snippets: list[str] = []
+    pos = 0
+    while q_len > 0:
+        idx = text_fold.find(q_fold, pos)
+        if idx < 0:
+            break
+        count += 1
+        if len(snippets) < AUDIT_MAX_SNIPPETS:
+            snippets.append(_snippet(text, idx, len(q_clean), radius=28))
+        pos = idx + q_len
+
+    if q_len > 0 and q_fold in title.casefold():
+        if count == 0:
+            count = 1
+        if len(snippets) < AUDIT_MAX_SNIPPETS:
+            snippets.insert(0, f"[标题] {title}")
+
+    return {"count": count, "snippets": snippets[:AUDIT_MAX_SNIPPETS]}
+
+
+def _audit_chapters_sync(base: Path, query: str | None = None) -> dict[str, Any]:
+    """跨章设定一致性、改名残留、极端篇幅压缩/膨胀、缝合边界状态巡检与全文关键词检索。"""
+    db = get_project_db(base)
+    db.ensure_hydrated()
+    rows = db.list_chapters_summary(include_empty=False)
+
+    pf = base / "progress.json"
+    progress: dict[str, Any] = {}
+    if pf.is_file():
+        progress = read_progress_cached(pf)
+
+    shim = _build_qc_req_shim(progress)
+    forbidden_list = _normalize_forbidden_list(
+        getattr(shim, "forbidden_canon", None) or progress.get("forbidden_canon")
+    )
+    name_map = _normalize_name_map(
+        getattr(shim, "name_map", None) or progress.get("name_map")
+    )
+    reskin_mode = str(getattr(shim, "refactor_mode", "") or progress.get("refactor_mode") or "") == "reskin"
+    stitch_rates, stitch_fails = _collect_stitch_signals(progress)
+
+    q_clean = (query or "").strip()
+    audited_chapters = 0
+    flagged_chapters = 0
+    forbidden_hits_count = 0
+    old_name_hits_count = 0
+    length_anomalies_count = 0
+    stitch_warnings_count = 0
+    search_matched_chapters = 0
+    search_total_matches = 0
+    items: list[dict[str, Any]] = []
+
+    for r in rows:
+        cid = str(r["chapter_id"])
+        title = str(r["title"] or f"第 {r['chapter_num']} 章")
+        ref_text = _read_chapter_text_candidates(
+            base,
+            [
+                str(r.get("refactored_file") or ""),
+                f"02_workspace/reconstructed/chapter_{cid}.txt",
+                f"02_refactored/chapter_{cid}.txt",
+                f"02_refactored/{cid}.txt",
+            ],
+        )
+        ref_stripped = ref_text.strip()
+        has_ref = len(ref_stripped) > 0
+        if not has_ref and not (q_clean and q_clean.casefold() in title.casefold()):
+            continue
+
+        orig_len = int(r.get("char_raw") or 0)
+        if orig_len <= 0:
+            orig_text = _read_chapter_text_candidates(
+                base,
+                [
+                    str(r.get("raw_file") or ""),
+                    f"02_workspace/split/{cid}.txt",
+                    f"00_chapters/{cid}.txt",
+                    f"00_chapters/chapter_{cid}.txt",
+                ],
+            )
+            orig_len = len(orig_text.strip())
+        ref_len = len(ref_stripped)
+        ratio = round(ref_len / orig_len, 3) if (orig_len > 0 and has_ref) else None
+
+        findings: list[dict[str, Any]] = []
+        if has_ref:
+            audited_chapters += 1
+
+            for needle, snip in find_hits(ref_text, forbidden_list):
+                forbidden_hits_count += 1
+                findings.append(
+                    {
+                        "severity": "bad",
+                        "category": "forbidden_canon",
+                        "message": f"命中禁用设定「{needle}」",
+                        "snippet": snip,
+                    }
+                )
+
+            if name_map:
+                for old_n, snip in find_hits(ref_text, list(name_map.keys())):
+                    old_name_hits_count += 1
+                    target_n = name_map.get(old_n, "")
+                    findings.append(
+                        {
+                            "severity": "bad" if reskin_mode else "warn",
+                            "category": "old_name",
+                            "message": (
+                                f"残留未替换旧名「{old_n}」（目标「{target_n}」）"
+                                if target_n
+                                else f"残留未替换旧名「{old_n}」"
+                            ),
+                            "snippet": snip,
+                        }
+                    )
+
+            if ratio is not None and orig_len >= AUDIT_MIN_RAW_CHARS:
+                if ratio < AUDIT_COMPRESSION_RATIO:
+                    length_anomalies_count += 1
+                    sev = (
+                        "bad"
+                        if (orig_len >= COLLAPSE_MIN_ORIG_CHARS and ratio < COLLAPSE_RATIO)
+                        else "warn"
+                    )
+                    findings.append(
+                        {
+                            "severity": sev,
+                            "category": "length_compression",
+                            "message": f"篇幅显著压缩：{orig_len} → {ref_len} 字（{ratio * 100:.1f}%）",
+                            "snippet": "",
+                        }
+                    )
+                elif ratio > AUDIT_BLOAT_RATIO:
+                    length_anomalies_count += 1
+                    sev = (
+                        "bad"
+                        if (orig_len >= COLLAPSE_MIN_ORIG_CHARS and ratio > EXPANSION_RATIO)
+                        else "warn"
+                    )
+                    findings.append(
+                        {
+                            "severity": sev,
+                            "category": "length_bloat",
+                            "message": f"篇幅显著膨胀：{orig_len} → {ref_len} 字（{ratio * 100:.1f}%）",
+                            "snippet": "",
+                        }
+                    )
+
+            if cid in stitch_fails:
+                stitch_warnings_count += 1
+                findings.append(
+                    {
+                        "severity": "warn",
+                        "category": "stitch_boundary",
+                        "message": f"缝合边界曾降级跳过（{stitch_fails[cid]}）",
+                        "snippet": "",
+                    }
+                )
+            elif cid in stitch_rates:
+                stitch_warnings_count += 1
+                findings.append(
+                    {
+                        "severity": "warn",
+                        "category": "stitch_boundary",
+                        "message": f"缝合边界改动率偏高（{stitch_rates[cid] * 100:.1f}%），建议核对衔接段",
+                        "snippet": "",
+                    }
+                )
+
+        if findings:
+            flagged_chapters += 1
+
+        search_res = (
+            _search_keyword_in_chapter(ref_text, title, q_clean)
+            if q_clean
+            else {"count": 0, "snippets": []}
+        )
+        if q_clean:
+            if search_res["count"] > 0:
+                search_matched_chapters += 1
+                search_total_matches += int(search_res["count"])
+                items.append(
+                    {
+                        "chapter_num": int(r["chapter_num"]),
+                        "chapter_id": cid,
+                        "title": title,
+                        "char_raw": orig_len,
+                        "char_refactored": ref_len,
+                        "length_ratio": ratio,
+                        "findings": findings,
+                        "search_matches": search_res,
+                    }
+                )
+        elif findings:
+            items.append(
+                {
+                    "chapter_num": int(r["chapter_num"]),
+                    "chapter_id": cid,
+                    "title": title,
+                    "char_raw": orig_len,
+                    "char_refactored": ref_len,
+                    "length_ratio": ratio,
+                    "findings": findings,
+                    "search_matches": search_res,
+                }
+            )
+
+    return {
+        "output_path": str(base),
+        "query": q_clean,
+        "summary": {
+            "audited_chapters": audited_chapters,
+            "flagged_chapters": flagged_chapters,
+            "forbidden_hits": forbidden_hits_count,
+            "old_name_hits": old_name_hits_count,
+            "length_anomalies": length_anomalies_count,
+            "stitch_warnings": stitch_warnings_count,
+            "search_matched_chapters": search_matched_chapters,
+            "search_total_matches": search_total_matches,
+        },
+        "items": items,
+    }
+
+
 @router.get("/api/chapters")
 async def list_chapters(output_path: str | None = Query(None)) -> dict[str, Any]:
     """O(1) 索引返回当前/指定输出目录的章节审阅与质检概览。"""
@@ -316,6 +636,23 @@ async def list_chapters(output_path: str | None = Query(None)) -> dict[str, Any]
         raise
     except Exception as e:
         raise raise_internal_error(e, "读取章节列表失败，详情请查看后端日志", "list_chapters")
+
+
+@router.get("/api/chapters/audit")
+async def audit_chapters(
+    output_path: str | None = Query(None),
+    q: str | None = Query(None, max_length=200),
+) -> dict[str, Any]:
+    """全书设定一致性（禁用设定/旧名残留）、极端篇幅压缩膨胀、缝合边界状态巡检与全文关键词检索。"""
+    base = await asyncio.to_thread(_resolve_output_dir, output_path)
+    try:
+        return await asyncio.to_thread(_audit_chapters_sync, base, q)
+    except ProgressUnreadable as e:
+        raise HTTPException(409, str(e)) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise raise_internal_error(e, "章节设定与检索巡检失败，详情请查看后端日志", "audit_chapters")
 
 
 @router.get("/api/chapters/{chapter_num}/diff")
