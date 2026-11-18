@@ -161,6 +161,17 @@ B4.1 ✅ 0bde150 | Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE
 > **批 6 收口（2026-11-18）**：补齐 60–300 章长篇书稿审校的跨章设定/改名/篇幅/缝合一致性巡检与全文秒级检索，工作台支持免鼠标全键盘流审校，且 `/api/status` 直接从 SQLite WAL 索引毫秒级捎带审校进度，前后端十道门禁全部一次通过。
 > 验证范围（批 6）：全量已跑（328 项 / 耗时 9.13s）
 
+### 批 7 —— 现代东方书卷与铅字工坊视觉体系焕新 + 宣纸/墨砚双主题令牌 + 衬线手稿审校体验
+
+| # | 改动 | DoD | 反向断言 |
+|---|---|---|---|
+| B7.1 ✅ 18d8343 | 重构 `src/styles/shared.css`、新增 `src/theme.ts` 并挂载 `src/main.ts`：建立昼境「宣纸昼光」（`--tf-bg: #f6f3ec`、青黛 `#264653`、朱砂印 `#b5493a`、青玉 `#2b6e53`）与夜境「墨砚夜读」（`[data-theme="dark"], html.dark`、`--tf-bg: #131417`、低眩光批注色）双套 CSS 自定义属性令牌体系，配置衬线手稿字体栈 `--tf-font-serif`、等宽数字 `tabular-nums`、毛玻璃弹窗动效与 `<kbd>` 键帽原语；`localStorage['tf-theme']` 持久化并向后兼容旧版 `textforge_prefs_v1.darkMode` | ① 首帧挂载前同步写入 `data-theme` 与 `.dark` 且零内联脚本（严守 Tauri CSP）；② `tf-theme` 显式读写与旧版配置回退经单测验证 | 移除 `shared.css` 令牌或主题同步逻辑 ⇒ `src/theme.test.ts` 变红 |
+| B7.2 ✅ 18d8343 | 焕新 `src/App.vue` 工坊顶栏与配置/进度双栏：顶栏新增朱砂「文炼」印记、五阶书卷工序胶囊步进条（`拆书 · 诊断 · 蓝图 · 重构缝合 · 成书`，由纯函数 `computePipelineSteps` 驱动）、青玉审校进度徽章及「`☀ 宣纸` / `☾ 墨砚`」主题切换；补齐此前遗漏的 `HistoryModal` 与 `VersionsModal` 显式组件导入；配置区升级分区导览、快捷预设胶囊与铅字票据式「预估本次」卡片 | ① `vue-tsc`、`eslint`、`prettier` 零告警；② 既有 SSE/503/对照接线守卫与新增 7 子组件导入守卫全绿 | 漏导入任一弹窗组件或退回旧版 `#2d3748` 硬编码 ⇒ `src/theme.test.ts` 源码守卫红 |
+| B7.3 ✅ 18d8343 | 焕新 `src/components/ChapterReviewWorkbench.vue` 与全部 6 个子组件（`GateModal.vue`、`HistoryModal.vue`、`VersionsModal.vue`、`QualityModal.vue`、`RunStats.vue`、`SettingsModal.vue`）：中栏升级为 15.5px / 1.88 行高衬线手稿纸张与青玉/赭红柔和句级批注，右栏新增篇幅健康比例条与 `<kbd>` 键帽速查卡，全量消除 `#fff`/`#f9fafb` 硬编码补丁 | ① `vitest` 6 文件 48 项全绿（0.25s）；② 后端零 `.py` 改动，`mypy` 53 文件零报错，`pytest` 契约与单测通过 | 移除 `--tf-font-serif` 或批注令牌 ⇒ `src/theme.test.ts` 与 `src/chapters.test.ts` 变红 |
+
+> **批 7 收口（2026-11-18）**：完成全站「现代东方书卷与铅字工坊」视觉升级与宣纸/墨砚双主题无缝贯通，同时修复 `App.vue` 漏导入 `HistoryModal`/`VersionsModal` 的隐性问题；前端四道门禁（`vue-tsc`、`eslint`、`prettier`、`vitest` 48 项 0.25s）全绿，后端零 `.py` 改动（`mypy` 53 文件全绿，本机受限沙箱下除 2 处系统 `_wmi`/`_ssl` DLL 限制外的 `pytest` 313 项 3.97s 全绿，合计实跑 361 项）。
+> 验证范围（批 7）：全量已跑（361 项 / 耗时 4.22s）
+
 ## 3. 本轮明确不做
 
 - **状态拆分 / 单写者队列**（R6+R7 的正解）：需要改 `progress_lock` 的所有权模型，属架构项，需拍板后单开一轮；本轮只落 B2.3 这种不动模型的半步。**重测条件**：若 `progress.json` 实际尺寸分布中位数 > 30 MB，或 `/api/status` p99 > 200 ms，必须启动。
