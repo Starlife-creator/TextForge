@@ -22,7 +22,12 @@ from core.quality import (
     MAX_PRE_STITCH_ISSUES,
 )
 from utils.tokens import estimate_tokens
-from utils.progress_io import ProgressUnreadable, merge_progress_write, save_progress_dict
+from utils.progress_io import (
+    ProgressUnreadable,
+    absorb_concurrent_review_fields,
+    merge_progress_write,
+    save_progress_dict,
+)
 
 logger = logging.getLogger("textforge")
 
@@ -47,13 +52,16 @@ REGEN_MAX_PER_CHAPTER = 3
 # —— 少了它，每次过验收门都会把 REGEN_MAX_PER_CHAPTER 保险丝清零，等于无限重写。
 # 流水线随后会把内存 progress 整份写回，不并回来就等于把刷新结果丢掉
 # （与当年 fix_list 静默失效同一个坑）。
-ACCEPT_ABSORB_KEYS = ('accepted_batches', 'batch_qc', 'pre_stitch_issues', 'regen_count')
+ACCEPT_ABSORB_KEYS = (
+    'accepted_batches', 'batch_qc', 'pre_stitch_issues', 'regen_count',
+    'chapter_reviews', 'chapter_qc_overrides',
+)
 
 class ChapterBreakMissingError(RetryableBusinessError):
     """v8.8 修正：继承 RetryableBusinessError，才能进入 call_with_retry 的重试路径。"""
     pass
 
-async def phase3_refactor_stitch(req, progress, progress_path, run_id):
+async def phase3_refactor_stitch(req, progress, progress_path, run_id, *, on_batch_ready=None):
     output_path = Path(req.output_path)
     recon_dir = output_path / "02_workspace/reconstructed"
     recon_dir.mkdir(parents=True, exist_ok=True)
@@ -185,6 +193,20 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
                 sse_emit("batch_done", {"batch_id": batch['batch_id'],
                                         "output_files": output_files,
                                         "qc_issues": len(batch_issues)}, run_id)
+                # 边跑边审：单批重构与内容质检落盘后立即同步到 ProjectDB 并推送 batch_stream_ready，
+                # 用户无需等全书批次跑完即可立即审阅/精修已完成章节。
+                try:
+                    if on_batch_ready is not None:
+                        await on_batch_ready(
+                            output_path, progress, batch, batch_issues, output_files, run_id
+                        )
+                    else:
+                        from routes.pipeline_runner import emit_batch_stream_ready
+                        await emit_batch_stream_ready(
+                            output_path, progress, batch, batch_issues, output_files, run_id
+                        )
+                except Exception as stream_err:
+                    logger.warning(f"[phase3] batch_stream_ready 同步警告（忽略）: {stream_err}")
                 # 逐章验收门：开启时每个批次重构稿产出后暂停，等待用户验收再继续
                 if gates.get("require_chapter_accept"):
                     await _wait_batch_accept(progress, progress_path, batch, output_path, run_id)
@@ -231,18 +253,23 @@ async def phase3_refactor_stitch(req, progress, progress_path, run_id):
     if gates.get("qc_block_export"):
         issues = _run_qc(output_path, progress)
         if issues:
+            # ADR-005：必须先 clear 闸门标志，再将 current_phase 落盘到 phase3_qc 并推送事件。
+            state.qc_confirm.clear()
             progress['qc_issues'] = issues
             progress['current_phase'] = 'phase3_qc'
             async with state.progress_lock:
+                absorb_concurrent_review_fields(progress, progress_path)
                 save_progress_dict(progress_path, progress)
             sse_emit("qc_failed", {"issues": issues}, run_id)
             await _wait_qc_confirm(progress, progress_path, run_id)
             progress['current_phase'] = 'phase3-1'
             async with state.progress_lock:
+                absorb_concurrent_review_fields(progress, progress_path)
                 save_progress_dict(progress_path, progress)
 
     progress['current_phase'] = 'phase4'
     async with state.progress_lock:
+        absorb_concurrent_review_fields(progress, progress_path)
         save_progress_dict(progress_path, progress)
 
 def _refresh_qc_after_regen(req, output_path, progress, chapter_id, new_text) -> list[dict]:
@@ -349,13 +376,26 @@ async def regen_single_chapter(req, output_path, chapter_id):
     committed: dict = {}
 
     def _commit_qc(disk: dict) -> None:
-        committed["fresh"] = _refresh_qc_after_regen(req, output_path, disk, chapter_id, new_text)
+        fresh_qc = _refresh_qc_after_regen(req, output_path, disk, chapter_id, new_text)
+        committed["fresh"] = fresh_qc
+        disk.setdefault("chapter_qc_overrides", {})[str(chapter_id)] = fresh_qc
+        disk.setdefault("chapter_reviews", {})[str(chapter_id)] = {"status": "pending"}
 
     try:
         async with state.progress_lock:
             await asyncio.to_thread(merge_progress_write, progress_path, _commit_qc)
+            from core.project_db import get_project_db
+            await asyncio.to_thread(
+                lambda: get_project_db(output_path).update_chapter_review(
+                    str(chapter_id),
+                    review_status="pending",
+                    qc_issues=committed.get("fresh") or [],
+                    char_refactored=len(new_text.strip()),
+                    status="ready_for_review",
+                )
+            )
         fresh = committed.get("fresh") or []
-    except (ProgressUnreadable, OSError) as e:
+    except (ProgressUnreadable, OSError, KeyError) as e:
         # 读不了磁盘现状就什么都不写：宁可这批 QC 结论晚一拍刷新，也不能用旧快照盖掉
         # 别人的进度（那正是 R4 的错法）。正文已经落盘，用户看到的是重写成功。
         logger.warning(f"[regen] progress.json 读不了，跳过 QC 回写（正文已更新）：{e}")
@@ -372,7 +412,8 @@ async def regen_single_chapter(req, output_path, chapter_id):
 
 async def _save_progress(progress, progress_path):
     async with state.progress_lock:
-        save_progress_dict(progress_path, progress)
+        await asyncio.to_thread(absorb_concurrent_review_fields, progress, progress_path)
+        await asyncio.to_thread(save_progress_dict, progress_path, progress)
 
 
 def _effective_concurrency(req, gates) -> int:
@@ -1175,8 +1216,8 @@ async def _wait_qc_confirm(progress, progress_path, run_id):
     `_qc_force` 由控制端点写盘，交给 wait_gate 统一并回内存：用户在闸门处按停止时
     也必须并（否则 run_pipeline 的 finally 会把整份内存写回，悄悄回退已确认的选择），
     并且停止不再等于「强制导出」。
+    注意：state.qc_confirm.clear() 已按 ADR-005 在写 phase3_qc 前完成，此处不再重复 clear。
     """
-    state.qc_confirm.clear()
     await state.wait_gate(
         state.qc_confirm, gate=state.GATE_QC,
         progress=progress, progress_path=progress_path, tick=1.0,

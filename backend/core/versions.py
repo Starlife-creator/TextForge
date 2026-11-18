@@ -110,6 +110,9 @@ def restore(output_path: Path, version_id: str) -> dict:
         raise ValueError("非法的版本号")
     if not src.is_dir():
         raise FileNotFoundError(f"版本不存在：{version_id}")
+    # 回滚前先对双引擎 .tfproj.db 执行 WAL TRUNCATE checkpoint 并关闭连接，保证目录状态一致无锁
+    from core.project_db import checkpoint_project_db
+    checkpoint_project_db(output_path)
     # 先快照当前成品，保证「恢复」这个动作本身可被回退
     cur_name = snapshot(output_path, novel_name="恢复前")
     final_dir = output_path / "03_final"

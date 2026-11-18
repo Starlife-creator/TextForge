@@ -7,7 +7,8 @@ from core.splitter import phase0_split, phase1_diagnose
 from core.pipeline import phase2_blueprint
 from core.refactor import phase3_refactor_stitch
 from core.finalize import phase4_finalize
-from utils.progress_io import save_progress_dict
+from core.project_db import checkpoint_project_db, get_project_db
+from utils.progress_io import absorb_concurrent_review_fields, save_progress_dict
 from utils.redact import redact, _mask_text, _strip_url_credentials
 from utils.version import VERSION
 from core.prompt_registry import PROMPT_VERSION, stage_versions, load_registry
@@ -57,7 +58,10 @@ async def run_pipeline(req, run_id: str):
         await phase2_blueprint(req, progress, progress_path, run_id)
         await check_pause(run_id)
 
-        await phase3_refactor_stitch(req, progress, progress_path, run_id)
+        await phase3_refactor_stitch(
+            req, progress, progress_path, run_id,
+            on_batch_ready=emit_batch_stream_ready,
+        )
         if state.stop_requested: raise asyncio.CancelledError()
 
         # phase4 含 docx 渲染与大量文件写盘，放入线程池避免阻塞事件循环（SSE/控制接口保持响应）
@@ -72,7 +76,9 @@ async def run_pipeline(req, run_id: str):
             progress["completed"] = True
             progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             async with state.progress_lock:
-                save_progress_dict(progress_path, progress)
+                await asyncio.to_thread(absorb_concurrent_review_fields, progress, progress_path)
+                await asyncio.to_thread(save_progress_dict, progress_path, progress)
+                await asyncio.to_thread(checkpoint_project_db, Path(req.output_path))
             logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
             # 记录历史必须在 done 事件之前，确保前端/测试拉取历史时已是完成态
             _history_record(progress_path, progress)
@@ -142,13 +148,86 @@ async def run_pipeline(req, run_id: str):
                 progress["pipeline_running"] = False
                 progress["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 async with state.progress_lock:
-                    save_progress_dict(progress_path, progress)
+                    await asyncio.to_thread(absorb_concurrent_review_fields, progress, progress_path)
+                    await asyncio.to_thread(save_progress_dict, progress_path, progress)
+                    await asyncio.to_thread(checkpoint_project_db, Path(req.output_path))
                 logger.info(f"[run_pipeline] 进度已落盘 finished_at={progress['finished_at']}")
                 # 完成态已在 try 块中记录历史；失败/中止态需要在此补记
                 if not progress.get("completed"):
                     _history_record(progress_path, progress)
             except Exception:
                 logger.exception("[run_pipeline] finally 写 progress.json 失败")
+        else:
+            try:
+                await asyncio.to_thread(checkpoint_project_db, Path(req.output_path))
+            except Exception:
+                pass
+
+
+def _sync_batch_ready_in_db(
+    output_path: Path,
+    progress: dict,
+    batch: dict,
+    batch_issues: list,
+    output_files: list,
+) -> list[dict]:
+    db = get_project_db(output_path)
+    if not db.db_path.is_file():
+        db.sync_from_progress(progress, progress_path=output_path / "progress.json")
+    raw_bid = batch.get("batch_id", 0)
+    try:
+        bid = int(raw_bid)
+    except (TypeError, ValueError):
+        bid = 0
+    return db.record_batch_ready(
+        bid,
+        list(batch.get("chapter_ids") or []),
+        qc_issues=batch_issues,
+        output_files=output_files,
+    )
+
+
+async def emit_batch_stream_ready(
+    output_path: Path,
+    progress: dict,
+    batch: dict,
+    batch_issues: list,
+    output_files: list,
+    run_id: str | None,
+) -> dict:
+    """Phase 3 单批重构与内容质检落盘后，立即标记章节 `ready_for_review` 并推送 `batch_stream_ready`。"""
+    ready_rows = await asyncio.to_thread(
+        _sync_batch_ready_in_db, output_path, progress, batch, batch_issues, output_files
+    )
+    batches = progress.get("batches") or []
+    total_batches = len(batches)
+    completed_batches = sum(1 for b in batches if b.get("status") == "phase3_done")
+    batch_index = next(
+        (i for i, b in enumerate(batches) if b.get("batch_id") == batch.get("batch_id")),
+        0,
+    )
+    payload = {
+        "batch_index": batch_index,
+        "batch_id": batch.get("batch_id"),
+        "chapters": [
+            {
+                "chapter_num": r["chapter_num"],
+                "chapter_id": r["chapter_id"],
+                "title": r["title"],
+                "status": r["status"],
+                "review_status": r["review_status"],
+                "qc_issues": r["qc_issues"],
+                "regen_count": r["regen_count"],
+                "char_raw": r["char_raw"],
+                "char_refactored": r["char_refactored"],
+            }
+            for r in ready_rows
+        ],
+        "completed_batches": completed_batches,
+        "total_batches": total_batches,
+    }
+    sse_emit("batch_stream_ready", payload, run_id)
+    return payload
 
 
 async def _heartbeat_loop(progress_path: Path, progress_ref: list | None = None, interval: float = 15.0):
@@ -364,31 +443,31 @@ async def wait_split_confirm(req, progress, progress_path, run_id):
     if not (getattr(req, "review_split", False) or det.get("needs_review")):
         return
 
-    def _push_preview():
-        chapters = [
-            {k: c.get(k) for k in ("id", "filename", "title", "is_empty", "is_virtual")}
-            for c in progress.get('chapters', [])
-        ]
-        # 先 clear 再推送：闸门必须先「上膛」再让用户看到弹窗，否则用户在
-        # SSE→HTTP 往返的几毫秒内点确认，动作会被紧随的 clear() 抹掉，流水线永久卡死。
-        state.split_confirm.clear()
-        state.split_redo.clear()
-        sse_emit("split_ready", {"chapters": chapters, "detection": det}, run_id)
-
+    # ADR-005：必须先 clear 闸门标志，再将 current_phase 落盘到闸门阶段并推送事件，
+    # 同时避免在重拆（R11）期间每轮循环重复 clear 抹掉刚到达的确认。
+    state.split_confirm.clear()
+    state.split_redo.clear()
     progress['current_phase'] = 'phase0_confirm'
     async with state.progress_lock:
         save_progress_dict(progress_path, progress)
+    sse_emit("split_ready", {
+        "chapters": [
+            {k: c.get(k) for k in ("id", "filename", "title", "is_empty", "is_virtual")}
+            for c in progress.get('chapters', [])
+        ],
+        "detection": det,
+    }, run_id)
     logger.info(f"[phase0] 拆书预览等待确认 run_id={run_id}（{det.get('reason') or det.get('mode')}）")
 
     while True:
-        _push_preview()
         await state.wait_gate(
             state.split_confirm, alternative=state.split_redo,
             gate=state.GATE_SPLIT, progress=progress, progress_path=progress_path,
             tick=0.5, release_events=(state.split_redo,))
         if state.split_confirm.is_set():
             break
-        # 用户要求按自定义标记重新拆分：原地重拆后重新预览（不退出本门）
+        # 用户要求按自定义标记重新拆分：先清 redo 标志再重拆，不碰 split_confirm（防 R11）
+        state.split_redo.clear()
         markers = list(state.split_redo_markers or [])
         req.chapter_markers = markers
         try:
@@ -418,11 +497,11 @@ async def wait_fix_review(req, progress, progress_path, run_id):
     if progress.get('refactor_mode') != 'fix_gaps':
         return
     gaps = _collect_diagnosed_gaps(req.diagnose_json)
+    # ADR-005：先 clear 闸门标志，再落盘 phase1_fixreview 与推送事件。
+    state.fix_review_confirm.clear()
     progress['current_phase'] = 'phase1_fixreview'
     async with state.progress_lock:
         save_progress_dict(progress_path, progress)
-    # 同 wait_split_confirm：先 clear 再推送，否则确认会被紧随的 clear() 抹掉。
-    state.fix_review_confirm.clear()
     sse_emit("fix_ready", {"gaps": gaps, "count": len(gaps)}, run_id)
     logger.info(f"[fix_review] 断层勾选等待确认（{len(gaps)} 项）run_id={run_id}")
     # 用户勾选的断层清单由控制端点写入 progress.json，由 wait_gate 统一并回内存

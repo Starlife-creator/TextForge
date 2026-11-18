@@ -17,6 +17,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
+from core.project_db import DB_ARTIFACT_NAMES, checkpoint_project_db
 from routes import state
 from utils.errors import raise_internal_error
 from utils.redact import redact
@@ -28,6 +29,8 @@ router = APIRouter()
 # TextForge 写出的产物（白名单）。清空时只删这些。
 ARTIFACTS = ("01_summaries", "02_workspace", "03_final", "_diagnostics",
              "_versions", "_backup", "Story_Bible.md", "progress.json")
+# 双引擎 SQLite WAL 索引文件（随 progress.json 同步生成，清理前先 checkpoint 关闭句柄）
+DB_ARTIFACTS = DB_ARTIFACT_NAMES
 # 带时间戳的临时/救急副本（versions.restore 产出，名字形如 `._restore_old_20261029_…`）：
 # 恢复失败时救急副本是用户旧成品的唯一副本，不能停进 `_versions/`（会被 _prune 当旧版本删），
 # 但也不能永远留在输出目录根上——「清空输出目录」负责收口。只按前缀匹配，不碰别的名字。
@@ -43,7 +46,7 @@ def _summarize(output_path: str) -> dict:
     info = {
         "exists": True,
         # 恢复失败留下的救急副本也要列出来：它是用户旧成品的唯一副本，界面必须看得见
-        "artifacts": [n for n in ARTIFACTS if (p / n).exists()] + sorted(
+        "artifacts": [n for n in (*ARTIFACTS, *DB_ARTIFACTS) if (p / n).exists()] + sorted(
             q.name for q in p.iterdir()
             if q.name.startswith(ARTIFACT_PREFIXES) and q.is_dir()),
         "resumable": False, "finished": False, "current_phase": None,
@@ -205,7 +208,11 @@ async def output_clear(payload: dict = Body(...)):
     # 正向证据：只有「明确像 TextForge 输出目录」才允许删。此前仅挡了根/主目录/桌面，
     # 指向 Documents 之类的任意目录时，仍会把碰巧同名的 03_final/_versions/_backup
     # 一并删掉。progress.json 与 02_workspace 是 TextForge 独有、几乎不会撞名的产物。
-    if not ((p / "progress.json").exists() or (p / "02_workspace").exists()):
+    if not (
+        (p / "progress.json").exists()
+        or (p / "02_workspace").exists()
+        or (p / ".tfproj.db").exists()
+    ):
         raise HTTPException(
             400, "该目录不像 TextForge 输出目录（缺少 progress.json / 02_workspace），拒绝清空")
 
@@ -216,10 +223,14 @@ async def output_clear(payload: dict = Body(...)):
 
 def _clear_artifacts(p: Path) -> tuple[list[str], list[str]]:
     """白名单逐个删除产物；目录 rmtree / 文件 unlink 属阻塞磁盘 I/O，由线程池执行。"""
+    # Windows 下必须先关闭 SQLite WAL 连接句柄再删除 .tfproj.db*，否则触发 WinError 32
+    checkpoint_project_db(p)
     removed: list[str] = []
     failed: list[str] = []
-    names = list(ARTIFACTS) + [q.name for q in p.iterdir()
-                               if q.name.startswith(ARTIFACT_PREFIXES) and q.is_dir()]
+    names = list(ARTIFACTS) + list(DB_ARTIFACTS) + [
+        q.name for q in p.iterdir()
+        if q.name.startswith(ARTIFACT_PREFIXES) and q.is_dir()
+    ]
     for name in names:
         target = p / name
         if not target.exists():

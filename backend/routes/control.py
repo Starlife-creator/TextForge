@@ -200,14 +200,18 @@ async def regen_chapter(payload: dict = Body(...)):
             progress = await asyncio.to_thread(load_progress_dict, progress_path)
         except (ProgressUnreadable, json.JSONDecodeError, OSError) as e:
             raise HTTPException(409, f"progress.json 无法读取: {e}")
-        if progress.get('current_phase') != 'phase3_accept':
-            raise HTTPException(409, f"当前阶段 {progress.get('current_phase')} 不允许重生成")
+        cur_phase = progress.get('current_phase')
+        if cur_phase not in ('phase3_accept', 'phase3-1', 'phase3_qc'):
+            raise HTTPException(409, f"当前阶段 {cur_phase} 不允许重生成")
         pend = progress.get('accept_pending_batch')
-        allowed = any(str(cid) == str(chapter_id)
-                      for b in progress.get('batches', []) if b.get('batch_id') == pend
-                      for cid in b.get('chapter_ids', []))
+        allowed = any(
+            str(cid) == str(chapter_id)
+            for b in progress.get('batches', [])
+            if b.get('batch_id') == pend or b.get('status') == 'phase3_done'
+            for cid in b.get('chapter_ids', [])
+        )
         if not allowed:
-            raise HTTPException(422, f"章节 {chapter_id} 不在当前待验收批次内")
+            raise HTTPException(422, f"章节 {chapter_id} 尚未完成重构或不在当前可重生成范围内")
         # #3 单章重生成次数熔断：达到上限拒绝再次驳回，避免重复计费。
         regen_count = progress.get('regen_count') or {}
         used = int(regen_count.get(str(chapter_id), 0) or 0)

@@ -8,6 +8,8 @@ import SettingsModal from './components/SettingsModal.vue';
 import GateModal from './components/GateModal.vue';
 import RunStats from './components/RunStats.vue';
 import QualityModal from './components/QualityModal.vue';
+import ChapterReviewWorkbench from './components/ChapterReviewWorkbench.vue';
+import { isReviewWorkbenchPhase } from './api/chapters';
 import { apiFetch, initAuth, postWithBusyRetry } from './api/client';
 import {
   DEFAULT_CONTEXT_WINDOW,
@@ -258,6 +260,18 @@ const batchStats = ref({ total: 0, phase1: 0, phase3: 0 });
 const chapterProgress = ref({ total: 0, done: 0 });
 const chapterRows = ref<{ id: string; label: string; status: string }[]>([]);
 const showChapterTree = ref(false);
+// 边跑边审三栏工作台状态：在 phase3 / phase3_accept / phase4 及已完成目录自动激活
+const rawPhase = ref('');
+const reviewRefreshTick = ref(0);
+const showReviewWorkbench = computed(
+  () =>
+    Boolean(port.value && outputPath.value) &&
+    isReviewWorkbenchPhase(
+      rawPhase.value || String(outInfo.value?.current_phase || ''),
+      Boolean(outInfo.value?.finished || currentPhase.value === '完成'),
+      chapterProgress.value.done,
+    ),
+);
 const topError = ref<string | null>(null);
 // 轮询已点亮的最后一条错误，用于避免同一错误被每个轮询周期重复点亮。
 let lastPolledError: string | null = null;
@@ -803,6 +817,7 @@ async function fetchStatus(): Promise<boolean> {
         done: s.reconstructed_chapters || 0,
       };
     if (Array.isArray(s.chapters_summary)) chapterRows.value = s.chapters_summary;
+    if (typeof s.current_phase === 'string') rawPhase.value = s.current_phase;
     if (pipelineRunning.value && s.current_phase)
       currentPhase.value = phaseLabel[s.current_phase] || s.current_phase;
     // 恢复时重新弹出蓝图确认（SSE 事件已错过）。已确认过就不要再弹：
@@ -880,6 +895,7 @@ function handleSSEEvent(event: string, payload: any) {
       runId.value = payload.run_id || runId.value;
       confirmedGates.value = new Set(); // 新一轮 run：清掉上一轮的闸门闩锁
       finalFiles.value = [];
+      rawPhase.value = 'phase0';
       currentPhase.value = payload.resumed ? '（断点恢复中）' : '启动';
       topTip.value = payload.resumed
         ? '检测到未完成的进度，将从断点继续（已完成的阶段/批次自动跳过）'
@@ -889,6 +905,9 @@ function handleSSEEvent(event: string, payload: any) {
       break;
     case 'phase_done':
       if (payload.phase === 'phase0') totalChapters.value = payload.total_chapters;
+      if (typeof payload.phase === 'string') {
+        rawPhase.value = payload.phase === 'phase2' ? 'phase3-1' : payload.phase;
+      }
       currentPhase.value = phaseLabel[payload.phase] || payload.phase;
       addLog(
         `阶段完成：${phaseLabel[payload.phase] || payload.phase}${payload.resumed_skip ? '（恢复跳过）' : ''}`,
@@ -896,6 +915,7 @@ function handleSSEEvent(event: string, payload: any) {
       );
       break;
     case 'batch_start':
+      rawPhase.value = 'phase3-1';
       if (streamRaf) {
         cancelAnimationFrame(streamRaf);
         streamRaf = 0;
@@ -905,7 +925,16 @@ function handleSSEEvent(event: string, payload: any) {
       addLog(`批次 ${payload.batch_id} 开始：章节 ${payload.chapter_ids?.join(',')}`, 'accent');
       break;
     case 'batch_done':
+      reviewRefreshTick.value++;
       addLog(`批次 ${payload.batch_id} 完成`, 'accent');
+      break;
+    case 'batch_stream_ready':
+      rawPhase.value = rawPhase.value || 'phase3-1';
+      reviewRefreshTick.value++;
+      addLog(
+        `边跑边审：批次 ${payload.batch_id ?? payload.batch_index} 已就绪（${payload.chapters?.length ?? 0} 章可立即审阅精修，进度 ${payload.completed_batches ?? 0}/${payload.total_batches ?? 0} 批）`,
+        'ok',
+      );
       break;
     case 'batch_split':
       // 批次因「上下文超限 / 分隔符契约失败」被自动对半拆分重跑。
@@ -948,6 +977,8 @@ function handleSSEEvent(event: string, payload: any) {
       break;
     case 'accept_ready':
       // 逐章验收门：本批重构稿已产出，等待验收
+      rawPhase.value = 'phase3_accept';
+      reviewRefreshTick.value++;
       acceptBatch.value = payload.batch_id;
       acceptChapters.value = payload.chapters || [];
       showAccept.value = true;
@@ -955,6 +986,8 @@ function handleSSEEvent(event: string, payload: any) {
       break;
     case 'qc_failed':
       // 质检拦截导出门：展示质检问题，供用户选择强制导出或停止
+      rawPhase.value = 'phase3_qc';
+      reviewRefreshTick.value++;
       qcIssues.value = payload.issues || [];
       showQcBlock.value = true;
       addLog(`质检未通过（${qcIssues.value.length} 项问题），请决定是否强制导出`, 'err');
@@ -991,7 +1024,9 @@ function handleSSEEvent(event: string, payload: any) {
       break;
     case 'done':
       pipelineRunning.value = false;
+      rawPhase.value = 'phase4';
       currentPhase.value = '完成';
+      reviewRefreshTick.value++;
       closeAllGates();
       stopStatusPolling(); // 空闲期不空转轮询；下次 startPipeline 会重新拉起
       // 不再断开 SSE：后端 /api/events 会「跟随」current_run_id，
@@ -1367,6 +1402,7 @@ async function regenChapter(c: any) {
     const d = await res.json().catch(() => null);
     if (res.ok) {
       c.preview = d?.preview || '';
+      reviewRefreshTick.value++;
       addLog(`章节 ${c.id} 已重写，请重新验收`, 'accent');
       // 后端读 progress.json 失败时不写旧快照（R12），代价是这次没记上次数。
       // 保险丝可能少算一次，必须如实说，不能让用户以为「随便重写不花钱」。
@@ -2179,6 +2215,20 @@ const canStart = computed(
           <div v-if="!eventLog.length" class="log-empty">暂无事件</div>
         </div>
       </section>
+
+      <!-- 三栏「边跑边审」流式章节审阅工作台 -->
+      <ChapterReviewWorkbench
+        v-if="showReviewWorkbench"
+        :port="port"
+        :output-path="outputPath"
+        :run-id="runId"
+        :pipeline-running="pipelineRunning"
+        :refresh-tick="reviewRefreshTick"
+        :regenerating-ids="regenerating"
+        @regen="regenChapter"
+        @log="(msg, lvl) => addLog(msg, lvl)"
+        @error="(msg) => (topError = msg)"
+      />
     </main>
 
     <!-- 拆书确认弹窗 -->
@@ -2447,7 +2497,7 @@ const canStart = computed(
   grid-template-columns: 1fr 1fr;
   gap: 16px;
   padding: 16px;
-  overflow: hidden;
+  overflow-y: auto;
 }
 .panel {
   background: #fff;

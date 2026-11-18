@@ -38,6 +38,7 @@ from routes.status import router as status_router
 from routes.system import router as system_router
 from routes.output import router as output_router
 from routes.history import router as history_router
+from routes.chapters import router as chapters_router
 
 app = FastAPI(title="TextForge", version=VERSION, lifespan=lifespan)
 
@@ -63,3 +64,4 @@ app.include_router(status_router)
 app.include_router(system_router)
 app.include_router(output_router)
 app.include_router(history_router)
+app.include_router(chapters_router)

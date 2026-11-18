@@ -32,10 +32,23 @@ class ProgressUnreadable(RuntimeError):
     """progress.json 存在但无法解析/读取。"""
 
 
+def _sync_project_db_safely(progress_path: Path, data: dict) -> None:
+    """将 `progress.json` 镜像同步到同目录 `.tfproj.db`（非 `progress.json` 文件跳过）。"""
+    p = Path(progress_path)
+    if p.name != "progress.json":
+        return
+    try:
+        from core.project_db import get_project_db
+        get_project_db(p.parent).sync_from_progress(data, progress_path=p)
+    except Exception as e:
+        logger.warning(f"[progress_io] .tfproj.db 同步失败（progress.json 已完好）: {e}")
+
+
 def read_progress(path: Path) -> dict:
     """读取 progress.json；失败抛 ProgressUnreadable（绝不返回空 dict 糊弄）。"""
+    p = Path(path)
     try:
-        raw = Path(path).read_text(encoding="utf-8-sig")
+        raw = p.read_text(encoding="utf-8-sig")
     except OSError as e:
         raise ProgressUnreadable(f"progress.json 无法读取：{e}") from e
     try:
@@ -46,6 +59,8 @@ def read_progress(path: Path) -> dict:
             f"为避免覆盖你的进度，程序不会自动重建；请修复该文件或改用新的输出目录。") from e
     if not isinstance(data, dict):
         raise ProgressUnreadable("progress.json 顶层结构不是对象，无法解析为进度")
+    if p.name == "progress.json" and not (p.parent / ".tfproj.db").is_file():
+        _sync_project_db_safely(p, data)
     return data
 
 
@@ -89,7 +104,7 @@ def load_progress_dict(path: Path) -> dict:
 
 
 def save_progress_dict(path: Path, data: dict) -> None:
-    """progress.json 的唯一写入口：紧凑排版 + 仍然 fsync（B2.3）。
+    """progress.json 的唯一写入口：紧凑排版 + 仍然 fsync（B2.3），并同步 `.tfproj.db`。
 
     这份文件是机器状态（缝合锚点内嵌全文时可达数十 MB），indent=2 让字节数与写盘量
     翻倍以上，而没有任何人类依赖它的可读性（文档把它当状态、测试一律 json.loads）。
@@ -98,9 +113,11 @@ def save_progress_dict(path: Path, data: dict) -> None:
     写后剔除该路径的缓存条目：write 由 progress_lock 串行化，但读侧缓存若按旧
     mtime/size 命中，会在同一秒快速连写时返回上一版内容。
     """
-    atomic_write_json(Path(path), data, pretty=False, sync=True)
+    p = Path(path)
+    atomic_write_json(p, data, pretty=False, sync=True)
     with _CACHE_LOCK:
-        _progress_cache.pop(Path(path), None)
+        _progress_cache.pop(p, None)
+    _sync_project_db_safely(p, data)
 
 
 def merge_progress_write(path: Path, mutate) -> dict:
@@ -118,6 +135,72 @@ def merge_progress_write(path: Path, mutate) -> dict:
     mutate(disk)
     save_progress_dict(path, disk)
     return disk
+
+
+def absorb_concurrent_review_fields(mem_progress: dict, progress_path: Path) -> None:
+    """将「边跑边审」或单章重写并发写到磁盘的审阅态/质检覆盖并回流水线内存 progress。
+
+    调用方须已持有 `state.progress_lock`；磁盘文件尚不存在或损坏时静默跳过，不阻断主路径。
+    """
+    p = Path(progress_path)
+    if not p.is_file() or not isinstance(mem_progress, dict):
+        return
+    try:
+        disk = read_progress(p)
+    except Exception:
+        return
+
+    disk_reviews = disk.get("chapter_reviews")
+    if isinstance(disk_reviews, dict) and disk_reviews:
+        mem_reviews = mem_progress.setdefault("chapter_reviews", {})
+        if isinstance(mem_reviews, dict):
+            for cid, val in disk_reviews.items():
+                mem_reviews[cid] = copy.deepcopy(val)
+
+    disk_rc = disk.get("regen_count")
+    if isinstance(disk_rc, dict) and disk_rc:
+        mem_rc = mem_progress.setdefault("regen_count", {})
+        if isinstance(mem_rc, dict):
+            for cid, cnt in disk_rc.items():
+                try:
+                    mem_rc[cid] = max(int(mem_rc.get(cid, 0) or 0), int(cnt or 0))
+                except (TypeError, ValueError):
+                    pass
+
+    disk_overrides = disk.get("chapter_qc_overrides")
+    if isinstance(disk_overrides, dict) and disk_overrides:
+        mem_overrides = mem_progress.setdefault("chapter_qc_overrides", {})
+        if isinstance(mem_overrides, dict):
+            for cid, issues in disk_overrides.items():
+                if isinstance(issues, list):
+                    mem_overrides[str(cid)] = copy.deepcopy(issues)
+
+        qc = mem_progress.get("batch_qc")
+        if isinstance(qc, dict):
+            for b in mem_progress.get("batches") or []:
+                if not isinstance(b, dict):
+                    continue
+                bid = str(b.get("batch_id"))
+                if bid not in qc:
+                    continue
+                b_cids = {str(x) for x in (b.get("chapter_ids") or [])}
+                touched = b_cids & set(str(k) for k in disk_overrides.keys())
+                if not touched:
+                    continue
+                kept = [
+                    i for i in (qc.get(bid) or [])
+                    if isinstance(i, dict) and str(i.get("chapter_id")) not in touched
+                ]
+                added: list[dict] = []
+                for t_cid in sorted(touched):
+                    ov = disk_overrides.get(t_cid)
+                    if isinstance(ov, list):
+                        added.extend(x for x in ov if isinstance(x, dict))
+                qc[bid] = (kept + added)[:50]
+            mem_progress["pre_stitch_issues"] = [
+                i for issues in qc.values() for i in (issues or [])
+                if isinstance(i, dict) and i.get("severity") == "bad"
+            ][:200]
 
 
 _CACHE_LOCK = threading.Lock()
@@ -161,11 +244,16 @@ def read_progress_cached(path: Path) -> dict:
 
 
 def clear_progress_cache() -> None:
-    """测试辅助：清空状态缓存。"""
+    """测试辅助：清空状态缓存并释放 `.tfproj.db` 连接池。"""
     global _cache_bytes
     with _CACHE_LOCK:
         _progress_cache.clear()
         _cache_bytes = 0
+    try:
+        from core.project_db import close_all_project_dbs
+        close_all_project_dbs()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
