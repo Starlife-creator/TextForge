@@ -2,9 +2,6 @@
 /**
  * 任务历史弹窗（跨会话）。
  *
- * 从 App.vue 拆出：那里原本有 2000+ 行，所有功能挤在一个组件里，改任何一处
- * 都要在整份文件里定位，也无法为单个功能单独测试。
- *
  * 职责边界：本组件只负责**展示与筛选**；会改动主界面配置的「载入」以及
  * 会调后端的「移除 / 清空」一律 emit 给 App.vue 处理，避免状态双向纠缠。
  */
@@ -47,13 +44,17 @@ const view = computed(() => {
   } else {
     // 进度低的排前面：它们才是用户回来要续跑的
     list = [...list].sort((a, b) => {
-      const pa = a.batches_total ? (a.batches_done || 0) / a.batches_total : a.finished ? 1 : 0;
-      const pb = b.batches_total ? (b.batches_done || 0) / b.batches_total : b.finished ? 1 : 0;
+      const pa = a.batches_total ? (a.batches_done || 0) / a.batches_total : hDone(a);
+      const pb = b.batches_total ? (b.batches_done || 0) / b.batches_total : hDone(b);
       return pa - pb || byUpdated(a, b);
     });
   }
   return list;
 });
+
+function hDone(item: HistoryItem): number {
+  return item.finished ? 1 : 0;
+}
 
 function state(h: HistoryItem): { text: string; cls: string } {
   if (h.running) return { text: '运行中', cls: 'badge running' };
@@ -61,7 +62,7 @@ function state(h: HistoryItem): { text: string; cls: string } {
   if (h.last_error) return { text: '出错中断', cls: 'badge err2' };
   if (h.current_phase && h.current_phase !== 'phase0')
     return { text: '未完成·可续跑', cls: 'badge paused' };
-  return { text: '未开始', cls: '' };
+  return { text: '未开始', cls: 'badge' };
 }
 
 /** 批次进度百分比（无批次信息时按完成与否给 0/100） */
@@ -100,22 +101,25 @@ onUnmounted(() => window.removeEventListener('keydown', onKey));
   <div class="modal-mask" @click.self="emit('close')">
     <div
       ref="root"
-      class="modal"
+      class="modal hist-modal"
       role="dialog"
       aria-modal="true"
       aria-label="任务历史"
       tabindex="-1"
     >
-      <h3>任务历史</h3>
+      <div class="hist-modal-head">
+        <h3>书稿编修历史</h3>
+        <span class="badge">{{ items.length }} 卷记录</span>
+      </div>
       <p class="hint">
-        记录你跑过的每一本书：跑到哪一阶段、上次为什么停的都在这里。点「载入」填回配置，再点开始即可断点续跑。
+        记录你跑过的每一部书稿：当前工序、批次进度与中断原因。点「载入」填回主面板配置，确认后即可断点续跑。
       </p>
       <div class="hist-toolbar">
         <input
           :value="query"
           type="search"
           aria-label="搜索任务"
-          placeholder="搜索书名或路径…"
+          placeholder="搜索书名或目录路径…"
           @input="emit('update:query', ($event.target as HTMLInputElement).value)"
         />
         <select
@@ -127,19 +131,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKey));
           <option value="progress">进度（未完成优先）</option>
           <option value="name">书名</option>
         </select>
-        <button class="ghost" :disabled="busy" @click="emit('refresh')">
-          {{ busy ? '刷新中…' : '刷新' }}
+        <button type="button" class="ghost" :disabled="busy" @click="emit('refresh')">
+          {{ busy ? '刷新中…' : '↻ 刷新' }}
         </button>
       </div>
       <div v-if="!view.length" class="log-empty">
-        {{ items.length ? '没有匹配的任务' : '还没有历史任务' }}
+        {{ items.length ? '没有匹配的书稿任务' : '尚无历史书稿记录' }}
       </div>
       <div class="sum-list">
         <div v-for="h in view" :key="h.output_path" class="split-row hist-row">
           <div class="hist-main">
             <div class="hist-title">
-              {{ h.novel_name || '（未命名）' }}
-              <span class="badge" :class="state(h).cls">{{ state(h).text }}</span>
+              <span class="hist-book">{{ h.novel_name || '（未命名书稿）' }}</span>
+              <span :class="state(h).cls">{{ state(h).text }}</span>
               <span v-if="h.is_current" class="badge paused">当前目录</span>
               <span class="hist-ago">{{ ago(h.updated_at) }}</span>
             </div>
@@ -150,7 +154,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey));
                 :class="{ done: h.finished, bad: !!h.last_error }"
               ></div>
             </div>
-            <div class="hint">
+            <div class="hint tabular">
               {{ h.total_chapters || 0 }} 章 · 批次 {{ h.batches_done || 0 }}/{{
                 h.batches_total || 0
               }}
@@ -163,16 +167,46 @@ onUnmounted(() => window.removeEventListener('keydown', onKey));
             </div>
           </div>
           <div class="hist-actions">
-            <button class="open-btn" @click="emit('load', h)">载入</button>
-            <button class="open-btn ghost" @click="emit('forget', h)">移除</button>
+            <button type="button" class="btn-primary hist-load-btn" @click="emit('load', h)">
+              载入
+            </button>
+            <button type="button" class="open-btn ghost" @click="emit('forget', h)">移除</button>
           </div>
         </div>
       </div>
       <div class="modal-actions">
-        <button v-if="items.length" class="ghost" @click="emit('clear')">清空历史记录</button>
+        <button v-if="items.length" type="button" class="ghost" @click="emit('clear')">
+          清空历史记录
+        </button>
         <span></span>
         <button type="button" @click="emit('close')">关闭</button>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.hist-modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding-bottom: 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--tf-border);
+}
+
+.hist-modal-head h3 {
+  margin: 0;
+  font-family: var(--tf-font-serif);
+}
+
+.hist-book {
+  font-family: var(--tf-font-serif);
+}
+
+.hist-load-btn {
+  padding: 5px 14px;
+  font-size: 12.5px;
+}
+</style>

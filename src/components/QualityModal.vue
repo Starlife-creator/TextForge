@@ -1,6 +1,6 @@
 <script setup lang="ts">
 /**
- * 成品质量报告弹窗。
+ * 成品质量报告弹窗（现代东方书卷工坊视觉体系）。
  *
  * 只展示后端已经算好的事实：状态、计数、问题清单、异常章节、跨章重复。
  * 不在这里做任何质量推断，也不把「通过」说成「写得好」—— 自动检查覆盖不到文风。
@@ -82,31 +82,36 @@ function rowStatus(row: QualityChapterRow): string {
       aria-label="成品质量报告"
       tabindex="-1"
     >
-      <h3>成品质量报告</h3>
+      <div class="q-top">
+        <h3>成品结构质检报告</h3>
+        <button type="button" class="q-close-x" aria-label="关闭质量报告" @click="emit('close')">
+          ×
+        </button>
+      </div>
 
-      <div v-if="busy" class="log-empty">读取中…</div>
+      <div v-if="busy" class="log-empty">正在读取质检报告…</div>
       <div v-else-if="!report" class="log-empty">{{ error || '尚无质量报告' }}</div>
 
       <template v-else>
         <p class="q-headline">
           <span :class="statusClass">{{ statusText }}</span>
           <span class="q-headline-text">{{ report.headline }}</span>
-          <span class="hint">{{ report.generated_at }}</span>
+          <span class="hint mono">{{ report.generated_at }}</span>
         </p>
 
         <div class="q-summary">
           <div class="q-stat">
             <span class="q-k">章节</span>
             <b>{{ fmt(report.summary.chapters_reconstructed) }}</b>
-            <span class="hint"
-              >/ {{ fmt(report.summary.chapters) }}（空章跳过
-              {{ fmt(report.summary.chapters_skipped_empty) }}）</span
-            >
+            <span class="hint tabular">
+              / {{ fmt(report.summary.chapters) }}（空章跳过
+              {{ fmt(report.summary.chapters_skipped_empty) }}）
+            </span>
           </div>
           <div class="q-stat">
             <span class="q-k">总字数</span>
             <b>{{ fmt(report.summary.total_reconstructed_chars) }}</b>
-            <span class="hint">
+            <span class="hint tabular">
               原文 {{ fmt(report.summary.total_original_chars) }} · 比例
               {{ ratioText(report.summary.length_ratio) }}
             </span>
@@ -178,7 +183,7 @@ function rowStatus(row: QualityChapterRow): string {
           <div class="sum-list">
             <div v-for="(d, i) in report.duplicates" :key="i" class="split-row q-dup">
               <span>第 {{ d.a }} 章 ↔ 第 {{ d.b }} 章</span>
-              <span class="hint">
+              <span class="hint tabular">
                 共享 {{ d.shared_shingles }} 处 60 字片段 · 占较短章
                 {{ (d.containment * 100).toFixed(1) }}%
               </span>
@@ -188,7 +193,7 @@ function rowStatus(row: QualityChapterRow): string {
 
         <template v-if="report.stitch && report.stitch.applied_patches">
           <h4 class="q-h4">缝合改动观测</h4>
-          <p class="hint">
+          <p class="hint tabular">
             已应用补丁 {{ fmt(report.stitch.applied_patches) }} 个，覆盖
             {{ fmt(report.stitch.exposed_chars) }} 字；其中可测量
             {{ fmt(report.stitch.measured) }} 个 —— 平均改动率
@@ -201,7 +206,7 @@ function rowStatus(row: QualityChapterRow): string {
           <div v-if="report.stitch.worst.length" class="sum-list">
             <div v-for="(w, i) in report.stitch.worst" :key="i" class="split-row q-dup">
               <span class="mono q-title">{{ w.file }}</span>
-              <span class="hint">
+              <span class="hint tabular">
                 {{ w.source === 'virtual_stitch' ? '虚拟章边界' : '批次边界' }} · 覆盖
                 {{ fmt(w.chars) }} 字 · 改动 {{ pct(w.change_rate) }}
               </span>
@@ -211,7 +216,7 @@ function rowStatus(row: QualityChapterRow): string {
 
         <div class="q-h4-row">
           <h4 class="q-h4">章节明细</h4>
-          <button class="min-btn" @click="showAll = !showAll">
+          <button type="button" class="q-toggle-btn" @click="showAll = !showAll">
             {{ showAll ? '只看异常章节' : `显示全部 ${report.chapters.length} 章` }}
           </button>
         </div>
@@ -235,9 +240,9 @@ function rowStatus(row: QualityChapterRow): string {
               <tr v-for="row in visibleChapters" :key="row.id">
                 <td class="mono">{{ row.id }}</td>
                 <td class="q-title">{{ row.title }}</td>
-                <td>{{ fmt(row.original_chars) }}</td>
-                <td>{{ fmt(row.reconstructed_chars) }}</td>
-                <td>{{ ratioText(row.ratio) }}</td>
+                <td class="mono">{{ fmt(row.original_chars) }}</td>
+                <td class="mono">{{ fmt(row.reconstructed_chars) }}</td>
+                <td class="mono">{{ ratioText(row.ratio) }}</td>
                 <td>
                   <span :class="rowBadge(row)">{{ rowStatus(row) }}</span>
                 </td>
@@ -248,7 +253,7 @@ function rowStatus(row: QualityChapterRow): string {
         </div>
 
         <p class="hint q-caveat">{{ report.caveat }}</p>
-        <p class="hint q-config">
+        <p class="hint q-config mono">
           {{ report.config.model || '未知模型' }} · {{ report.config.refactor_mode || '-' }} ·
           提示词
           {{ report.config.prompt_version || '-' }}
@@ -267,109 +272,193 @@ function rowStatus(row: QualityChapterRow): string {
 .q-modal {
   width: min(1040px, 94vw);
 }
+
+.q-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 10px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--tf-border);
+}
+
+.q-top h3 {
+  margin: 0;
+  font-family: var(--tf-font-serif);
+}
+
+.q-close-x {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--tf-radius-xs);
+  color: var(--tf-ink-muted);
+  font-size: 20px;
+  line-height: 1;
+  width: 28px;
+  height: 28px;
+  cursor: pointer;
+}
+
+.q-close-x:hover {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
+}
+
 .q-headline {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-  margin: 8px 0 12px;
+  margin: 8px 0 14px;
 }
+
 .q-headline-text {
   font-size: 14px;
+  font-weight: 500;
+  color: var(--tf-ink);
 }
+
 .q-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 8px;
+  gap: 10px;
 }
+
 .q-stat {
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  padding: 8px 10px;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  padding: 10px 12px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
 }
+
 .q-stat b {
   font-size: 18px;
+  font-family: var(--tf-font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--tf-ink);
 }
+
 .q-k {
-  color: #6b7280;
+  color: var(--tf-ink-muted);
   font-size: 12px;
 }
+
 .q-h4 {
-  margin: 18px 0 4px;
+  margin: 20px 0 6px;
   font-size: 14px;
+  font-weight: 600;
+  color: var(--tf-ink);
 }
+
 .q-h4-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
 }
+
+.q-toggle-btn {
+  padding: 4px 12px;
+  border-radius: var(--tf-radius-sm);
+  border: 1px solid var(--tf-border-strong);
+  background: var(--tf-surface-2);
+  color: var(--tf-ink-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.q-toggle-btn:hover {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
+}
+
 .q-issue {
   display: flex;
   justify-content: space-between;
   gap: 10px;
 }
+
 .q-issue-main {
   min-width: 0;
 }
+
 .q-issue-msg {
   margin-left: 6px;
   font-size: 13px;
+  color: var(--tf-ink);
 }
+
 .q-evidence {
   margin-top: 4px;
   font-size: 11px;
-  color: #6b7280;
+  color: var(--tf-ink-muted);
   word-break: break-all;
 }
+
 .q-dup {
   display: flex;
   justify-content: space-between;
   gap: 10px;
   font-size: 13px;
 }
+
 .q-table-wrap {
   max-height: 320px;
   overflow: auto;
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-surface-elevated);
 }
+
 .q-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
+
 .q-table th,
 .q-table td {
-  padding: 6px 8px;
-  border-bottom: 1px solid #f3f4f6;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--tf-border);
   text-align: left;
   white-space: nowrap;
 }
+
+.q-table tbody tr:hover {
+  background: var(--tf-surface-hover);
+}
+
 .q-table th {
   position: sticky;
   top: 0;
-  background: #f9fafb;
-  color: #6b7280;
+  background: var(--tf-surface-2);
+  color: var(--tf-ink-secondary);
   font-weight: 600;
+  z-index: 1;
 }
+
 .q-title {
   max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-family: var(--tf-font-serif);
 }
+
 .q-codes {
   max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
-  color: #6b7280;
+  color: var(--tf-ink-muted);
 }
+
 .q-caveat {
   margin-top: 14px;
 }
+
 .q-config {
   margin-top: 2px;
 }

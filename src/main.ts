@@ -1,8 +1,11 @@
 import { createApp } from 'vue';
 import App from './App.vue';
-// 弹窗/列表的共用样式必须全局引入：App.vue 的 <style scoped> 不会作用到
-// 子组件内部元素，拆出的历史、版本等弹窗会因此完全丢失样式。
+import { applyThemeToRoot, resolveInitialTheme } from './theme';
+// 弹窗/列表与工坊设计令牌全局引入：App.vue 的 <style scoped> 不会作用到子组件内部元素。
 import './styles/shared.css';
+
+// 首帧挂载前同步套用「宣纸 / 墨砚」主题，避免深色用户启动闪白，同时严守 Tauri CSP（无内联脚本）。
+applyThemeToRoot(resolveInitialTheme(typeof localStorage !== 'undefined' ? localStorage : null));
 
 const app = createApp(App);
 

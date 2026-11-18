@@ -1,14 +1,11 @@
 <script setup lang="ts">
 /**
- * 人工闸门弹窗的展示层外壳。
+ * 人工闸门弹窗的展示层外壳（现代东方书卷工坊视觉体系）。
  *
  * 拆书确认、断层勾选、逐章验收、质检拦截、蓝图确认这五个弹窗共用同一套
- * 「遮罩 + 容器 + 标题 + 底部按钮条」结构，之前各写一遍。抽出来后：
- *   - 外壳样式只有这一处定义，改主题不会漏改；
- *   - 各弹窗只关心自己的内容与按钮。
+ * 「毛玻璃遮罩 + 宣纸/墨砚卷匣 + 朱砂印标题栏 + 底部操作条」结构。
  *
  * 注意遮罩点击关闭**默认关闭**：闸门弹窗要求显式选择，确认/拒绝不能靠误点遮罩。
- * 需要时可开 maskClose。
  */
 import { onMounted, ref } from 'vue';
 
@@ -32,18 +29,64 @@ onMounted(() => root.value?.focus());
   <div class="modal-mask" @click.self="maskClose && emit('close')">
     <div
       ref="root"
-      class="modal"
+      class="modal gate-modal"
       :class="{ 'modal-wide': wide }"
       role="dialog"
       aria-modal="true"
       :aria-label="title"
       tabindex="-1"
     >
-      <h3>{{ title }}</h3>
-      <slot />
+      <div class="gate-head">
+        <span class="gate-seal" aria-hidden="true">审</span>
+        <h3>{{ title }}</h3>
+      </div>
+      <div class="gate-body">
+        <slot />
+      </div>
       <div v-if="$slots.actions" class="modal-actions">
         <slot name="actions" />
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.gate-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--tf-border);
+}
+
+.gate-head h3 {
+  margin: 0;
+  font-family: var(--tf-font-serif);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.gate-seal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--tf-radius-xs);
+  background: var(--tf-accent-soft);
+  border: 1px solid var(--tf-accent-border);
+  color: var(--tf-accent);
+  font-family: var(--tf-font-serif);
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.gate-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+</style>

@@ -124,6 +124,18 @@ const activeRegenerating = computed(() => {
   return cid ? props.regeneratingIds.has(String(cid)) : false;
 });
 
+const lengthRatioWidth = computed(() => {
+  const r = currentDiff.value?.stats.length_ratio;
+  if (r == null || !Number.isFinite(r) || r <= 0) return '0%';
+  return `${Math.min(100, Math.round((r / 1.5) * 100))}%`;
+});
+
+const lengthRatioHealthy = computed(() => {
+  const r = currentDiff.value?.stats.length_ratio;
+  if (r == null || !Number.isFinite(r)) return true;
+  return r >= 0.6 && r <= 1.45;
+});
+
 function fmtDelta(delta: number): string {
   if (delta > 0) return `+${delta.toLocaleString('zh-CN')}`;
   return delta.toLocaleString('zh-CN');
@@ -455,14 +467,15 @@ watch(
   <section class="panel wb-panel" aria-label="边跑边审章节工作台">
     <div class="wb-header">
       <div class="wb-title-group">
-        <h2>边跑边审 · 章节对照与精修工作台</h2>
-        <span class="wb-live-badge">
+        <span class="wb-seal" aria-hidden="true">校</span>
+        <h2>边跑边审 · 书卷对照与精修案台</h2>
+        <span class="wb-live-badge tabular">
           边跑边审：已完成 {{ readyCount }}/{{ totalChapters }} 章
         </span>
-        <span v-if="approvedCount + editedCount > 0" class="wb-sub-badge ok">
+        <span v-if="approvedCount + editedCount > 0" class="wb-sub-badge ok tabular">
           已审定 {{ approvedCount + editedCount }} 章
         </span>
-        <span v-if="flaggedCount > 0" class="wb-sub-badge warn">
+        <span v-if="flaggedCount > 0" class="wb-sub-badge warn tabular">
           质检提示 {{ flaggedCount }} 章
         </span>
       </div>
@@ -500,13 +513,25 @@ watch(
       <!-- 左栏：全书检索/设定一致性巡检 + 可筛选章节树 -->
       <aside class="wb-col wb-left">
         <div class="wb-search-bar" aria-label="全书正文检索 / 设定一致性巡检">
-          <input
-            v-model="searchQuery"
-            type="search"
-            class="wb-search-input"
-            placeholder="全书检索人名/词条（回车）…"
-            @keydown.enter.prevent="runAuditOrSearch()"
-          />
+          <div class="wb-search-field">
+            <span class="wb-search-icon" aria-hidden="true">⌕</span>
+            <input
+              v-model="searchQuery"
+              type="search"
+              class="wb-search-input"
+              placeholder="检索人名 / 词条（回车）…"
+              @keydown.enter.prevent="runAuditOrSearch()"
+            />
+            <button
+              v-if="searchQuery || activeSearchQuery || filterTab === 'audit'"
+              type="button"
+              class="wb-search-clear"
+              title="清除检索与巡检筛选"
+              @click="clearSearchAndAuditFilter"
+            >
+              ×
+            </button>
+          </div>
           <button
             type="button"
             class="wb-search-btn"
@@ -515,18 +540,9 @@ watch(
           >
             检索
           </button>
-          <button
-            v-if="activeSearchQuery || filterTab === 'audit'"
-            type="button"
-            class="wb-search-btn clear"
-            title="清除检索与巡检筛选"
-            @click="clearSearchAndAuditFilter"
-          >
-            ×
-          </button>
         </div>
 
-        <div v-if="auditSummary" class="wb-audit-strip">
+        <div v-if="auditSummary" class="wb-audit-strip tabular">
           <template v-if="activeSearchQuery">
             检索「{{ activeSearchQuery }}」：命中 {{ auditSummary.search_matched_chapters }} 章 ·
             {{ auditSummary.search_total_matches }} 处
@@ -578,7 +594,7 @@ watch(
             </div>
             <div class="wb-ch-meta">
               <span :class="reviewBadgeClass(ch)">{{ reviewBadgeText(ch) }}</span>
-              <span v-if="ch.char_refactored > 0" class="wb-chars">
+              <span v-if="ch.char_refactored > 0" class="wb-chars tabular">
                 {{ ch.char_raw }} → {{ ch.char_refactored }} 字
               </span>
             </div>
@@ -598,84 +614,97 @@ watch(
         </div>
       </aside>
 
-      <!-- 中栏：句级 Diff / 双栏并排 / 内联精修编辑 -->
+      <!-- 中栏：书卷手稿纸张（句级 Diff / 双栏并排 / 内联精修编辑） -->
       <div class="wb-col wb-center">
         <div class="wb-mode-bar">
           <div class="wb-modes">
             <button
-              v-for="m in CENTER_MODES"
+              v-for="(m, mIdx) in CENTER_MODES"
               :key="m.key"
               type="button"
               class="wb-mode-btn"
               :class="{ active: centerMode === m.key }"
               @click="centerMode = m.key"
             >
+              <kbd class="wb-mode-key">{{ mIdx + 1 }}</kbd>
               {{ m.label }}
             </button>
           </div>
           <span v-if="localNotice" class="wb-notice">{{ localNotice }}</span>
         </div>
 
-        <div v-if="loadingDiff" class="wb-empty wb-center-empty">正在加载章节对照…</div>
+        <div v-if="loadingDiff" class="wb-empty wb-center-empty">正在展卷加载章节对照…</div>
         <div v-else-if="!currentDiff" class="wb-empty wb-center-empty">
-          请从左侧选择一章查看句级对照或内联精修
+          请从左侧书目选择一章，展开句级批注或内联精修
         </div>
         <div
           v-else-if="!currentDiff.refactored_text && centerMode !== 'edit'"
-          class="wb-empty wb-center-empty"
+          class="wb-empty wb-center-empty tabular"
         >
           本章尚未完成重构，正在等待流水线批次产出（原文共
           {{ currentDiff.stats.char_original }} 字）
         </div>
 
-        <!-- 模式 1：句级对照 Diff -->
+        <!-- 模式 1：句级对照 Diff（书卷批注模式） -->
         <div v-else-if="centerMode === 'diff'" class="wb-diff-scroll">
-          <div
-            v-for="(blk, idx) in currentDiff.diff_blocks"
-            :key="idx"
-            class="wb-diff-block"
-            :class="`op-${blk.op}`"
-          >
-            <template v-if="blk.op === 'equal'">
-              <span class="wb-seg-equal">{{ blk.refactored_text }}</span>
-            </template>
-            <template v-else-if="blk.op === 'delete'">
-              <del class="wb-seg-del">{{ blk.original_text }}</del>
-            </template>
-            <template v-else-if="blk.op === 'insert'">
-              <ins class="wb-seg-ins">{{ blk.refactored_text }}</ins>
-            </template>
-            <template v-else>
-              <div class="wb-seg-replace">
+          <div class="wb-manuscript-head">
+            <span class="wb-ms-num mono">CHAPTER {{ currentDiff.chapter_num }}</span>
+            <h3 class="wb-ms-title">{{ currentDiff.title }}</h3>
+          </div>
+          <div class="wb-manuscript-body">
+            <div
+              v-for="(blk, idx) in currentDiff.diff_blocks"
+              :key="idx"
+              class="wb-diff-block"
+              :class="`op-${blk.op}`"
+            >
+              <template v-if="blk.op === 'equal'">
+                <span class="wb-seg-equal">{{ blk.refactored_text }}</span>
+              </template>
+              <template v-else-if="blk.op === 'delete'">
                 <del class="wb-seg-del">{{ blk.original_text }}</del>
+              </template>
+              <template v-else-if="blk.op === 'insert'">
                 <ins class="wb-seg-ins">{{ blk.refactored_text }}</ins>
-              </div>
-            </template>
+              </template>
+              <template v-else>
+                <div class="wb-seg-replace">
+                  <del class="wb-seg-del">{{ blk.original_text }}</del>
+                  <ins class="wb-seg-ins">{{ blk.refactored_text }}</ins>
+                </div>
+              </template>
+            </div>
           </div>
         </div>
 
         <!-- 模式 2：双栏并排 -->
         <div v-else-if="centerMode === 'side_by_side'" class="wb-side-grid">
           <div class="wb-pane">
-            <div class="wb-pane-head">原文（{{ currentDiff.stats.char_original }} 字）</div>
+            <div class="wb-pane-head tabular">
+              <span>原稿底本</span>
+              <span class="wb-pane-count">{{ currentDiff.stats.char_original }} 字</span>
+            </div>
             <pre class="wb-pane-body">{{ currentDiff.original_text }}</pre>
           </div>
           <div class="wb-pane">
-            <div class="wb-pane-head">重构稿（{{ currentDiff.stats.char_refactored }} 字）</div>
+            <div class="wb-pane-head tabular">
+              <span>文炼重构稿</span>
+              <span class="wb-pane-count">{{ currentDiff.stats.char_refactored }} 字</span>
+            </div>
             <pre class="wb-pane-body">{{ currentDiff.refactored_text }}</pre>
           </div>
         </div>
 
-        <!-- 模式 3：内联精修编辑 -->
+        <!-- 模式 3：内联精修编辑（沉浸式书卷校勘） -->
         <div v-else class="wb-edit-wrap">
           <textarea
             v-model="draftText"
             class="wb-editor"
-            placeholder="在此直接精修本章正文，保存后将原子写入重构稿并立即重跑单章结构性质检…"
+            placeholder="在此直接校勘精修本章正文，保存后将原子写入重构稿并立即重跑单章结构性质检…"
           ></textarea>
           <div class="wb-edit-foot">
-            <span v-if="liveEditStats" class="wb-edit-stat">
-              当前草稿 {{ liveEditStats.charEdited }} 字（相对原文
+            <span v-if="liveEditStats" class="wb-edit-stat tabular">
+              当前草稿 <b>{{ liveEditStats.charEdited }}</b> 字（相对原文
               {{ fmtDelta(liveEditStats.charDelta) }} 字 · 比例
               {{ fmtPct(liveEditStats.lengthRatio) }} · 估算句级改动
               {{ fmtPct(liveEditStats.changeRatio) }}）
@@ -704,33 +733,42 @@ watch(
         </div>
       </div>
 
-      <!-- 右栏：章节质检诊断卡片、字数增减、重写计数与操作按钮 -->
+      <!-- 右栏：编辑审校诊断卡片、篇幅比例条、操作按钮与键帽图例 -->
       <aside class="wb-col wb-right">
         <template v-if="currentDiff">
           <div class="wb-card">
             <div class="wb-card-title">第 {{ currentDiff.chapter_num }} 章 · 篇幅与改动</div>
             <div class="wb-kv">
               <span>章节标题</span>
-              <b>{{ currentDiff.title }}</b>
+              <b class="wb-kv-serif">{{ currentDiff.title }}</b>
             </div>
-            <div class="wb-kv">
+            <div class="wb-kv tabular">
               <span>字数变化</span>
-              <b>
+              <b class="mono">
                 {{ currentDiff.stats.char_original }} → {{ currentDiff.stats.char_refactored }}（{{
                   fmtDelta(currentDiff.stats.char_delta)
                 }}）
               </b>
             </div>
-            <div class="wb-kv">
+            <div class="wb-kv tabular">
               <span>篇幅比例 / 改动率</span>
-              <b>
+              <b class="mono">
                 {{ fmtPct(currentDiff.stats.length_ratio) }} /
                 {{ fmtPct(currentDiff.stats.change_ratio) }}
               </b>
             </div>
-            <div class="wb-kv">
+            <div class="wb-ratio-wrap" title="篇幅比例健康参考区间：60% – 145%">
+              <div class="wb-ratio-track">
+                <div
+                  class="wb-ratio-fill"
+                  :class="lengthRatioHealthy ? 'ok' : 'warn'"
+                  :style="{ width: lengthRatioWidth }"
+                ></div>
+              </div>
+            </div>
+            <div class="wb-kv tabular">
               <span>单章重写次数</span>
-              <span class="wb-regen-badge">已重写 {{ currentDiff.regen_count }} / 3 次</span>
+              <span class="wb-regen-badge mono">已重写 {{ currentDiff.regen_count }} / 3 次</span>
             </div>
           </div>
 
@@ -750,7 +788,7 @@ watch(
                   <span class="wb-qc-sev">{{ iss.severity === 'bad' ? '硬性' : '留意' }}</span>
                   <span>{{ iss.message }}</span>
                 </div>
-                <div v-if="iss.evidence" class="wb-qc-ev">{{ iss.evidence }}</div>
+                <div v-if="iss.evidence" class="wb-qc-ev mono">{{ iss.evidence }}</div>
               </div>
             </div>
           </div>
@@ -828,6 +866,13 @@ watch(
               {{ activeRegenerating ? '↻ 重写中…' : '↻ 重写本章' }}
             </button>
           </div>
+
+          <div class="wb-keycap-card" aria-label="键盘流审校速查">
+            <span class="wb-keycap-item"><kbd>J</kbd><kbd>K</kbd> 切章</span>
+            <span class="wb-keycap-item"><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd> 视图</span>
+            <span class="wb-keycap-item"><kbd>A</kbd> 审定</span>
+            <span class="wb-keycap-item"><kbd>Ctrl+S</kbd> 存稿</span>
+          </div>
         </template>
         <div v-else class="wb-empty">选择章节后查看诊断与操作</div>
       </aside>
@@ -840,338 +885,603 @@ watch(
   grid-column: 1 / -1;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 14px;
 }
+
 .wb-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--tf-border);
 }
+
 .wb-title-group {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 10px;
 }
+
+.wb-seal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--tf-radius-xs);
+  background: var(--tf-accent-soft);
+  border: 1px solid var(--tf-accent-border);
+  color: var(--tf-accent);
+  font-family: var(--tf-font-serif);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .wb-title-group h2 {
   margin: 0;
-  font-size: 15px;
+  font-family: var(--tf-font-serif);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--tf-ink);
+  letter-spacing: 0.02em;
 }
+
 .wb-live-badge {
-  background: #ebf8ff;
-  color: #2b6cb0;
-  border: 1px solid #bee3f8;
-  border-radius: 999px;
-  padding: 2px 10px;
+  background: var(--tf-brand-soft);
+  color: var(--tf-brand);
+  border: 1px solid var(--tf-brand-border);
+  border-radius: var(--tf-radius-pill);
+  padding: 2px 11px;
   font-size: 12px;
   font-weight: 600;
 }
+
 .wb-sub-badge {
-  border-radius: 999px;
+  border-radius: var(--tf-radius-pill);
   padding: 2px 10px;
   font-size: 12px;
+  font-weight: 500;
 }
+
 .wb-sub-badge.ok {
-  background: #f0fff4;
-  color: #276749;
-  border: 1px solid #c6f6d5;
+  background: var(--tf-ok-bg);
+  color: var(--tf-ok);
+  border: 1px solid var(--tf-ok-border);
 }
+
 .wb-sub-badge.warn {
-  background: #fffff0;
-  color: #975a16;
-  border: 1px solid #fefcbf;
+  background: var(--tf-warn-bg);
+  color: var(--tf-warn);
+  border: 1px solid var(--tf-warn-border);
 }
+
 .wb-header-actions {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
 }
+
 .wb-shortcut-legend {
   font-size: 11px;
-  color: #718096;
-  background: #edf2f7;
-  border: 1px solid #e2e8f0;
-  border-radius: 4px;
-  padding: 3px 8px;
+  color: var(--tf-ink-muted);
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm);
+  padding: 4px 10px;
 }
-.wb-search-bar {
-  display: flex;
-  gap: 4px;
-  padding: 6px;
-  border-bottom: 1px solid #e2e8f0;
-  background: #fff;
-}
-.wb-search-input {
-  flex: 1;
-  min-width: 0;
-  padding: 4px 8px;
-  font-size: 12px;
-  border: 1px solid #cbd5e0;
-  border-radius: 4px;
-}
-.wb-search-btn {
-  padding: 4px 8px;
-  font-size: 12px;
-  border: 1px solid #cbd5e0;
-  border-radius: 4px;
-  background: #edf2f7;
-  color: #2d3748;
-  cursor: pointer;
-}
-.wb-search-btn.clear {
-  padding: 4px 7px;
-  font-weight: 700;
-}
-.wb-audit-strip {
-  padding: 5px 8px;
-  font-size: 11px;
-  color: #744210;
-  background: #fffff0;
-  border-bottom: 1px solid #fefcbf;
-  line-height: 1.45;
-}
+
+/* 三栏主体网格 */
 .wb-grid {
   display: grid;
-  grid-template-columns: 270px minmax(0, 1fr) 290px;
-  gap: 12px;
-  min-height: 430px;
-  max-height: 560px;
+  grid-template-columns: 280px minmax(0, 1fr) 300px;
+  gap: 14px;
+  min-height: 480px;
+  max-height: 640px;
 }
+
 .wb-col {
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  background: #f9fafb;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-surface-2);
   display: flex;
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
 }
+
+.wb-center {
+  background: var(--tf-surface);
+  box-shadow: var(--tf-shadow-sm);
+}
+
+/* 左栏：检索 + 筛选 + 章节卡片 */
+.wb-search-bar {
+  display: flex;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--tf-border);
+  background: var(--tf-surface);
+}
+
+.wb-search-field {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.wb-search-icon {
+  position: absolute;
+  left: 8px;
+  color: var(--tf-ink-muted);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.wb-search-input {
+  width: 100%;
+  min-width: 0;
+  padding: 5px 24px 5px 24px;
+  font-size: 12px;
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-sm);
+  background: var(--tf-surface-elevated);
+  color: var(--tf-ink);
+  transition: border-color 0.15s var(--tf-ease);
+}
+
+.wb-search-input:focus {
+  border-color: var(--tf-brand);
+  outline: none;
+}
+
+.wb-search-clear {
+  position: absolute;
+  right: 4px;
+  width: 18px;
+  height: 18px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--tf-ink-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.wb-search-clear:hover {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
+}
+
+.wb-search-btn {
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-sm);
+  background: var(--tf-surface-2);
+  color: var(--tf-ink-secondary);
+  cursor: pointer;
+  transition: background 0.15s var(--tf-ease);
+}
+
+.wb-search-btn:hover:not(:disabled) {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
+}
+
+.wb-audit-strip {
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--tf-warn);
+  background: var(--tf-warn-bg);
+  border-bottom: 1px solid var(--tf-warn-border);
+  line-height: 1.45;
+}
+
 .wb-tabs {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
-  border-bottom: 1px solid #e2e8f0;
-  background: #edf2f7;
+  gap: 2px;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--tf-border);
+  background: var(--tf-surface-2);
 }
+
 .wb-tab {
   border: none;
+  border-radius: var(--tf-radius-xs);
   background: transparent;
-  padding: 7px 4px;
-  font-size: 12px;
-  color: #4a5568;
+  padding: 5px 2px;
+  font-size: 11.5px;
+  color: var(--tf-ink-muted);
   cursor: pointer;
+  transition:
+    background 0.14s var(--tf-ease),
+    color 0.14s var(--tf-ease);
 }
+
+.wb-tab:hover {
+  color: var(--tf-ink);
+}
+
 .wb-tab.active {
-  background: #fff;
-  color: #2b6cb0;
+  background: var(--tf-surface);
+  color: var(--tf-brand);
   font-weight: 600;
-  box-shadow: inset 0 -2px 0 #3182ce;
+  box-shadow: var(--tf-shadow-sm);
 }
+
 .wb-chapter-list {
   flex: 1;
   overflow-y: auto;
-  padding: 6px;
+  padding: 8px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
+
 .wb-chapter-item {
   text-align: left;
-  border: 1px solid transparent;
-  background: #fff;
-  border-radius: 5px;
-  padding: 7px 9px;
+  border: 1px solid var(--tf-border);
+  border-left: 3px solid transparent;
+  background: var(--tf-surface);
+  border-radius: var(--tf-radius-sm);
+  padding: 8px 10px;
   cursor: pointer;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
+  transition:
+    border-color 0.15s var(--tf-ease),
+    background 0.15s var(--tf-ease),
+    box-shadow 0.15s var(--tf-ease);
 }
+
 .wb-chapter-item:hover {
-  border-color: #cbd5e0;
+  border-color: var(--tf-border-strong);
+  background: var(--tf-surface-elevated);
 }
+
 .wb-chapter-item.selected {
-  border-color: #3182ce;
-  background: #ebf8ff;
+  border-color: var(--tf-brand-border);
+  border-left-color: var(--tf-brand);
+  background: var(--tf-brand-soft);
+  box-shadow: var(--tf-shadow-sm);
 }
+
 .wb-ch-top {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: 12.5px;
 }
+
 .wb-ch-num {
-  color: #718096;
-  font-family: 'Consolas', monospace;
+  color: var(--tf-ink-muted);
+  font-family: var(--tf-font-mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
+
 .wb-ch-title {
   flex: 1;
+  font-family: var(--tf-font-serif);
   font-weight: 600;
-  color: #2d3748;
+  color: var(--tf-ink);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
 .wb-qc-dot {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  background: #e53e3e;
+  background: var(--tf-danger);
   color: #fff;
   font-size: 11px;
   font-weight: 700;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
+
+.wb-audit-dot {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--tf-warn);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
 .wb-ch-meta {
   display: flex;
   align-items: center;
   justify-content: space-between;
   font-size: 11px;
 }
+
 .wb-pill {
-  padding: 1px 6px;
-  border-radius: 4px;
+  padding: 1px 7px;
+  border-radius: var(--tf-radius-pill);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.wb-pill.pending {
+  background: var(--tf-surface-2);
+  color: var(--tf-ink-muted);
+}
+
+.wb-pill.ready {
+  background: var(--tf-brand-soft);
+  color: var(--tf-brand);
+}
+
+.wb-pill.ok {
+  background: var(--tf-ok-bg);
+  color: var(--tf-ok);
+}
+
+.wb-pill.edited {
+  background: var(--tf-edited-bg);
+  color: var(--tf-edited);
+}
+
+.wb-chars {
+  color: var(--tf-ink-muted);
+  font-family: var(--tf-font-mono);
   font-size: 11px;
 }
-.wb-pill.pending {
-  background: #edf2f7;
-  color: #718096;
+
+.wb-ch-snip {
+  font-size: 11px;
+  color: var(--tf-brand);
+  background: var(--tf-brand-soft);
+  border-radius: var(--tf-radius-xs);
+  padding: 2px 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.wb-pill.ready {
-  background: #ebf8ff;
-  color: #2b6cb0;
+
+.wb-ch-snip.warn {
+  color: var(--tf-warn);
+  background: var(--tf-warn-bg);
 }
-.wb-pill.ok {
-  background: #c6f6d5;
-  color: #22543d;
-}
-.wb-pill.edited {
-  background: #e9d8fd;
-  color: #553c9a;
-}
-.wb-chars {
-  color: #718096;
-}
+
+/* 中栏：文学书卷手稿区 */
 .wb-mode-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 10px;
-  border-bottom: 1px solid #e2e8f0;
-  background: #edf2f7;
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--tf-border);
+  background: var(--tf-surface-2);
   gap: 8px;
 }
+
 .wb-modes {
   display: flex;
   gap: 6px;
 }
+
 .wb-mode-btn {
-  padding: 4px 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 11px;
   font-size: 12px;
-  border: 1px solid #cbd5e0;
-  background: #fff;
-  color: #4a5568;
-  border-radius: 4px;
+  font-weight: 500;
+  border: 1px solid var(--tf-border-strong);
+  background: var(--tf-surface);
+  color: var(--tf-ink-secondary);
+  border-radius: var(--tf-radius-sm);
   cursor: pointer;
+  transition:
+    background 0.15s var(--tf-ease),
+    border-color 0.15s var(--tf-ease),
+    color 0.15s var(--tf-ease);
 }
+
+.wb-mode-btn:hover {
+  color: var(--tf-ink);
+  background: var(--tf-surface-hover);
+}
+
 .wb-mode-btn.active {
-  background: #3182ce;
-  border-color: #3182ce;
-  color: #fff;
+  background: var(--tf-brand);
+  border-color: var(--tf-brand);
+  color: var(--tf-ink-on-brand);
 }
+
+.wb-mode-btn.active .wb-mode-key {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: var(--tf-ink-on-brand);
+}
+
+.wb-mode-key {
+  min-width: 15px;
+  padding: 0 4px;
+  font-size: 10px;
+}
+
 .wb-notice {
   font-size: 12px;
-  color: #2f855a;
+  font-weight: 500;
+  color: var(--tf-ok);
 }
+
 .wb-diff-scroll {
   flex: 1;
   overflow-y: auto;
-  padding: 12px 14px;
-  background: #fff;
-  font-size: 13px;
-  line-height: 1.75;
+  padding: 22px 28px;
+  background: var(--tf-surface);
+  color: var(--tf-ink);
+}
+
+.wb-manuscript-head {
+  padding-bottom: 12px;
+  margin-bottom: 16px;
+  border-bottom: 1px dashed var(--tf-border-strong);
+}
+
+.wb-ms-num {
+  display: block;
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  color: var(--tf-ink-muted);
+  margin-bottom: 4px;
+}
+
+.wb-ms-title {
+  margin: 0;
+  font-family: var(--tf-font-serif);
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--tf-ink);
+  letter-spacing: 0.02em;
+}
+
+.wb-manuscript-body {
+  font-family: var(--tf-font-serif);
+  font-size: 15.5px;
+  line-height: 1.88;
+  letter-spacing: 0.012em;
   white-space: pre-wrap;
   word-break: break-word;
 }
+
 .wb-diff-block {
   display: inline;
 }
+
 .wb-seg-del {
-  background: #fed7d7;
-  color: #9b2c2c;
+  background: var(--tf-diff-del-bg);
+  color: var(--tf-diff-del-ink);
   text-decoration: line-through;
-  padding: 0 2px;
-  border-radius: 2px;
+  text-decoration-thickness: 1.2px;
+  padding: 1px 3px;
+  border-radius: 3px;
 }
+
 .wb-seg-ins {
-  background: #c6f6d5;
-  color: #22543d;
+  background: var(--tf-diff-ins-bg);
+  color: var(--tf-diff-ins-ink);
   text-decoration: none;
-  padding: 0 2px;
-  border-radius: 2px;
+  border-bottom: 1.5px solid var(--tf-diff-ins-line);
+  padding: 1px 3px;
+  border-radius: 3px;
 }
+
 .wb-seg-replace {
   display: inline;
 }
+
 .wb-side-grid {
   flex: 1;
   display: grid;
   grid-template-columns: 1fr 1fr;
   min-height: 0;
-  background: #fff;
+  background: var(--tf-surface);
 }
+
 .wb-pane {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  border-right: 1px solid #e2e8f0;
+  border-right: 1px solid var(--tf-border);
 }
+
 .wb-pane:last-child {
   border-right: none;
 }
+
 .wb-pane-head {
-  padding: 5px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 14px;
   font-size: 12px;
   font-weight: 600;
-  color: #4a5568;
-  background: #f7fafc;
-  border-bottom: 1px solid #e2e8f0;
+  color: var(--tf-ink-secondary);
+  background: var(--tf-surface-2);
+  border-bottom: 1px solid var(--tf-border);
 }
+
+.wb-pane-count {
+  font-family: var(--tf-font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--tf-ink-muted);
+}
+
 .wb-pane-body {
   flex: 1;
   margin: 0;
-  padding: 10px 12px;
+  padding: 18px 20px;
   overflow-y: auto;
-  font-family: inherit;
-  font-size: 13px;
-  line-height: 1.7;
+  font-family: var(--tf-font-serif);
+  font-size: 15px;
+  line-height: 1.85;
+  letter-spacing: 0.01em;
+  color: var(--tf-ink);
   white-space: pre-wrap;
   word-break: break-word;
 }
+
 .wb-edit-wrap {
   flex: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 8px;
-  gap: 8px;
-  background: #fff;
+  padding: 12px 14px;
+  gap: 10px;
+  background: var(--tf-surface);
 }
+
 .wb-editor {
   flex: 1;
   width: 100%;
   resize: none;
-  padding: 10px 12px;
-  border: 1px solid #cbd5e0;
-  border-radius: 5px;
-  font-family: inherit;
-  font-size: 13px;
-  line-height: 1.7;
-  box-sizing: border-box;
+  padding: 18px 22px;
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-surface-elevated);
+  color: var(--tf-ink);
+  font-family: var(--tf-font-serif);
+  font-size: 15.5px;
+  line-height: 1.88;
+  letter-spacing: 0.012em;
+  transition:
+    border-color 0.15s var(--tf-ease),
+    box-shadow 0.15s var(--tf-ease);
 }
+
+.wb-editor:focus {
+  border-color: var(--tf-brand);
+  box-shadow: 0 0 0 3px var(--tf-brand-soft);
+  outline: none;
+}
+
 .wb-edit-foot {
   display: flex;
   justify-content: space-between;
@@ -1179,188 +1489,275 @@ watch(
   flex-wrap: wrap;
   gap: 8px;
 }
+
 .wb-edit-stat {
   font-size: 12px;
-  color: #4a5568;
+  color: var(--tf-ink-secondary);
 }
+
 .wb-dirty-flag {
-  color: #c05621;
+  color: var(--tf-accent);
 }
+
 .wb-edit-actions {
   display: flex;
   gap: 8px;
 }
+
+/* 右栏：编辑审校诊断区 */
 .wb-right {
-  padding: 8px;
-  gap: 8px;
+  padding: 10px;
+  gap: 10px;
   overflow-y: auto;
 }
+
 .wb-card {
-  background: #fff;
-  border: 1px solid #e2e8f0;
-  border-radius: 5px;
-  padding: 9px 10px;
+  background: var(--tf-surface);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm);
+  padding: 11px 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
+  box-shadow: var(--tf-shadow-sm);
 }
+
 .wb-card-title {
   font-size: 12px;
   font-weight: 700;
-  color: #2d3748;
-  border-bottom: 1px solid #edf2f7;
-  padding-bottom: 4px;
+  color: var(--tf-ink);
+  border-bottom: 1px solid var(--tf-border);
+  padding-bottom: 5px;
+  letter-spacing: 0.02em;
 }
+
 .wb-kv {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font-size: 12px;
-  color: #4a5568;
+  color: var(--tf-ink-secondary);
 }
+
 .wb-kv b {
-  color: #1a202c;
+  color: var(--tf-ink);
   text-align: right;
 }
+
+.wb-kv-serif {
+  font-family: var(--tf-font-serif);
+}
+
+.wb-ratio-wrap {
+  padding: 2px 0;
+}
+
+.wb-ratio-track {
+  height: 5px;
+  background: var(--tf-surface-2);
+  border-radius: var(--tf-radius-pill);
+  overflow: hidden;
+}
+
+.wb-ratio-fill {
+  height: 100%;
+  border-radius: var(--tf-radius-pill);
+  transition: width 0.28s var(--tf-ease);
+}
+
+.wb-ratio-fill.ok {
+  background: var(--tf-ok);
+}
+
+.wb-ratio-fill.warn {
+  background: var(--tf-warn);
+}
+
 .wb-regen-badge {
-  background: #edf2f7;
-  color: #2d3748;
-  border-radius: 4px;
-  padding: 1px 6px;
+  background: var(--tf-surface-2);
+  color: var(--tf-ink-secondary);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-xs);
+  padding: 1px 7px;
   font-size: 11px;
   font-weight: 600;
 }
+
 .wb-qc-card {
   flex: 1;
   min-height: 110px;
 }
+
 .wb-qc-clean {
   font-size: 12px;
-  color: #276749;
-  background: #f0fff4;
-  border: 1px solid #c6f6d5;
-  border-radius: 4px;
-  padding: 8px;
+  color: var(--tf-ok);
+  background: var(--tf-ok-bg);
+  border: 1px solid var(--tf-ok-border);
+  border-radius: var(--tf-radius-sm);
+  padding: 8px 10px;
+  line-height: 1.5;
 }
+
 .wb-qc-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
   overflow-y: auto;
 }
+
 .wb-qc-item {
-  border-radius: 4px;
-  padding: 6px 8px;
+  border-radius: var(--tf-radius-sm);
+  padding: 7px 9px;
   font-size: 12px;
+  line-height: 1.5;
 }
+
 .wb-qc-item.bad {
-  background: #fff5f5;
-  border: 1px solid #feb2b2;
-  color: #822727;
+  background: var(--tf-danger-bg);
+  border: 1px solid var(--tf-danger-border);
+  color: var(--tf-danger);
 }
+
 .wb-qc-item.warn {
-  background: #fffff0;
-  border: 1px solid #f6e05e;
-  color: #744210;
+  background: var(--tf-warn-bg);
+  border: 1px solid var(--tf-warn-border);
+  color: var(--tf-warn);
 }
+
 .wb-qc-head {
   display: flex;
   gap: 6px;
   align-items: baseline;
 }
+
 .wb-qc-sev {
   font-weight: 700;
   flex-shrink: 0;
 }
+
 .wb-qc-ev {
   margin-top: 3px;
   font-size: 11px;
-  opacity: 0.85;
+  opacity: 0.88;
   word-break: break-all;
 }
-.wb-audit-dot {
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: #dd6b20;
-  color: #fff;
-  font-size: 10px;
-  font-weight: 700;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.wb-ch-snip {
-  font-size: 11px;
-  color: #2b6cb0;
-  background: #ebf8ff;
-  border-radius: 3px;
-  padding: 2px 5px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.wb-ch-snip.warn {
-  color: #975a16;
-  background: #fffff0;
-}
+
 .wb-search-hit {
-  font-size: 11px;
-  color: #2b6cb0;
-  background: #ebf8ff;
-  border: 1px solid #bee3f8;
-  border-radius: 4px;
-  padding: 5px 7px;
+  font-size: 11.5px;
+  color: var(--tf-brand);
+  background: var(--tf-brand-soft);
+  border: 1px solid var(--tf-brand-border);
+  border-radius: var(--tf-radius-sm);
+  padding: 6px 8px;
   word-break: break-all;
+  line-height: 1.5;
 }
+
 .wb-actions-stack {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
 }
+
 .wb-btn {
-  padding: 6px 12px;
-  border-radius: 5px;
-  font-size: 12px;
+  padding: 7px 12px;
+  border-radius: var(--tf-radius-sm);
+  font-size: 12.5px;
+  font-weight: 500;
   cursor: pointer;
-  border: 1px solid #cbd5e0;
-  background: #fff;
-  color: #2d3748;
+  border: 1px solid var(--tf-border-strong);
+  background: var(--tf-surface);
+  color: var(--tf-ink);
+  transition:
+    background 0.15s var(--tf-ease),
+    border-color 0.15s var(--tf-ease),
+    color 0.15s var(--tf-ease);
 }
+
+.wb-btn:hover:not(:disabled) {
+  background: var(--tf-surface-hover);
+}
+
+.wb-btn.ghost {
+  background: transparent;
+  color: var(--tf-ink-secondary);
+}
+
+.wb-btn.ghost:hover:not(:disabled) {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
+}
+
 .wb-btn:disabled {
-  opacity: 0.45;
+  opacity: 0.42;
   cursor: not-allowed;
 }
+
 .wb-btn.primary {
-  background: #3182ce;
-  border-color: #3182ce;
-  color: #fff;
+  background: var(--tf-brand);
+  border-color: var(--tf-brand);
+  color: var(--tf-ink-on-brand);
 }
+
+.wb-btn.primary:hover:not(:disabled) {
+  background: var(--tf-brand-hover);
+  border-color: var(--tf-brand-hover);
+}
+
 .wb-btn.approve {
-  background: #2f855a;
-  border-color: #2f855a;
+  background: var(--tf-ok);
+  border-color: var(--tf-ok);
   color: #fff;
   font-weight: 600;
 }
+
+.wb-btn.approve:hover:not(:disabled) {
+  filter: brightness(0.94);
+}
+
 .wb-btn.regen {
-  background: #fff;
-  border-color: #805ad5;
-  color: #6b46c1;
+  background: var(--tf-surface);
+  border-color: var(--tf-accent-border);
+  color: var(--tf-accent);
   font-weight: 600;
 }
-.wb-empty {
-  padding: 18px 12px;
-  text-align: center;
-  font-size: 12px;
-  color: #718096;
+
+.wb-btn.regen:hover:not(:disabled) {
+  background: var(--tf-accent-soft);
 }
+
+.wb-keycap-card {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  padding: 8px 10px;
+  border-radius: var(--tf-radius-sm);
+  background: var(--tf-surface);
+  border: 1px dashed var(--tf-border-strong);
+  font-size: 11px;
+  color: var(--tf-ink-muted);
+}
+
+.wb-keycap-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.wb-empty {
+  padding: 22px 14px;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--tf-ink-muted);
+}
+
 .wb-center-empty {
   flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #fff;
+  background: var(--tf-surface);
 }
 
 @media (max-width: 1100px) {
@@ -1368,95 +1765,5 @@ watch(
     grid-template-columns: 1fr;
     max-height: none;
   }
-}
-
-html.dark .wb-col,
-html.dark .wb-card,
-html.dark .wb-diff-scroll,
-html.dark .wb-side-grid,
-html.dark .wb-edit-wrap,
-html.dark .wb-center-empty {
-  background: #1a202c;
-  border-color: #4a5568;
-  color: #e2e8f0;
-}
-html.dark .wb-tabs,
-html.dark .wb-mode-bar,
-html.dark .wb-pane-head {
-  background: #232b39;
-  border-color: #4a5568;
-  color: #cbd5e0;
-}
-html.dark .wb-tab {
-  color: #a0aec0;
-}
-html.dark .wb-tab.active {
-  background: #1a202c;
-  color: #90cdf4;
-}
-html.dark .wb-chapter-item {
-  background: #232b39;
-}
-html.dark .wb-chapter-item.selected {
-  background: #2a4365;
-  border-color: #63b3ed;
-}
-html.dark .wb-ch-title,
-html.dark .wb-card-title,
-html.dark .wb-kv b {
-  color: #e2e8f0;
-}
-html.dark .wb-kv,
-html.dark .wb-edit-stat {
-  color: #a0aec0;
-}
-html.dark .wb-btn,
-html.dark .wb-mode-btn {
-  background: #2d3748;
-  border-color: #4a5568;
-  color: #e2e8f0;
-}
-html.dark .wb-mode-btn.active,
-html.dark .wb-btn.primary {
-  background: #3182ce;
-  border-color: #3182ce;
-  color: #fff;
-}
-html.dark .wb-btn.approve {
-  background: #2f855a;
-  border-color: #2f855a;
-  color: #fff;
-}
-html.dark .wb-seg-del {
-  background: rgba(245, 101, 101, 0.25);
-  color: #feb2b2;
-}
-html.dark .wb-seg-ins {
-  background: rgba(72, 187, 120, 0.25);
-  color: #9ae6b4;
-}
-html.dark .wb-shortcut-legend,
-html.dark .wb-search-bar,
-html.dark .wb-search-btn {
-  background: #232b39;
-  border-color: #4a5568;
-  color: #cbd5e0;
-}
-html.dark .wb-search-input {
-  background: #1a202c;
-  border-color: #4a5568;
-  color: #e2e8f0;
-}
-html.dark .wb-audit-strip,
-html.dark .wb-ch-snip.warn {
-  background: rgba(236, 201, 75, 0.14);
-  border-color: #975a16;
-  color: #fbd38d;
-}
-html.dark .wb-ch-snip,
-html.dark .wb-search-hit {
-  background: rgba(49, 130, 206, 0.2);
-  border-color: #2b6cb0;
-  color: #90cdf4;
 }
 </style>

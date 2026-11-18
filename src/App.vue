@@ -6,10 +6,18 @@ import { waitForPort } from './api/backend';
 import { connectSSE, disconnectSSE, type SSEHandlers } from './api/sse';
 import SettingsModal from './components/SettingsModal.vue';
 import GateModal from './components/GateModal.vue';
+import HistoryModal from './components/HistoryModal.vue';
+import VersionsModal from './components/VersionsModal.vue';
 import RunStats from './components/RunStats.vue';
 import QualityModal from './components/QualityModal.vue';
 import ChapterReviewWorkbench from './components/ChapterReviewWorkbench.vue';
 import { isReviewWorkbenchPhase } from './api/chapters';
+import {
+  applyThemeToRoot,
+  computePipelineSteps,
+  persistThemeChoice,
+  resolveInitialTheme,
+} from './theme';
 import { apiFetch, initAuth, postWithBusyRetry } from './api/client';
 import {
   DEFAULT_CONTEXT_WINDOW,
@@ -153,6 +161,10 @@ function applyPreset() {
   contextWindow.value = p.ctx;
   batchInterval.value = p.interval;
 }
+function selectPresetPill(name: string) {
+  preset.value = name;
+  applyPreset();
+}
 // A2：构建 models 字典——仅模型则为字符串；配了独立端点则为 {model, api_url[, api_key]}
 function buildModels(): Record<
   string,
@@ -287,9 +299,20 @@ const zombieWarn = ref(false);
 const darkMode = ref(false);
 function toggleTheme() {
   darkMode.value = !darkMode.value;
-  document.documentElement.classList.toggle('dark', darkMode.value);
+  const next = darkMode.value ? 'dark' : 'light';
+  applyThemeToRoot(next);
+  persistThemeChoice(next);
   persist();
 }
+
+const pipelineSteps = computed(() =>
+  computePipelineSteps({
+    rawPhase: rawPhase.value || String(outInfo.value?.current_phase || ''),
+    currentPhaseLabel: currentPhase.value,
+    finished: Boolean(outInfo.value?.finished || currentPhase.value === '完成'),
+    running: pipelineRunning.value,
+  }),
+);
 
 // C2：本地持久化记忆设置项
 const PERSIST_KEY = 'textforge_prefs_v1';
@@ -338,6 +361,13 @@ function persist() {
 }
 function restore() {
   try {
+    // 优先读取显式主题键 localStorage.getItem('tf-theme')，未设置时兼容旧版 prefs.darkMode
+    const initialTheme = resolveInitialTheme(
+      typeof localStorage !== 'undefined' ? localStorage : null,
+    );
+    darkMode.value = initialTheme === 'dark';
+    applyThemeToRoot(initialTheme);
+
     const raw = localStorage.getItem(PERSIST_KEY);
     if (!raw) return;
     const p = JSON.parse(raw);
@@ -360,9 +390,9 @@ function restore() {
         if (typeof p.gates[key] === 'boolean') gates[key] = p.gates[key];
       }
     }
-    if (typeof p.darkMode === 'boolean') {
+    if (localStorage.getItem('tf-theme') == null && typeof p.darkMode === 'boolean') {
       darkMode.value = p.darkMode;
-      document.documentElement.classList.toggle('dark', p.darkMode);
+      applyThemeToRoot(p.darkMode ? 'dark' : 'light');
     }
     if (typeof p.forbiddenCanon === 'string') forbiddenCanon.value = p.forbiddenCanon;
     if (typeof p.nameMapText === 'string') nameMapText.value = p.nameMapText;
@@ -1677,17 +1707,59 @@ const canStart = computed(
 <template>
   <div class="app">
     <header class="header">
-      <h1>
-        文炼工坊 <span class="version">TextForge v{{ appVersion }}</span>
-      </h1>
+      <div class="brand-group">
+        <span class="brand-seal" aria-hidden="true">文炼</span>
+        <div class="brand-titles">
+          <h1>
+            文炼工坊 <span class="version">TextForge v{{ appVersion }}</span>
+          </h1>
+          <span class="brand-subtitle">长篇文学重构与书卷校勘工坊</span>
+        </div>
+      </div>
+
+      <!-- 五阶书卷工序步进条：拆书 · 诊断 · 蓝图 · 重构缝合 · 成书 -->
+      <nav class="pipeline-stepper" aria-label="五阶重构工序进度">
+        <template v-for="(st, idx) in pipelineSteps" :key="st.key">
+          <span v-if="idx > 0" class="step-sep" aria-hidden="true">·</span>
+          <span
+            class="step-pill"
+            :class="[`is-${st.state}`, { 'is-pulsing': st.state === 'active' && pipelineRunning }]"
+          >
+            <span class="step-idx mono">
+              <template v-if="st.state === 'done'">✓</template>
+              <template v-else>{{ idx + 1 }}</template>
+            </span>
+            <span class="step-label">{{ st.label }}</span>
+          </span>
+        </template>
+      </nav>
+
       <div class="status">
+        <span
+          v-if="reviewSummary && reviewSummary.ready_chapters > 0"
+          class="header-jade-badge tabular"
+          title="来自 .tfproj.db 的实时章节审校汇总"
+        >
+          已审校 {{ reviewSummary.approved_chapters + reviewSummary.edited_chapters }}/{{
+            reviewSummary.ready_chapters
+          }}
+          章
+        </span>
         <button
+          type="button"
           class="status-link"
+          :class="{ running: pipelineRunning }"
           :title="backendReady ? '查看后端设置' : '后端未连接，点击排查/重启'"
           @click="showSettings = true"
         >
-          <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
-          {{ backendReady ? '后端已连接' : errorMsg || '连接中...' }}
+          <span
+            :class="[
+              'dot',
+              backendReady ? 'ok' : 'err',
+              { pulse: pipelineRunning && backendReady },
+            ]"
+          ></span>
+          <span>{{ backendReady ? '后端已连接' : errorMsg || '连接中...' }}</span>
         </button>
         <button
           type="button"
@@ -1698,8 +1770,14 @@ const canStart = computed(
         >
           ⚙
         </button>
-        <button type="button" class="theme-toggle" aria-label="切换深浅色主题" @click="toggleTheme">
-          {{ darkMode ? '☀︎' : '☾' }}
+        <button
+          type="button"
+          class="theme-toggle"
+          aria-label="切换宣纸/墨砚主题"
+          :title="darkMode ? '切换至宣纸昼光主题' : '切换至墨砚夜读主题'"
+          @click="toggleTheme"
+        >
+          {{ darkMode ? '☀ 宣纸' : '☾ 墨砚' }}
         </button>
       </div>
     </header>
@@ -1752,15 +1830,22 @@ const canStart = computed(
       <!-- 配置区 -->
       <section class="panel config" :class="{ disabled: pipelineRunning }">
         <h2>
-          运行配置
-          <button class="panel-gear" title="系统与后端设置" @click="showSettings = true">
+          <span class="panel-title-serif">书卷编修配置</span>
+          <button
+            type="button"
+            class="panel-gear"
+            title="系统与后端设置"
+            @click="showSettings = true"
+          >
             ⚙ 后端设置
           </button>
         </h2>
 
+        <div class="cfg-section-head">01 · 服务与书稿卷宗</div>
+
         <div class="row backend-row">
           <label>后端服务</label>
-          <span class="backend-state">
+          <span class="backend-state tabular">
             <span :class="['dot', backendReady ? 'ok' : 'err']"></span>
             {{
               backendReady
@@ -1770,8 +1855,8 @@ const canStart = computed(
                   : '未连接'
             }}
           </span>
-          <button @click="reconnectBackend" :disabled="backendReady">重新连接</button>
-          <button class="ghost" @click="showSettings = true">设置</button>
+          <button type="button" :disabled="backendReady" @click="reconnectBackend">重新连接</button>
+          <button type="button" class="ghost" @click="showSettings = true">设置</button>
         </div>
 
         <div class="row">
@@ -1791,14 +1876,21 @@ const canStart = computed(
         <div class="row">
           <label>输入路径</label>
           <input v-model="inputPath" placeholder="可直接粘贴路径，或点击右侧选择" />
-          <button @click="selectInput">选择</button>
+          <button type="button" @click="selectInput">选择</button>
         </div>
 
         <div class="row">
           <label>输出路径</label>
           <input v-model="outputPath" placeholder="可直接粘贴路径，或点击右侧选择" />
-          <button @click="selectOutput">选择</button>
+          <button type="button" @click="selectOutput">选择</button>
         </div>
+
+        <div class="row">
+          <label>输出书名</label>
+          <input v-model="novelName" placeholder="可选，默认取输入文件夹名" />
+        </div>
+
+        <div class="cfg-section-head">02 · 模型端点与档位预设</div>
 
         <div class="row">
           <label>API URL</label>
@@ -1807,32 +1899,45 @@ const canStart = computed(
 
         <div class="row">
           <label>API Key</label>
-          <input v-model="apiKey" type="password" placeholder="可选，仅存内存" />
+          <input v-model="apiKey" type="password" placeholder="可选，仅存内存不落盘" />
         </div>
 
         <div class="row">
           <label>模型名</label>
-          <input v-model="model" placeholder="如 gpt-4o" />
+          <input v-model="model" placeholder="如 gpt-4o / deepseek-chat" />
           <label class="ctx">上下文</label>
           <input
             v-model.number="contextWindow"
             type="number"
+            class="tabular"
             :min="MIN_CONTEXT_WINDOW"
             title="它决定单批能装多少字：窗口小→批数多→每批都要重发蓝图/前情这些脚手架。填到「预估本次」里的批数不再下降为止，再大只会多花 token"
           />
         </div>
 
-        <div class="row">
-          <label>预设</label>
-          <select v-model="preset" @change="applyPreset">
-            <option v-for="name in Object.keys(PRESETS)" :key="name" :value="name">
-              {{ name }}（上下文 {{ PRESETS[name].ctx }}）
-            </option>
-          </select>
-          <label class="rich"
-            >套用温度/上下文/批次间隔。本地小模型选「快速低保真」；没把握就点「预估本次」看批数</label
-          >
+        <div class="row preset-row">
+          <label>预设档位</label>
+          <div class="preset-controls">
+            <div class="preset-pills" role="group" aria-label="快捷档位切换">
+              <button
+                v-for="name in Object.keys(PRESETS)"
+                :key="name"
+                type="button"
+                class="preset-pill"
+                :class="{ active: preset === name }"
+                @click="selectPresetPill(name)"
+              >
+                <span>{{ name }}</span>
+                <small class="mono">{{ Math.round(PRESETS[name].ctx / 1024) }}k</small>
+              </button>
+            </div>
+            <span class="preset-hint">
+              一键套用温度 / 上下文 / 批次间隔；本地小模型建议选「快速低保真」
+            </span>
+          </div>
         </div>
+
+        <div class="cfg-section-head">03 · 重构法则与质量闸门</div>
 
         <div class="row">
           <label>重构模式</label>
@@ -1847,36 +1952,38 @@ const canStart = computed(
         <div class="row">
           <label>保护门</label>
           <details class="adv gates">
-            <summary>重构保护门（多数默认关）</summary>
-            <label class="rich"
-              ><input type="checkbox" v-model="gates.lock_names" /> 锁人名/设定名</label
-            >
-            <label class="rich"
-              ><input type="checkbox" v-model="gates.lock_plot" /> 锁剧情骨架</label
-            >
-            <label class="rich"
-              ><input type="checkbox" v-model="gates.inject_forbidden" /> 注入禁改清单</label
-            >
-            <label class="rich"
-              ><input type="checkbox" v-model="gates.require_chapter_accept" /> 逐章验收</label
-            >
-            <label class="rich"
-              ><input type="checkbox" v-model="gates.skip_stitch_if_smooth" />
-              平滑衔接跳过缝合</label
-            >
-            <label class="rich"
-              ><input type="checkbox" v-model="gates.qc_block_export" /> 质检拦截导出</label
-            >
-            <label class="rich" title="只处理空章/塌缩/占位/残留等结构硬伤，每批最多重写一次"
-              ><input type="checkbox" v-model="gates.auto_rewrite_bad_batch" />
-              硬伤批次自动重写</label
-            >
-            <label
-              class="rich"
-              title="交界处原文句子有超过 35% 没被原样保留时拒绝该补丁，退回保留原文（默认开；关掉后只受长度比 0.5~3.0 约束）"
-              ><input type="checkbox" v-model="gates.stitch_minimal_change" />
-              缝合只做最小改动</label
-            >
+            <summary>重构保护门（自动重写与最小缝合默认开启）</summary>
+            <div class="gates-grid">
+              <label class="rich"
+                ><input v-model="gates.lock_names" type="checkbox" /> 锁人名/设定名</label
+              >
+              <label class="rich"
+                ><input v-model="gates.lock_plot" type="checkbox" /> 锁剧情骨架</label
+              >
+              <label class="rich"
+                ><input v-model="gates.inject_forbidden" type="checkbox" /> 注入禁改清单</label
+              >
+              <label class="rich"
+                ><input v-model="gates.require_chapter_accept" type="checkbox" /> 逐章验收</label
+              >
+              <label class="rich"
+                ><input v-model="gates.skip_stitch_if_smooth" type="checkbox" />
+                平滑衔接跳过缝合</label
+              >
+              <label class="rich"
+                ><input v-model="gates.qc_block_export" type="checkbox" /> 质检拦截导出</label
+              >
+              <label class="rich" title="只处理空章/塌缩/占位/残留等结构硬伤，每批最多重写一次"
+                ><input v-model="gates.auto_rewrite_bad_batch" type="checkbox" />
+                硬伤批次自动重写</label
+              >
+              <label
+                class="rich"
+                title="交界处原文句子有超过 35% 没被原样保留时拒绝该补丁，退回保留原文（默认开；关掉后只受长度比 0.5~3.0 约束）"
+                ><input v-model="gates.stitch_minimal_change" type="checkbox" />
+                缝合只做最小改动</label
+              >
+            </div>
           </details>
         </div>
 
@@ -1896,22 +2003,16 @@ const canStart = computed(
           ></textarea>
         </div>
 
-        <div class="row">
-          <label>输出书名</label>
-          <input v-model="novelName" placeholder="可选，默认取输入文件夹名" />
-        </div>
-
-        <div class="row">
+        <div class="row wrap-checks">
           <label>拆书确认</label>
           <label class="rich"
-            ><input type="checkbox" v-model="reviewSplit" /> 拆书后先预览章节再继续</label
+            ><input v-model="reviewSplit" type="checkbox" /> 拆书后先预览章节再继续</label
           >
           <label
             class="rich"
             title="仅在规则识别不可靠（没认出章节 / 章节长度异常）时才额外调用一次模型，成本很低"
           >
-            <input type="checkbox" v-model="aiSplit" /> 识别不到章节时用 AI
-            辅助定位边界（多一次模型调用）
+            <input v-model="aiSplit" type="checkbox" /> 识别不到章节时用 AI 辅助定位边界
           </label>
         </div>
 
@@ -1919,18 +2020,18 @@ const canStart = computed(
           <summary>优化项：左右对照 / 章快照 / 诊断 JSON</summary>
           <div class="row">
             <label class="rich"
-              ><input type="checkbox" v-model="compareOutput" />
+              ><input v-model="compareOutput" type="checkbox" />
               左右对照（重构后按章生成原文|重构后表格）</label
             >
           </div>
           <div class="row">
             <label class="rich"
-              ><input type="checkbox" v-model="chapterSnapshots" />
+              ><input v-model="chapterSnapshots" type="checkbox" />
               章快照（保留重构初稿与缝合终稿）</label
             >
           </div>
           <div class="row">
-            <label>诊断JSON输出目录</label>
+            <label>诊断JSON目录</label>
             <input
               v-model="diagnoseJson"
               placeholder="可选，留空关闭；设置后按批次把结构化断层 JSON 写入该目录"
@@ -1939,20 +2040,20 @@ const canStart = computed(
         </details>
 
         <div class="row">
-          <label>代理</label>
+          <label>网络代理</label>
           <input v-model="proxy" placeholder="可选，如 http://127.0.0.1:7890" />
           <label
             class="rich"
             title="仅影响 docx 成品：章标题用 Word 标题样式、章间分页、**粗体**/*斜体* 生效"
-            ><input type="checkbox" v-model="richText" /> docx富文本</label
+            ><input v-model="richText" type="checkbox" /> docx富文本</label
           >
           <label class="rich" title="仅在使用 https 自签证书的服务端时需要关闭"
-            ><input type="checkbox" v-model="sslVerify" /> 校验HTTPS证书</label
+            ><input v-model="sslVerify" type="checkbox" /> 校验HTTPS证书</label
           >
         </div>
 
         <details class="adv">
-          <summary>高级项：各阶段温度</summary>
+          <summary>高级项：各阶段温度与并发</summary>
           <div class="row">
             <label>诊断</label>
             <input v-model.number="tDiagnose" type="number" min="0" max="2" step="0.1" />
@@ -1975,6 +2076,7 @@ const canStart = computed(
             <span class="ph-note">本地模型建议 1；云端可 2-4</span>
           </div>
         </details>
+
         <details class="adv">
           <summary>分阶段模型（可选，留空用全局模型）</summary>
           <p class="ph-note">
@@ -2027,16 +2129,18 @@ const canStart = computed(
           </div>
         </details>
 
+        <div class="cfg-section-head">04 · 文学风骨与规模预估</div>
+
         <div class="row col">
           <label>作者风格</label>
-          <textarea v-model="authorStyle" rows="2"></textarea>
+          <textarea v-model="authorStyle" rows="2" class="style-area"></textarea>
         </div>
 
         <div class="row">
-          <label>单价</label>
+          <label>参考单价</label>
           <input
             v-model.number="priceInput"
-            class="num"
+            class="num tabular"
             type="number"
             min="0"
             step="0.1"
@@ -2045,7 +2149,7 @@ const canStart = computed(
           <span class="ph-note">¥/百万输入</span>
           <input
             v-model.number="priceOutput"
-            class="num"
+            class="num tabular"
             type="number"
             min="0"
             step="0.1"
@@ -2053,56 +2157,78 @@ const canStart = computed(
           />
           <span class="ph-note">¥/百万输出（留 0 = 本地不计费）</span>
         </div>
+
         <div class="row">
-          <button class="ghost" :disabled="estimating" @click="runEstimate">
+          <button type="button" class="ghost" :disabled="estimating" @click="runEstimate">
             {{ estimating ? '预估中…' : '预估本次规模与花费' }}
           </button>
           <span v-if="estimateError" class="ph-note err">{{ estimateError }}</span>
         </div>
+
+        <!-- 铅字票据式预估单（Typographic Receipt） -->
         <div v-if="estimate" class="estimate">
-          <p class="estimate-line">
-            <b>{{ estimate.chapters }}</b> 章 → <b>{{ estimate.batches }}</b> 批（每批
-            {{ estimate.chapters_per_batch.join('/') }} 章） · 调用
-            <b>{{ estimate.calls.total }}</b> 次（诊断 {{ estimate.calls.diagnose }} · 蓝图
-            {{ estimate.calls.blueprint }} · 重构 {{ estimate.calls.refactor }} · 缝合
-            {{ estimate.calls.stitch }}）
-          </p>
-          <p class="estimate-line">
-            Token：<b>{{ estimate.tokens.prompt.toLocaleString('zh-CN') }}</b> 输入 /
-            <b>{{ estimate.tokens.completion.toLocaleString('zh-CN') }}</b> 输出 · 预计
-            <b>{{ estimateCostText }}</b>
-          </p>
-          <p class="hint">
-            单批正文上限 {{ estimate.body_token_limit.toLocaleString('zh-CN') }} token；
-            每次请求的固定脚手架
-            {{ estimate.scaffold_per_request.toLocaleString('zh-CN') }} token（占输入约
-            {{
-              (estimate.scaffold_share * 100).toFixed(0)
-            }}%。窗口越小批数越多越亏；但批数已经触底后再放大窗口，这部分只会继续变贵）
-          </p>
-          <p class="hint">
-            缝合边界 {{ estimate.stitch_boundaries }} 处，每侧改写窗口
+          <div class="estimate-head">
+            <span>预估本次</span>
+            <span class="estimate-cost mono">{{ estimateCostText }}</span>
+          </div>
+          <div class="estimate-grid tabular">
+            <div class="estimate-cell">
+              <span class="estimate-k">书稿切分</span>
+              <b class="mono">{{ estimate.chapters }} 章 → {{ estimate.batches }} 批</b>
+              <small>每批 {{ estimate.chapters_per_batch.join('/') }} 章</small>
+            </div>
+            <div class="estimate-cell">
+              <span class="estimate-k">模型调用</span>
+              <b class="mono">共 {{ estimate.calls.total }} 次</b>
+              <small>
+                诊 {{ estimate.calls.diagnose }} · 蓝 {{ estimate.calls.blueprint }} · 构
+                {{ estimate.calls.refactor }} · 缝 {{ estimate.calls.stitch }}
+              </small>
+            </div>
+            <div class="estimate-cell">
+              <span class="estimate-k">预计 Token</span>
+              <b class="mono">
+                {{ estimate.tokens.prompt.toLocaleString('zh-CN') }} 入 /
+                {{ estimate.tokens.completion.toLocaleString('zh-CN') }} 出
+              </b>
+              <small>
+                脚手架占比约 {{ (estimate.scaffold_share * 100).toFixed(0) }}%（每次
+                {{ estimate.scaffold_per_request.toLocaleString('zh-CN') }}）
+              </small>
+            </div>
+          </div>
+          <p class="hint tabular">
+            单批正文上限 {{ estimate.body_token_limit.toLocaleString('zh-CN') }} token · 缝合边界
+            {{ estimate.stitch_boundaries }} 处（每侧窗口
             {{ estimate.stitch_window_chars.toLocaleString('zh-CN') }} 字，合计覆盖
-            {{ estimate.stitch_exposed_chars.toLocaleString('zh-CN') }} 字
+            {{ estimate.stitch_exposed_chars.toLocaleString('zh-CN') }} 字）
           </p>
-          <ul class="hint estimate-notes">
+          <ul v-if="estimate.notes.length" class="hint estimate-notes">
             <li v-for="(n, i) in estimate.notes" :key="i">· {{ n }}</li>
           </ul>
         </div>
 
-        <button class="start-btn" :disabled="!canStart" @click="startPipeline">开始重构</button>
+        <button type="button" class="start-btn" :disabled="!canStart" @click="startPipeline">
+          {{ starting ? '正在提交工序…' : '✦ 开始重构书稿' }}
+        </button>
       </section>
 
       <!-- 进度区 -->
       <section class="panel progress">
-        <h2>运行进度</h2>
+        <h2>
+          <span class="panel-title-serif">工序实况与事件流</span>
+          <span v-if="pipelineRunning" class="live-tag">
+            <span class="live-dot"></span>流式运行中
+          </span>
+        </h2>
+
         <div class="phase-bar">
           <span v-if="currentPhase" class="phase">{{ currentPhase }}</span>
           <span v-if="isPaused" class="badge paused">已暂停</span>
           <span v-if="pipelineRunning" class="badge running">运行中</span>
           <span
             v-if="reviewSummary && reviewSummary.ready_chapters > 0"
-            class="badge running"
+            class="badge ok"
             title="来自 .tfproj.db 的实时章节审校汇总"
           >
             已审校 {{ reviewSummary.approved_chapters + reviewSummary.edited_chapters }}/{{
@@ -2110,23 +2236,39 @@ const canStart = computed(
             }}
             章
           </span>
-          <button v-if="outputPath && port" class="open-btn" @click="openOutput">
+          <button v-if="outputPath && port" type="button" class="open-btn" @click="openOutput">
             打开输出目录
           </button>
-          <button v-if="outputPath && port" class="open-btn ghost" @click="openFinal">
+          <button v-if="outputPath && port" type="button" class="open-btn ghost" @click="openFinal">
             打开成品
           </button>
-          <button v-if="outputPath && port" class="open-btn ghost" @click="openComparisons">
+          <button
+            v-if="outputPath && port"
+            type="button"
+            class="open-btn ghost"
+            @click="openComparisons"
+          >
             对照预览
           </button>
-          <button v-if="outputPath && port" class="open-btn ghost" @click="openVersions">
+          <button
+            v-if="outputPath && port"
+            type="button"
+            class="open-btn ghost"
+            @click="openVersions"
+          >
             成品版本
           </button>
-          <button v-if="outputPath && port" class="open-btn ghost" @click="openQuality">
+          <button
+            v-if="outputPath && port"
+            type="button"
+            class="open-btn ghost"
+            @click="openQuality"
+          >
             质量报告<template v-if="qualityLabel"> · {{ qualityLabel }}</template>
           </button>
           <button
             v-if="port"
+            type="button"
             class="open-btn ghost"
             @click="
               showHistory = true;
@@ -2137,6 +2279,7 @@ const canStart = computed(
           </button>
           <button
             v-if="outputPath && port"
+            type="button"
             class="open-btn ghost"
             :disabled="pipelineRunning || clearingOutput"
             @click="clearOutputDir"
@@ -2144,6 +2287,7 @@ const canStart = computed(
             {{ clearingOutput ? '清空中…' : '清空输出目录' }}
           </button>
         </div>
+
         <p
           v-if="outInfo && outInfo.exists && outInfo.artifacts && outInfo.artifacts.length"
           class="out-status"
@@ -2167,10 +2311,17 @@ const canStart = computed(
           上次中断原因：{{ outInfo.error_logs[outInfo.error_logs.length - 1].message }}
         </p>
 
-        <div class="controls" v-if="pipelineRunning">
-          <button @click="control('pause')" :disabled="isPaused || controlling">暂停</button>
-          <button @click="control('resume')" :disabled="!isPaused || controlling">恢复</button>
-          <button class="danger" @click="control('stop')" :disabled="controlling">停止</button>
+        <div v-if="pipelineRunning" class="controls">
+          <button type="button" :disabled="isPaused || controlling" @click="control('pause')">
+            暂停
+          </button>
+          <button type="button" :disabled="!isPaused || controlling" @click="control('resume')">
+            恢复
+          </button>
+          <button type="button" class="danger" :disabled="controlling" @click="control('stop')">
+            停止
+          </button>
+          <span class="controls-kbd-hint"><kbd>Space</kbd> 暂停 / 恢复</span>
         </div>
 
         <RunStats
@@ -2186,8 +2337,12 @@ const canStart = computed(
           :chapter-percent="chapterPercent"
         />
 
-        <div class="tree-head" v-if="chapterRows.length">
-          <button class="tree-toggle" @click="showChapterTree = !showChapterTree">
+        <div v-if="chapterRows.length" class="tree-head">
+          <button
+            type="button"
+            class="tree-toggle tabular"
+            @click="showChapterTree = !showChapterTree"
+          >
             {{ showChapterTree ? '▾' : '▸' }} 章节概览（{{
               chapterRows.filter((c) => c.status === 'reconstructed').length
             }}/{{ chapterRows.length }} 已重构）
@@ -2196,28 +2351,29 @@ const canStart = computed(
         <div v-if="showChapterTree && chapterRows.length" class="tree-box">
           <div v-for="c in chapterRows" :key="c.id" class="tree-row">
             <span class="split-id">{{ c.label }}</span>
-            <span class="badge" :class="c.status === 'reconstructed' ? 'running' : ''">{{
+            <span class="badge" :class="c.status === 'reconstructed' ? 'ok' : ''">{{
               c.status === 'reconstructed' ? '已重构' : '待处理'
             }}</span>
           </div>
         </div>
 
         <div v-if="streamingText" class="stream-box">
-          <b class="stream-title">流式输出</b>{{ streamingText }}
+          <b class="stream-title">墨迹流式预览</b>{{ streamingText }}
         </div>
 
         <div class="log-head">
-          <b>事件日志</b>
-          <span class="log-count">{{ eventLog.length }} 条</span>
-          <button class="min-btn" @click="exportLog">导出</button>
-          <button class="min-btn" @click="eventLog = []">清空</button>
+          <b>实时事件暗匣</b>
+          <span class="log-count tabular">{{ eventLog.length }} 条</span>
+          <button type="button" class="min-btn" @click="exportLog">导出日志</button>
+          <button type="button" class="min-btn min-btn-adj" @click="eventLog = []">清空</button>
         </div>
-        <div class="bar chapter-row-bar" v-if="finalFiles.length">
+        <div v-if="finalFiles.length" class="bar chapter-row-bar">
           <span class="bar-label">成品文件</span>
           <div class="final-list">
             <button
               v-for="f in finalFiles"
               :key="f.path"
+              type="button"
               class="min-btn"
               @click="callOpenOutput(f.path)"
             >
@@ -2230,7 +2386,7 @@ const canStart = computed(
             <span class="log-ts">{{ line.ts }}</span
             >{{ line.text }}
           </div>
-          <div v-if="!eventLog.length" class="log-empty">暂无事件</div>
+          <div v-if="!eventLog.length" class="log-empty">等待工序启动或事件推流…</div>
         </div>
       </section>
 
@@ -2278,13 +2434,13 @@ const canStart = computed(
           rows="4"
           placeholder="楔子&#10;风起于青萍之末&#10;尾声"
         ></textarea>
-        <button :disabled="redoingSplit" @click="redoSplit">
+        <button type="button" class="btn-ghost" :disabled="redoingSplit" @click="redoSplit">
           {{ redoingSplit ? '重拆中…' : '按此标记重新拆分' }}
         </button>
       </details>
       <template #actions>
         <span></span>
-        <button :disabled="confirmingSplit" @click="confirmSplit">
+        <button type="button" :disabled="confirmingSplit" @click="confirmSplit">
           {{ confirmingSplit ? '确认中…' : '确认拆分，继续' }}
         </button>
       </template>
@@ -2309,7 +2465,7 @@ const canStart = computed(
         全选 / 全不选</label
       >
       <div class="sum-list">
-        <label v-for="g in fixGaps" :key="g.id" class="fix-row">
+        <label v-for="g in fixGaps" :key="g.id" class="split-row fix-row">
           <input type="checkbox" :checked="fixSelected.includes(g.id)" @change="toggleFix(g.id)" />
           <span class="split-id">{{ g.location || g.batch_id }}</span>
           <span
@@ -2324,7 +2480,7 @@ const canStart = computed(
       </div>
       <template #actions>
         <span></span>
-        <button :disabled="confirmingFix" @click="confirmFix">
+        <button type="button" :disabled="confirmingFix" @click="confirmFix">
           确认修复（{{ fixSelected.length }} 处）
         </button>
       </template>
@@ -2338,15 +2494,22 @@ const canStart = computed(
       <div class="sum-list">
         <div v-for="c in acceptChapters" :key="c.id" class="split-row accept-row">
           <span class="split-id">{{ c.id }}</span>
-          <span class="fix-desc">{{ c.preview }}</span>
-          <button class="min-btn" :disabled="regenerating.has(c.id)" @click="regenChapter(c)">
+          <span class="fix-desc serif-preview">{{ c.preview }}</span>
+          <button
+            type="button"
+            class="min-btn"
+            :disabled="regenerating.has(c.id)"
+            @click="regenChapter(c)"
+          >
             {{ regenerating.has(c.id) ? '重写中…' : '重写此章' }}
           </button>
         </div>
       </div>
       <template #actions>
         <span></span>
-        <button :disabled="confirmingAccept" @click="confirmAccept">验收通过，继续</button>
+        <button type="button" :disabled="confirmingAccept" @click="confirmAccept">
+          验收通过，继续
+        </button>
       </template>
     </GateModal>
 
@@ -2362,16 +2525,18 @@ const canStart = computed(
       </div>
       <template #actions>
         <span></span>
-        <button class="danger" @click="control('stop')">停止</button>
-        <button class="primary" :disabled="forcingExport" @click="forceExport">强制导出</button>
+        <button type="button" class="danger" @click="control('stop')">停止</button>
+        <button type="button" class="primary" :disabled="forcingExport" @click="forceExport">
+          强制导出
+        </button>
       </template>
     </GateModal>
 
     <!-- 左右对照预览弹窗 -->
-    <div v-if="showComparisons" class="modal-mask">
-      <div class="modal modal-wide">
+    <div v-if="showComparisons" class="modal-mask" @click.self="showComparisons = false">
+      <div class="modal modal-wide" role="dialog" aria-modal="true" aria-label="左右对照预览">
         <h3>左右对照预览</h3>
-        <div class="row" v-if="comparisonItems.length">
+        <div v-if="comparisonItems.length" class="row">
           <label>章节</label>
           <select v-model="comparisonSel">
             <option v-for="it in comparisonItems" :key="it.name" :value="it.name">
@@ -2382,18 +2547,18 @@ const canStart = computed(
         <pre class="comp-preview">{{ comparisonText }}</pre>
         <div class="modal-actions">
           <span></span>
-          <button @click="showComparisons = false">关闭</button>
+          <button type="button" @click="showComparisons = false">关闭</button>
         </div>
       </div>
     </div>
 
     <!-- 蓝图确认弹窗 -->
-    <GateModal v-if="showBlueprint" title="请检查并确认蓝图">
-      <p class="hint">可直接编辑后确认，蓝图将作为后续重构的系统提示词。</p>
+    <GateModal v-if="showBlueprint" wide title="请检查并确认全书重构蓝图">
+      <p class="hint">可直接润色校勘后确认，蓝图将作为后续全部批次重构的核心文学纲领。</p>
       <textarea v-model="blueprintText" rows="16" class="blueprint-area"></textarea>
 
       <label class="sum-toggle" :class="{ off: !showSummaries }">
-        <input type="checkbox" v-model="showSummaries" />
+        <input v-model="showSummaries" type="checkbox" />
         查看本步诊断摘要（生成蓝图的输入）
       </label>
       <div v-if="showSummaries" class="sum-list">
@@ -2405,9 +2570,9 @@ const canStart = computed(
       </div>
 
       <template #actions>
-        <span class="count">{{ blueprintText.length }} 字</span>
-        <button @click="confirmBlueprint" :disabled="confirmingBlueprint">
-          {{ confirmingBlueprint ? '确认中...' : '确认蓝图' }}
+        <span class="count tabular">{{ blueprintText.length.toLocaleString('zh-CN') }} 字</span>
+        <button type="button" :disabled="confirmingBlueprint" @click="confirmBlueprint">
+          {{ confirmingBlueprint ? '确认中...' : '确认蓝图，进入重构' }}
         </button>
       </template>
     </GateModal>
@@ -2466,165 +2631,460 @@ const canStart = computed(
 </template>
 
 <style scoped>
+@keyframes tf-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(1.22);
+  }
+}
+
 .app {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  font-family: 'Microsoft YaHei', system-ui, sans-serif;
-  background: #f5f6f8;
-  color: #1f2328;
+  font-family: var(--tf-font-sans);
+  background: var(--tf-bg-gradient);
+  color: var(--tf-ink);
 }
+
+/* ---------- 工坊顶栏（Atelier Top Bar） ---------- */
 .header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 24px;
-  background: #2d3748;
-  color: #fff;
+  gap: 16px;
+  padding: 11px 24px;
+  background: var(--tf-surface);
+  color: var(--tf-ink);
+  border-bottom: 1px solid var(--tf-border);
+  box-shadow: var(--tf-shadow-sm);
+  z-index: 10;
 }
-.header h1 {
-  font-size: 18px;
-  margin: 0;
-}
-.version {
-  font-size: 12px;
-  opacity: 0.7;
-  font-weight: normal;
-}
-.status {
-  font-size: 13px;
+
+.brand-group {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 11px;
+  flex-shrink: 0;
 }
+
+.brand-seal {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--tf-radius-sm);
+  background: var(--tf-accent);
+  color: #fbf8f3;
+  font-family: var(--tf-font-serif);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.22),
+    0 2px 6px rgba(181, 73, 58, 0.25);
+}
+
+.brand-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.header h1 {
+  font-family: var(--tf-font-serif);
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin: 0;
+  color: var(--tf-ink);
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.version {
+  font-family: var(--tf-font-mono);
+  font-size: 11px;
+  color: var(--tf-ink-muted);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.brand-subtitle {
+  font-size: 11px;
+  color: var(--tf-ink-muted);
+  letter-spacing: 0.04em;
+}
+
+/* 五阶书卷工序步进条 */
+.pipeline-stepper {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-pill);
+}
+
+.step-sep {
+  color: var(--tf-ink-muted);
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+.step-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: var(--tf-radius-pill);
+  font-size: 12px;
+  color: var(--tf-ink-muted);
+  transition:
+    background 0.2s var(--tf-ease),
+    color 0.2s var(--tf-ease);
+}
+
+.step-idx {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  font-size: 10px;
+  font-weight: 600;
+  background: var(--tf-surface);
+  color: var(--tf-ink-muted);
+  border: 1px solid var(--tf-border);
+}
+
+.step-pill.is-done {
+  color: var(--tf-ok);
+  font-weight: 500;
+}
+
+.step-pill.is-done .step-idx {
+  background: var(--tf-ok-bg);
+  border-color: var(--tf-ok-border);
+  color: var(--tf-ok);
+}
+
+.step-pill.is-active {
+  background: var(--tf-brand);
+  color: var(--tf-ink-on-brand);
+  font-weight: 600;
+  box-shadow: var(--tf-shadow-sm);
+}
+
+.step-pill.is-active .step-idx {
+  background: rgba(255, 255, 255, 0.2);
+  border-color: rgba(255, 255, 255, 0.35);
+  color: var(--tf-ink-on-brand);
+}
+
+.step-pill.is-pulsing .step-idx {
+  animation: tf-pulse 1.8s ease-in-out infinite;
+}
+
+/* 顶栏右侧状态与主题开关 */
+.status {
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.header-jade-badge {
+  padding: 3px 10px;
+  border-radius: var(--tf-radius-pill);
+  background: var(--tf-ok-bg);
+  border: 1px solid var(--tf-ok-border);
+  color: var(--tf-ok);
+  font-size: 12px;
+  font-weight: 600;
+}
+
 .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   display: inline-block;
-}
-.dot.ok {
-  background: #48bb78;
-}
-.dot.err {
-  background: #fc8181;
+  flex-shrink: 0;
 }
 
+.dot.ok {
+  background: var(--tf-ok);
+}
+
+.dot.err {
+  background: var(--tf-danger);
+}
+
+.dot.pulse {
+  animation: tf-pulse 1.8s ease-in-out infinite;
+}
+
+.status-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border);
+  color: var(--tf-ink-secondary);
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 4px 11px;
+  border-radius: var(--tf-radius-pill);
+  max-width: 300px;
+  transition:
+    background 0.15s var(--tf-ease),
+    border-color 0.15s var(--tf-ease),
+    color 0.15s var(--tf-ease);
+}
+
+.status-link:hover {
+  background: var(--tf-surface-hover);
+  border-color: var(--tf-border-strong);
+  color: var(--tf-ink);
+}
+
+.gear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border-strong);
+  color: var(--tf-ink-secondary);
+  border-radius: var(--tf-radius-sm);
+  font-size: 14px;
+  cursor: pointer;
+  width: 30px;
+  height: 28px;
+  line-height: 1;
+  transition:
+    background 0.15s var(--tf-ease),
+    color 0.15s var(--tf-ease);
+}
+
+.gear:hover {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
+}
+
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 11px;
+  height: 28px;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border-strong);
+  color: var(--tf-ink);
+  border-radius: var(--tf-radius-pill);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background 0.15s var(--tf-ease),
+    border-color 0.15s var(--tf-ease);
+}
+
+.theme-toggle:hover {
+  background: var(--tf-surface-hover);
+  border-color: var(--tf-brand-border);
+}
+
+/* ---------- 主工作台双栏布局 ---------- */
 .main {
   flex: 1;
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  padding: 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 18px;
+  padding: 18px 24px;
   overflow-y: auto;
 }
+
 .panel {
-  background: #fff;
-  border-radius: 8px;
-  padding: 16px 20px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  background: var(--tf-surface);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  padding: 20px 22px;
+  box-shadow: var(--tf-shadow-sm);
   overflow-y: auto;
 }
+
 .panel h2 {
-  font-size: 15px;
+  font-size: 16px;
   margin: 0 0 14px;
-  color: #2d3748;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--tf-border);
+  color: var(--tf-ink);
   display: flex;
   align-items: center;
+  gap: 10px;
 }
+
+.panel-title-serif {
+  font-family: var(--tf-font-serif);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
 .panel-gear {
   margin-left: auto;
-  padding: 3px 12px;
+  padding: 4px 12px;
   font-size: 12px;
-  background: #fff;
-  border: 1px solid #cbd5e0;
-  color: #4a5568;
-  border-radius: 5px;
+  font-weight: 500;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border-strong);
+  color: var(--tf-ink-secondary);
+  border-radius: var(--tf-radius-sm);
   cursor: pointer;
+  transition:
+    background 0.15s var(--tf-ease),
+    color 0.15s var(--tf-ease);
 }
+
 .panel-gear:hover {
-  background: #edf2f7;
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
 }
+
 .panel.config.disabled {
-  opacity: 0.55;
+  opacity: 0.56;
   pointer-events: none;
 }
+
 .panel.progress {
   display: flex;
   flex-direction: column;
 }
 
+.live-tag {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 10px;
+  border-radius: var(--tf-radius-pill);
+  background: var(--tf-brand-soft);
+  border: 1px solid var(--tf-brand-border);
+  color: var(--tf-brand);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tf-brand);
+  animation: tf-pulse 1.6s ease-in-out infinite;
+}
+
+/* 配置分区小标题 */
+.cfg-section-head {
+  font-family: var(--tf-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--tf-ink-muted);
+  margin: 14px 0 10px;
+  padding-bottom: 4px;
+  border-bottom: 1px dashed var(--tf-border);
+}
+
+.cfg-section-head:first-of-type {
+  margin-top: 2px;
+}
+
 /* 后端服务行 */
 .backend-row {
-  background: #f7fafc;
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  padding: 8px 10px;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  padding: 8px 12px;
   margin-bottom: 12px;
 }
+
 .backend-state {
   flex: 1;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   font-size: 13px;
-  color: #2d3748;
+  font-weight: 500;
+  color: var(--tf-ink);
 }
+
 .backend-row button {
   padding: 4px 12px;
-  border: 1px solid #d1d5db;
-  background: #fff;
-  border-radius: 5px;
+  border: 1px solid var(--tf-border-strong);
+  background: var(--tf-surface);
+  color: var(--tf-ink-secondary);
+  border-radius: var(--tf-radius-sm);
   cursor: pointer;
   font-size: 12px;
 }
-.backend-row button:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+
+.backend-row button:hover:not(:disabled) {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
 }
+
 .backend-row button.ghost {
-  border-color: #3182ce;
-  color: #3182ce;
+  border-color: var(--tf-brand-border);
+  color: var(--tf-brand);
+  background: transparent;
 }
 
-/* 顶栏：状态可点击 + 齿轮入口 */
-.status-link {
+/* 全局横幅 */
+.banner {
+  grid-column: 1 / -1;
   display: flex;
+  justify-content: space-between;
   align-items: center;
-  gap: 6px;
-  background: transparent;
-  border: none;
-  color: #fff;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: var(--tf-radius-md);
   font-size: 13px;
-  cursor: pointer;
-  padding: 2px 4px;
-  border-radius: 4px;
-  max-width: 340px;
-}
-.status-link:hover {
-  background: rgba(255, 255, 255, 0.12);
-}
-.gear {
-  background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.4);
-  color: #fff;
-  border-radius: 5px;
-  font-size: 15px;
-  cursor: pointer;
-  width: 28px;
-  height: 24px;
-  line-height: 1;
-}
-.gear:hover {
-  background: rgba(255, 255, 255, 0.12);
 }
 
-/* 断连横幅里的操作按钮 */
+.banner.tip {
+  background: var(--tf-ok-bg);
+  color: var(--tf-ok);
+  border: 1px solid var(--tf-ok-border);
+}
+
+.banner.err {
+  background: var(--tf-danger-bg);
+  color: var(--tf-danger);
+  border: 1px solid var(--tf-danger-border);
+}
+
+.banner.warn {
+  background: var(--tf-warn-bg);
+  color: var(--tf-warn);
+  border: 1px solid var(--tf-warn-border);
+}
+
 .banner-act {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
+
 .banner-btn {
   padding: 3px 10px;
   font-size: 12px;
@@ -2632,468 +3092,708 @@ const canStart = computed(
   border: 1px solid currentColor;
   background: transparent;
   color: inherit;
-  border-radius: 4px;
+  border-radius: var(--tf-radius-xs);
 }
+
 .banner-btn.primary {
-  background: #822727;
-  border-color: #822727;
+  background: var(--tf-danger);
+  border-color: var(--tf-danger);
   color: #fff;
 }
 
-.banner {
-  grid-column: 1 / -1;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 8px 14px;
-  border-radius: 6px;
-  font-size: 13px;
-}
-.banner.tip {
-  background: #c6f6d5;
-  color: #22543d;
-  border: 1px solid #9ae6b4;
-}
-.banner.err {
-  background: #fed7d7;
-  color: #822727;
-  border: 1px solid #feb2b2;
-}
-.banner.warn {
-  background: #fefcbf;
-  color: #975a16;
-  border: 1px solid #f6e05e;
-}
 .banner-close {
   background: transparent;
   border: none;
-  font-size: 16px;
+  font-size: 17px;
   cursor: pointer;
   color: inherit;
   padding: 0 4px;
+  line-height: 1;
 }
 
-.bar-fill.recon {
-  background: #38a169;
-}
-.bar-fill.chapter {
-  background: #805ad5;
-}
-.tree-head {
-  margin-bottom: 6px;
-}
-.tree-toggle {
-  background: transparent;
-  border: none;
-  color: #4a5568;
-  font-size: 13px;
-  font-weight: 600;
-  cursor: pointer;
-  padding: 4px 0;
-}
-.tree-box {
-  max-height: 150px;
-  overflow-y: auto;
-  border: 1px solid #e2e8f0;
-  border-radius: 5px;
-  padding: 6px 10px;
-  margin-bottom: 10px;
-  background: #f7fafc;
-}
-.tree-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 2px 0;
-  font-size: 12px;
-}
-html.dark .tree-box {
-  background: #232b39;
-  border-color: #4a5568;
-}
-html.dark .tree-toggle {
-  color: #a0aec0;
-}
-
+/* 表单控件与行排布 */
 .row {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: 10px;
 }
+
+.row.wrap-checks {
+  flex-wrap: wrap;
+}
+
 .row.col {
   flex-direction: column;
   align-items: stretch;
+  gap: 6px;
 }
+
 .row label {
-  width: 80px;
+  width: 82px;
   font-size: 13px;
-  color: #4a5568;
+  font-weight: 500;
+  color: var(--tf-ink-secondary);
   flex-shrink: 0;
 }
+
+.row.col > label {
+  width: auto;
+}
+
 .row label.fmt,
 .row label.ctx,
 .row label.t {
   width: auto;
-  margin-left: 12px;
+  margin-left: 10px;
 }
+
 .row label.rich {
   width: auto;
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
+  font-weight: 400;
+  color: var(--tf-ink-secondary);
   cursor: pointer;
 }
+
 .row label.rich input {
   width: auto;
   margin: 0;
 }
+
+.row select,
+.row input:not([type='checkbox']):not([type='radio']),
+.row textarea {
+  background: var(--tf-surface-elevated);
+  color: var(--tf-ink);
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-sm);
+  padding: 7px 11px;
+  font-size: 13px;
+  transition:
+    border-color 0.15s var(--tf-ease),
+    box-shadow 0.15s var(--tf-ease),
+    background 0.15s var(--tf-ease);
+}
+
+.row select:hover,
+.row input:not([type='checkbox']):not([type='radio']):hover,
+.row textarea:hover {
+  border-color: var(--tf-ink-muted);
+}
+
+.row select:focus,
+.row input:not([type='checkbox']):not([type='radio']):focus,
+.row textarea:focus {
+  border-color: var(--tf-brand);
+  box-shadow: 0 0 0 3px var(--tf-brand-soft);
+  outline: none;
+}
+
 .row select {
   flex: 1;
-  padding: 6px 10px;
-  border: 1px solid #d1d5db;
-  border-radius: 5px;
-  font-size: 13px;
 }
-.row input {
+
+.row input:not([type='checkbox']):not([type='radio']) {
   flex: 1;
   min-width: 0;
-  padding: 6px 10px;
-  border: 1px solid #d1d5db;
-  border-radius: 5px;
-  font-size: 13px;
 }
+
 .row label.t + input,
 .row label.rich + input {
   flex: 1;
 }
+
 .row label.rich-k {
   width: auto;
   margin-left: 12px;
   font-size: 12px;
-  color: #718096;
+  color: var(--tf-ink-muted);
 }
-.ph-note {
-  font-size: 12px;
-  color: #718096;
-  margin: 4px 0 8px;
-  line-height: 1.5;
+
+.row textarea {
+  width: 100%;
+  resize: vertical;
+  line-height: 1.65;
 }
-.ph-note.err {
-  color: #b91c1c;
+
+.style-area {
+  font-family: var(--tf-font-serif);
+  font-size: 14px;
+  line-height: 1.75;
 }
-.estimate {
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  padding: 8px 12px;
-  margin-bottom: 10px;
-  background: #f9fafb;
+
+.lone-area + .lone-area {
+  margin-top: 4px;
 }
-.estimate-line {
-  margin: 3px 0;
-  font-size: 13px;
+
+.row button {
+  padding: 6px 14px;
+  border: 1px solid var(--tf-border-strong);
+  background: var(--tf-surface-2);
+  color: var(--tf-ink);
+  border-radius: var(--tf-radius-sm);
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 500;
+  transition:
+    background 0.15s var(--tf-ease),
+    border-color 0.15s var(--tf-ease);
 }
-.estimate-notes {
-  margin: 6px 0 0;
-  padding-left: 2px;
-  list-style: none;
-  font-size: 12px;
-  color: #718096;
+
+.row button:hover:not(:disabled) {
+  background: var(--tf-surface-hover);
 }
-html.dark .estimate {
-  background: #1f2937;
-  border-color: #374151;
+
+/* 预设档位胶囊组 */
+.preset-row {
+  align-items: flex-start;
 }
-html.dark .ph-note.err {
-  color: #f87171;
+
+.preset-row > label {
+  padding-top: 5px;
 }
+
+.preset-controls {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.preset-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.preset-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px !important;
+  border-radius: var(--tf-radius-pill) !important;
+  background: var(--tf-surface-2) !important;
+  border: 1px solid var(--tf-border-strong) !important;
+  color: var(--tf-ink-secondary) !important;
+  font-size: 12px !important;
+}
+
+.preset-pill small {
+  opacity: 0.72;
+  font-size: 10.5px;
+}
+
+.preset-pill.active {
+  background: var(--tf-brand) !important;
+  border-color: var(--tf-brand) !important;
+  color: var(--tf-ink-on-brand) !important;
+}
+
+.preset-hint {
+  font-size: 11.5px;
+  color: var(--tf-ink-muted);
+}
+
+/* 折叠高级面板 */
 .adv {
-  border: 1px solid #e2e8f0;
-  border-radius: 6px;
-  padding: 8px 12px;
+  border: 1px solid var(--tf-border);
+  background: var(--tf-surface-2);
+  border-radius: var(--tf-radius-md);
+  padding: 9px 14px;
   margin-bottom: 10px;
 }
+
 .adv summary {
-  font-size: 13px;
-  color: #4a5568;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--tf-ink-secondary);
   cursor: pointer;
 }
+
+.adv[open] summary {
+  margin-bottom: 8px;
+  color: var(--tf-ink);
+}
+
 .adv.gates {
   display: flex;
   flex-direction: column;
   flex: 1;
-}
-.adv.gates .rich {
-  margin: 3px 0;
-}
-.row textarea {
-  width: 100%;
-  padding: 6px 10px;
-  border: 1px solid #d1d5db;
-  border-radius: 5px;
-  font-size: 13px;
-  resize: vertical;
-}
-.lone-area + .lone-area {
-  margin-top: 6px;
-}
-.row button {
-  padding: 6px 14px;
-  border: 1px solid #d1d5db;
-  background: #fff;
-  border-radius: 5px;
-  cursor: pointer;
-  font-size: 13px;
-}
-.row button:hover {
-  background: #f0f4f8;
+  margin-bottom: 0;
 }
 
+.gates-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 6px 10px;
+  margin-top: 6px;
+}
+
+.ph-note {
+  font-size: 12px;
+  color: var(--tf-ink-muted);
+  margin: 2px 0;
+  line-height: 1.5;
+}
+
+.ph-note.err {
+  color: var(--tf-danger);
+}
+
+/* 铅字票据式预估卡片（Typographic Receipt） */
+.estimate {
+  border: 1px solid var(--tf-border-strong);
+  border-top: 3px solid var(--tf-brand);
+  border-radius: var(--tf-radius-md);
+  padding: 12px 15px;
+  margin: 6px 0 12px;
+  background: var(--tf-surface-2);
+}
+
+.estimate-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding-bottom: 8px;
+  margin-bottom: 10px;
+  border-bottom: 1px dashed var(--tf-border-strong);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--tf-ink-secondary);
+}
+
+.estimate-cost {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--tf-brand);
+}
+
+.estimate-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  padding-bottom: 8px;
+  margin-bottom: 6px;
+  border-bottom: 1px dashed var(--tf-border);
+}
+
+.estimate-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.estimate-k {
+  font-size: 11px;
+  color: var(--tf-ink-muted);
+}
+
+.estimate-cell b {
+  font-size: 13px;
+  color: var(--tf-ink);
+}
+
+.estimate-cell small {
+  font-size: 11px;
+  color: var(--tf-ink-secondary);
+}
+
+.estimate-notes {
+  margin: 6px 0 0;
+  padding-left: 2px;
+  list-style: none;
+  font-size: 11.5px;
+  color: var(--tf-ink-muted);
+}
+
+/* 启动主按钮 */
 .start-btn {
   width: 100%;
-  margin-top: 8px;
-  padding: 10px;
-  background: #3182ce;
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  font-size: 14px;
+  margin-top: 10px;
+  padding: 11px 16px;
+  background: var(--tf-brand);
+  color: var(--tf-ink-on-brand);
+  border: 1px solid var(--tf-brand);
+  border-radius: var(--tf-radius-md);
+  font-family: var(--tf-font-serif);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
   cursor: pointer;
+  box-shadow: var(--tf-shadow-sm);
+  transition:
+    background 0.18s var(--tf-ease),
+    transform 0.12s var(--tf-ease),
+    box-shadow 0.18s var(--tf-ease);
 }
+
+.start-btn:hover:not(:disabled) {
+  background: var(--tf-brand-hover);
+  border-color: var(--tf-brand-hover);
+  box-shadow: var(--tf-shadow-md);
+}
+
 .start-btn:disabled {
-  background: #a0aec0;
+  background: var(--tf-surface-3);
+  border-color: var(--tf-border);
+  color: var(--tf-ink-muted);
+  box-shadow: none;
   cursor: not-allowed;
 }
 
+/* ---------- 进度面板 ---------- */
 .phase-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   margin-bottom: 12px;
 }
+
 .phase {
-  font-size: 14px;
+  font-family: var(--tf-font-serif);
+  font-size: 14.5px;
   font-weight: 600;
-  color: #2d3748;
+  color: var(--tf-ink);
 }
 
 .controls {
   display: flex;
+  align-items: center;
   gap: 8px;
   margin-bottom: 12px;
 }
+
 .controls button {
   padding: 5px 14px;
-  border: 1px solid #d1d5db;
-  background: #fff;
-  border-radius: 5px;
+  border: 1px solid var(--tf-border-strong);
+  background: var(--tf-surface-2);
+  color: var(--tf-ink);
+  border-radius: var(--tf-radius-sm);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 12.5px;
+  font-weight: 500;
 }
+
+.controls button:hover:not(:disabled) {
+  background: var(--tf-surface-hover);
+}
+
 .controls button.danger {
-  color: #c53030;
-  border-color: #feb2b2;
+  color: var(--tf-danger);
+  border-color: var(--tf-danger-border);
+  background: var(--tf-danger-bg);
 }
-.controls button:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+
+.controls button.danger:hover:not(:disabled) {
+  background: var(--tf-danger);
+  color: #fff;
+}
+
+.controls-kbd-hint {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--tf-ink-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tree-head {
+  margin-bottom: 6px;
+}
+
+.tree-toggle {
+  background: transparent;
+  border: none;
+  color: var(--tf-ink-secondary);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.tree-toggle:hover {
+  color: var(--tf-ink);
+}
+
+.tree-box {
+  max-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  background: var(--tf-surface-2);
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
 }
 
 .stream-box {
-  max-height: 72px;
+  max-height: 92px;
   overflow-y: auto;
-  background: #edf2f7;
-  border: 1px solid #e2e8f0;
-  border-radius: 5px;
-  padding: 8px 10px;
-  margin-bottom: 10px;
-  font-size: 12px;
-  line-height: 1.5;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border-strong);
+  border-left: 3px solid var(--tf-brand);
+  border-radius: var(--tf-radius-sm);
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-family: var(--tf-font-serif);
+  font-size: 13.5px;
+  line-height: 1.75;
   white-space: pre-wrap;
   word-break: break-all;
-  color: #2d3748;
-}
-.stream-title {
-  color: #3182ce;
-  margin-right: 6px;
+  color: var(--tf-ink);
 }
 
-.log-box {
-  flex: 1;
-  min-height: 220px;
-  overflow-y: auto;
-  background: #1a202c;
-  color: #e2e8f0;
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-family: 'Consolas', monospace;
-  font-size: 12px;
-  line-height: 1.6;
-}
-.log-line {
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-.log-line .log-ts {
-  color: #718096;
+.stream-title {
+  font-family: var(--tf-font-sans);
+  font-size: 11.5px;
+  color: var(--tf-brand);
   margin-right: 8px;
+  padding: 1px 6px;
+  border-radius: var(--tf-radius-xs);
+  background: var(--tf-brand-soft);
 }
-.log-ok {
-  color: #9ae6b4;
-}
-.log-warn {
-  color: #fefcbf;
-}
-.log-err {
-  color: #fc8181;
-}
-.log-accent {
-  color: #90cdf4;
-}
+
+/* 实时事件暗匣（SSE Console） */
 .log-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  color: #4a5568;
-  font-size: 12px;
-  margin-bottom: 6px;
-}
-.log-count {
-  color: #718096;
-}
-.min-btn {
-  margin-left: auto;
-  padding: 2px 10px;
-  background: transparent;
-  border: 1px solid #cbd5e0;
-  border-radius: 4px;
-  color: #4a5568;
-  font-size: 12px;
-  cursor: pointer;
-}
-.min-btn:hover {
-  background: #edf2f7;
+  color: var(--tf-ink-secondary);
+  font-size: 12.5px;
+  margin-bottom: 8px;
 }
 
+.log-count {
+  color: var(--tf-ink-muted);
+  font-family: var(--tf-font-mono);
+  font-size: 11.5px;
+}
+
+.min-btn {
+  margin-left: auto;
+  padding: 3px 10px;
+  background: var(--tf-surface-2);
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-xs);
+  color: var(--tf-ink-secondary);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition:
+    background 0.15s var(--tf-ease),
+    color 0.15s var(--tf-ease);
+}
+
+.min-btn-adj {
+  margin-left: 0;
+}
+
+.min-btn:hover:not(:disabled) {
+  background: var(--tf-surface-hover);
+  color: var(--tf-ink);
+}
+
+.log-box {
+  flex: 1;
+  min-height: 230px;
+  overflow-y: auto;
+  background: var(--tf-console-bg);
+  color: var(--tf-console-ink);
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-md);
+  padding: 12px 14px;
+  font-family: var(--tf-font-mono);
+  font-size: 12px;
+  line-height: 1.68;
+  font-variant-numeric: tabular-nums;
+}
+
+.log-line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.log-line .log-ts {
+  color: var(--tf-console-muted);
+  margin-right: 9px;
+}
+
+.log-ok {
+  color: var(--tf-console-ok);
+}
+
+.log-warn {
+  color: var(--tf-console-warn);
+}
+
+.log-err {
+  color: var(--tf-console-err);
+}
+
+.log-accent {
+  color: var(--tf-console-accent);
+}
+
+/* ---------- 人工闸门与蓝图手稿内部元素 ---------- */
 .blueprint-area {
   flex: 1;
   width: 100%;
-  padding: 10px;
-  border: 1px solid #d1d5db;
-  border-radius: 5px;
-  font-size: 13px;
+  padding: 16px 20px;
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-surface-elevated);
+  color: var(--tf-ink);
+  font-family: var(--tf-font-serif);
+  font-size: 15px;
+  line-height: 1.85;
+  letter-spacing: 0.01em;
   resize: vertical;
-  min-height: 300px;
+  min-height: 320px;
 }
+
 .sum-toggle {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
-  color: #4a5568;
+  font-size: 12.5px;
+  color: var(--tf-ink-secondary);
   cursor: pointer;
   margin: 10px 0 4px;
 }
+
 .sum-toggle input {
   width: auto;
   margin: 0;
 }
+
 .sum-empty {
-  color: #718096;
+  color: var(--tf-ink-muted);
 }
+
 .split-id {
   flex: 1;
-  color: #2d3748;
+  color: var(--tf-ink);
+  font-weight: 500;
   word-break: break-all;
 }
+
 .redo-split {
   margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-md);
+  background: var(--tf-surface-2);
 }
+
 .redo-split summary {
   cursor: pointer;
-  color: #4a5568;
+  color: var(--tf-ink-secondary);
   font-size: 13px;
+  font-weight: 500;
 }
+
 .redo-split textarea {
   width: 100%;
   margin-top: 8px;
-  padding: 6px 8px;
-  font-family: inherit;
-  font-size: 13px;
-  border: 1px solid #cbd5e0;
-  border-radius: 4px;
-  box-sizing: border-box;
+  font-family: var(--tf-font-serif);
 }
+
 .redo-split button {
   margin-top: 8px;
 }
+
 .fix-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 3px 0;
+  gap: 8px;
   cursor: pointer;
 }
+
 .fix-row input {
   width: auto;
   margin: 0;
 }
+
 .fix-desc {
-  color: #4a5568;
+  color: var(--tf-ink-secondary);
   word-break: break-all;
+  font-size: 13px;
+  line-height: 1.6;
 }
+
+.serif-preview {
+  font-family: var(--tf-font-serif);
+}
+
 .accept-row {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 10px;
 }
+
 .accept-row .fix-desc {
   flex: 1;
 }
+
 .accept-row .min-btn {
   margin-left: auto;
   flex: 0 0 auto;
 }
+
+.sum-item {
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm);
+  padding: 8px 12px;
+  background: var(--tf-surface-2);
+}
+
 .sum-item summary {
   cursor: pointer;
-  color: #2d3748;
-  margin-bottom: 2px;
+  color: var(--tf-ink);
+  font-weight: 500;
+  margin-bottom: 4px;
 }
+
 .sum-preview {
-  color: #4a5568;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-.count {
-  font-size: 12px;
-  color: #718096;
-}
-.comp-preview {
-  margin-top: 10px;
-  max-height: 60vh;
-  overflow: auto;
-  background: #1a202c;
-  color: #e2e8f0;
-  border-radius: 6px;
-  padding: 10px 12px;
-  font-family: 'Consolas', monospace;
-  font-size: 12px;
+  color: var(--tf-ink-secondary);
+  font-family: var(--tf-font-serif);
+  font-size: 13.5px;
+  line-height: 1.75;
   white-space: pre-wrap;
   word-break: break-all;
 }
 
-.theme-toggle {
-  margin-left: 8px;
-  padding: 2px 10px;
-  background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.4);
-  color: #fff;
-  border-radius: 5px;
-  font-size: 14px;
-  cursor: pointer;
+.count {
+  font-family: var(--tf-font-mono);
+  font-size: 12px;
+  color: var(--tf-ink-muted);
 }
-.theme-toggle:hover {
-  background: rgba(255, 255, 255, 0.12);
+
+.comp-preview {
+  margin-top: 10px;
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--tf-surface-2);
+  color: var(--tf-ink);
+  border: 1px solid var(--tf-border-strong);
+  border-radius: var(--tf-radius-md);
+  padding: 16px 20px;
+  font-family: var(--tf-font-serif);
+  font-size: 14.5px;
+  line-height: 1.85;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .final-list {
@@ -3101,105 +3801,27 @@ html.dark .ph-note.err {
   flex-wrap: wrap;
   gap: 6px;
 }
+
 /* .min-btn 默认 margin-left:auto（为「导出/清空」右对齐设计），在列表里要归零 */
 .final-list .min-btn {
   margin-left: 0;
 }
+
 .chapter-row-bar {
   align-items: center;
 }
 
-/* 深色主题（html.dark）最小覆盖 */
-html.dark .app {
-  background: #171923;
-  color: #e2e8f0;
-}
-html.dark .panel {
-  background: #1f2733;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
-}
-html.dark .panel h2 {
-  color: #e2e8f0;
-}
-html.dark .panel-gear {
-  background: #2d3748;
-  border-color: #4a5568;
-  color: #e2e8f0;
-}
-html.dark .backend-row {
-  background: #232b39;
-  border-color: #4a5568;
-}
-html.dark .backend-state {
-  color: #e2e8f0;
-}
-html.dark .backend-row button {
-  background: #2d3748;
-  color: #e2e8f0;
-  border-color: #4a5568;
-}
-html.dark .row label,
-html.dark .phase,
-html.dark .phase-bar .open-btn {
-  color: #e2e8f0;
-}
-html.dark input,
-html.dark select,
-html.dark textarea {
-  background: #1a202c;
-  color: #e2e8f0;
-  border-color: #4a5568;
-}
-html.dark .stats {
-  background: #232b39;
-  color: #a0aec0;
-}
-html.dark .stat b {
-  color: #e2e8f0;
-}
-html.dark .bar-track {
-  background: #2d3748;
-}
-html.dark .bar,
-html.dark .bar-num,
-html.dark .bar-label {
-  color: #a0aec0;
-}
-html.dark .adv {
-  border-color: #4a5568;
-}
-html.dark .adv summary,
-html.dark .log-count,
-html.dark .sum-empty {
-  color: #a0aec0;
-}
-html.dark .stream-box {
-  background: #1a202c;
-  border-color: #4a5568;
-  color: #e2e8f0;
-}
-html.dark .sum-list {
-  background: #232b39;
-  border-color: #4a5568;
-}
-html.dark .split-id,
-html.dark .sum-item summary {
-  color: #e2e8f0;
-}
-html.dark .fix-desc,
-html.dark .sum-preview {
-  color: #a0aec0;
-}
-html.dark .modal {
-  background: #1f2733;
-}
-html.dark .controls button,
-html.dark .row button {
-  background: #2d3748;
-  color: #e2e8f0;
-  border-color: #4a5568;
-}
-html.dark .start-btn:disabled {
-  background: #4a5568;
+@media (max-width: 1120px) {
+  .header {
+    flex-wrap: wrap;
+  }
+  .pipeline-stepper {
+    order: 3;
+    width: 100%;
+    justify-content: center;
+  }
+  .main {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

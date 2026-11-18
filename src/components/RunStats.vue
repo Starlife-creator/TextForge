@@ -2,9 +2,8 @@
 /**
  * 运行统计与进度条（纯展示，无任何副作用）。
  *
- * 从 App.vue 抽出：这里原本是一大块内联模板，所有数据都从上百个 ref 里取，
- * 与主界面的状态逻辑缠在一起。拆出来后它只接收**已经算好的值**，
- * 既能单独理解，也能单独写渲染测试。
+ * 只接收父组件已经算好的数值与百分比，使用等宽数字（tabular-nums）稳定排版，
+ * 避免流式 token 与读秒跳动时产生水平抖动。
  */
 defineProps<{
   totalChapters: number;
@@ -20,31 +19,34 @@ defineProps<{
   reconPercent: string;
   chapterPercent: string;
 }>();
+
+function fmtNum(v: number | string): string {
+  if (typeof v === 'number' && Number.isFinite(v)) return v.toLocaleString('zh-CN');
+  return String(v);
+}
 </script>
 
 <template>
   <div class="stats">
-    <span class="stat"
-      >总章节：<b>{{ totalChapters || '-' }}</b></span
-    >
-    <span class="stat"
-      >批次：<b>{{ batchStats.phase1 }}/{{ batchStats.total }}</b
-      >（诊断）</span
-    >
-    <span class="stat"
-      >重构：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b></span
-    >
-    <span class="stat" v-if="pipelineRunning || elapsed !== '00:00'"
-      >已运行：<b>{{ elapsed }}</b></span
-    >
-    <span class="stat"
-      >Tokens：<b>{{ usageTokens.prompt }}</b
-      >输入 / <b>{{ usageTokens.completion }}</b
-      >输出</span
-    >
-    <span v-if="spentText" class="stat"
-      >已花费：<b>{{ spentText }}</b></span
-    >
+    <span class="stat">
+      总章节：<b>{{ totalChapters || '-' }}</b>
+    </span>
+    <span class="stat">
+      诊断批次：<b>{{ batchStats.phase1 }}/{{ batchStats.total }}</b>
+    </span>
+    <span class="stat">
+      重构批次：<b>{{ batchStats.phase3 }}/{{ batchStats.total }}</b>
+    </span>
+    <span v-if="pipelineRunning || elapsed !== '00:00'" class="stat">
+      耗时：<b>{{ elapsed }}</b>
+    </span>
+    <span class="stat">
+      Tokens：<b>{{ fmtNum(usageTokens.prompt) }}</b> 入 /
+      <b>{{ fmtNum(usageTokens.completion) }}</b> 出
+    </span>
+    <span v-if="spentText" class="stat">
+      花费：<b>{{ spentText }}</b>
+    </span>
   </div>
 
   <div class="bars">
@@ -69,9 +71,9 @@ defineProps<{
       <div class="bar-track">
         <div class="bar-fill chapter" :style="{ width: chapterPercent }"></div>
       </div>
-      <span class="bar-num"
-        >{{ chapterProgress.done }}/{{ chapterProgress.total }} · {{ chapterPercent }}</span
-      >
+      <span class="bar-num">
+        {{ chapterProgress.done }}/{{ chapterProgress.total }} · {{ chapterPercent }}
+      </span>
     </div>
   </div>
 </template>
