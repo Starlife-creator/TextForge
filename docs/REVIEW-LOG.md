@@ -150,6 +150,17 @@ B4.1 ✅ 0bde150 | Rust 侧 `create_dir_all` 失败 ⇒ **不注入** `TEXTFORGE
 > **批 5 收口（2026-11-18）**：双引擎架构保留了 `progress.json` 的纯文本可检视性与 100% 旧测试/旧目录兼容，同时消除章节级查询与边跑边审对大 JSON 的重复解析与深拷贝开销；全部 5 个人工闸门现均由 AST 契约强制保证 `clear()` 早于阶段落盘。
 > 验证范围（批 5）：全量已跑（326 项 / 耗时 8.10s）
 
+### 批 6 —— 全书设定一致性与缝合巡检检索 + 键盘流审校工作台 + O(1) 状态审校汇总
+
+| # | 改动 | DoD | 反向断言 |
+|---|---|---|---|
+| B6.1 ✅ 36ab81b | `backend/routes/chapters.py` 新增 `GET /api/chapters/audit`（经 `asyncio.to_thread` 卸载并纳入 `test_arch_contracts.py` 阻塞调用守卫）：跨章核查 `forbidden_canon` 禁设泄露、`name_map` 未替换旧称、极端篇幅压缩/膨胀（`<60%` / `>145%`）、`stitch_anchors` 高改动率与 `stitch_failures` 边界跳过，并支持可选 `?q=` 关键词全文检索返回匹配章号、次数与上下文摘要 | ① 检出禁设、旧名、压缩、膨胀与缝合异常并返回分类计数；② `?q=` 大小写无关检索命中并返回片段预览；③ 路由阻塞调用受 AST 门禁约束 | 移除 `asyncio.to_thread` 卸载 ⇒ `test_arch_contracts.py` 红；删任一巡检分类 ⇒ `test_chapters_audit_detects_forbidden_old_name_length_and_stitch_anomalies` 红 |
+| B6.2 ✅ 36ab81b | `src/api/chapters.ts` 与 `src/components/ChapterReviewWorkbench.vue` 新增全书正文检索与「🔍 设定与篇幅巡检」面板、`audit` 异常筛选页签、左栏/右栏命中摘要卡片，以及纯函数化键盘流快捷键（`J`/`K` 或 `Alt+↑↓` 切章、`1`/`2`/`3` 切换视图、`A` 通过/撤回、精修框内 `Ctrl+S`/`Cmd+S` 保存并重跑质检）与顶栏快捷键图例 | ① `vitest` 42 项（含检索鉴权编码、五维交集筛选、键盘流映射与输入框防误触守卫）全绿；② `vue-tsc`、`eslint`、`prettier` 零报错 | 放开输入框内单键拦截 ⇒ `resolveWorkbenchShortcut` 反向防误触断言红；删巡检或快捷键接线 ⇒ `src/chapters.test.ts` 源码守卫红 |
+| B6.3 ✅ 36ab81b | `backend/core/project_db.py` 新增单条 SQL 聚合 `get_review_summary()`，`backend/routes/status.py` 在 `.tfproj.db` 存在时以 `<1ms` 向后兼容附带 `review_summary`，`src/App.vue` 顶部运行进度栏实时展示「已审校 X/Y 章」并与工作台审定事件联动 | ① 空目录不越权创建 `.tfproj.db`；② 有进度目录经 `/api/status` 返回精确 `total/ready/approved/edited` 汇总且随审阅实时更新 | 去掉 `status.py` 的 `review_summary` 聚合返回或 `App.vue` 接线 ⇒ 前后端集成用例同红 |
+
+> **批 6 收口（2026-11-18）**：补齐 60–300 章长篇书稿审校的跨章设定/改名/篇幅/缝合一致性巡检与全文秒级检索，工作台支持免鼠标全键盘流审校，且 `/api/status` 直接从 SQLite WAL 索引毫秒级捎带审校进度，前后端十道门禁全部一次通过。
+> 验证范围（批 6）：全量已跑（328 项 / 耗时 9.13s）
+
 ## 3. 本轮明确不做
 
 - **状态拆分 / 单写者队列**（R6+R7 的正解）：需要改 `progress_lock` 的所有权模型，属架构项，需拍板后单开一轮；本轮只落 B2.3 这种不动模型的半步。**重测条件**：若 `progress.json` 实际尺寸分布中位数 > 30 MB，或 `/api/status` p99 > 200 ms，必须启动。
